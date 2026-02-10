@@ -1,0 +1,7 @@
+# Executable files
+/*.exe
+*.exe
+IMPACT.exe
+
+# Environment variables
+.env

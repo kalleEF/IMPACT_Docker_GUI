@@ -1,0 +1,407 @@
+# 📘 IMPACT Docker GUI v2 — User Guide
+
+> A friendly, step-by-step guide to launching and managing your **IMPACT NCD Germany** RStudio containers — locally for testing or remotely on the workstation for heavy simulation runs.
+
+---
+
+## 📋 Table of Contents
+
+1. [What This Tool Does](#-what-this-tool-does)
+2. [System Requirements](#-system-requirements)
+3. [Quick Start (Happy Path)](#-quick-start-happy-path)
+4. [Step-by-Step Workflow](#-step-by-step-workflow)
+   - [Step 1 — Launch the Tool](#step-1--launch-the-tool-)
+   - [Step 2 — Enter Your Credentials](#step-2--enter-your-credentials-)
+   - [Step 3 — SSH Key Setup](#step-3--ssh-key-setup-)
+   - [Step 4 — Choose Where to Run](#step-4--choose-where-to-run-)
+   - [Step 5 — Repository Setup](#step-5--repository-setup)
+   - [Step 6 — Container Manager](#step-6--container-manager-)
+   - [Step 7 — Connect to RStudio](#step-7--connect-to-rstudio-)
+   - [Step 8 — Stopping & Data Sync](#step-8--stopping--data-sync-)
+5. [Options Reference](#-options-reference)
+6. [Connecting to RStudio](#-connecting-to-rstudio)
+7. [Frequently Asked Questions & Troubleshooting](#-frequently-asked-questions--troubleshooting)
+8. [Logs & Diagnostics](#-logs--diagnostics)
+9. [Multiple Users on the Same Workstation](#-multiple-users-on-the-same-workstation)
+10. [Building the EXE](#-building-the-exe)
+11. [Glossary](#-glossary)
+
+---
+
+## 🎯 What This Tool Does
+
+The **IMPACT Docker GUI** is a Windows application that lets you:
+
+- 🏗️ **Build** a Docker image containing the IMPACT NCD Germany simulation environment (RStudio Server + R packages)
+- 🚀 **Start** an RStudio Server container — either on your local machine or on a remote workstation
+- 🔑 **Manage SSH keys** for secure GitHub access and remote connectivity
+- 📂 **Mount your project files** so you can edit code in your browser through RStudio
+- 🔄 **Sync data** between Docker volumes and your host folders when using volume mode
+- 📝 **Commit & push** your changes to GitHub when you stop the container
+
+All of this is done through a series of simple, dark-themed dialog windows — no command-line expertise needed.
+
+---
+
+## 💻 System Requirements
+
+| Requirement | Details |
+|---|---|
+| **Operating System** | Windows 10 or later |
+| **PowerShell** | PowerShell 7+ (pwsh) — the tool auto-relaunches under pwsh if started in Windows PowerShell |
+| **Docker** | Docker Desktop installed and running (for local mode) |
+| **OpenSSH Client** | `ssh` and `ssh-keygen` on PATH (typically built into Windows 10+) |
+| **Network** | Access to the remote workstation IP (for remote mode) |
+| **Posh-SSH Module** | *(Recommended)* For first-time remote password bootstrap; the tool will offer to install it |
+| **PuTTY / plink.exe** | *(Fallback)* Used if Posh-SSH is unavailable for initial remote key setup |
+| **Git** | *(Optional)* Required for commit/push on stop |
+
+> 💡 **Tip:** The tool checks for Docker, SSH, and PowerShell 7 on startup and shows clear error messages if anything is missing.
+
+---
+
+## ⚡ Quick Start (Happy Path)
+
+For experienced users — the fastest way from zero to RStudio:
+
+1. ▶️ Run `IMPACT_Docker_GUI_v2.ps1` (or double-click `IMPACT.exe`)
+2. 👤 Enter a **username** and **password**
+3. 🔑 Let it create your SSH key; copy the public key to **GitHub → Settings → SSH and GPG keys** if needed
+4. 🌐 Choose **Local** or **Remote** (enter the workstation IP if remote)
+5. 📁 Pick your repository (Local: folder picker; Remote: list from the workstation)
+6. ▶️ In the Container Manager, review options and click **Start Container**
+7. 🖥️ Open the URL shown in the dialog; log in as `rstudio` with the password you entered
+8. ⏹️ Click **Stop Container** when you're done — data syncs back and you can commit changes
+
+---
+
+## 🚶 Step-by-Step Workflow
+
+### Step 1 — Launch the Tool 🚀
+
+You have two ways to start:
+
+| Method | How |
+|---|---|
+| **PowerShell script** | Right-click `IMPACT_Docker_GUI_v2.ps1` → *Run with PowerShell*, or open a terminal and run `pwsh .\IMPACT_Docker_GUI_v2.ps1` |
+| **Compiled EXE** | Double-click `IMPACT.exe` (see [Building the EXE](#-building-the-exe)) |
+
+On launch, the tool:
+- Checks if PowerShell 7 is available and re-launches under `pwsh` if needed (you may see a brief console flash)
+- Starts logging to a file in your home directory (see [Logs & Diagnostics](#-logs--diagnostics))
+- Verifies that Docker and SSH are available
+
+> ⚠️ **If you see "PowerShell 7 required":** Install PowerShell 7 from [https://aka.ms/powershell](https://aka.ms/powershell)
+
+---
+
+### Step 2 — Enter Your Credentials 🔐
+
+A dialog asks for:
+
+| Field | Purpose | Rules |
+|---|---|---|
+| **Username** | Identifies your SSH key, container, and Docker volumes | Spaces removed, converted to lowercase (e.g., `John Doe` → `johndoe`) |
+| **Password** | Used to log in to RStudio Server inside the container | Any non-empty string |
+
+> 💡 **Keep your username consistent** across sessions. It is used to name your container (`<repo>_<username>`) and your per-user Docker volumes.
+
+---
+
+### Step 3 — SSH Key Setup 🔑
+
+The tool looks for an SSH key pair at:
+```
+~/.ssh/id_ed25519_<username>
+~/.ssh/id_ed25519_<username>.pub
+```
+
+- **If keys exist:** The public key is displayed so you can verify it's in GitHub.
+- **If keys are missing:** A new Ed25519 key pair is generated. The public key is:
+  - Shown in a dialog with a **Copy to Clipboard** button
+  - Also printed to the console
+
+**Add the public key to GitHub** if you need Git access inside the container:
+1. Go to **GitHub → Settings → SSH and GPG keys → New SSH key**
+2. Paste the public key and save
+
+> 🔒 The private key never leaves your machine (it is bind-mounted into the container as read-only).
+
+---
+
+### Step 4 — Choose Where to Run 🌍
+
+A dialog presents two buttons:
+
+| Option | When to Use |
+|---|---|
+| 🖥️ **Local Container** | Testing on your own machine; uses Docker Desktop |
+| 🖧 **Remote Container** | Running heavy simulations on the shared workstation |
+
+**Remote mode** requires:
+- The workstation IP address (a default is pre-filled: `... ask you admin ;)`)
+- Network connectivity to that IP
+
+**Optional:**
+- ☑️ **Enable Debug Mode** — shows detailed progress messages in the console (useful for troubleshooting)
+
+---
+
+### Step 5 — Repository Setup
+
+What happens next depends on which location you chose:
+
+#### 5a. Local Preparation 🖥️
+
+1. A folder picker dialog opens — select the root of your project repository (the folder containing `docker_setup/` and `inputs/sim_design.yaml`)
+2. The tool warns if no `.git` directory is found but lets you continue
+3. Docker Desktop is checked; if not running, the tool tries to start it and waits up to 30 seconds
+4. A Docker context named `local` is created pointing to the Docker Desktop socket
+
+#### 5b. Remote Preparation 🖧
+
+1. **SSH key authorization** — the tool tries to connect with your key. If it fails (first time), a password prompt appears:
+   - Enter the remote user's password once
+   - The tool uses **Posh-SSH** (preferred) or **plink.exe** (fallback) to install your public key in the remote `~/.ssh/authorized_keys`
+   - Subsequent connections use key-based auth (no password needed)
+2. **Key sync** — your private key and `known_hosts` are securely copied to the remote host for Git access inside containers
+3. **Repository selection** — the tool lists folders under `/home/php-workstation/Schreibtisch/Repositories/` on the remote machine; select one
+4. **Docker context** — a context named `remote-<ip>` is created. If that fails, the tool falls back to direct `DOCKER_HOST=ssh://...`
+
+> 💡 **First-time remote setup**: you'll need the remote password once. After that, key-based auth is automatic.  
+> If prompted to install **Posh-SSH**, click **Yes** — it's a one-time install that enables password-based key bootstrap without PuTTY.
+
+---
+
+### Step 6 — Container Manager 🎛️
+
+This is the main control panel. It shows:
+
+```
+┌──────────────────────────────────────────────┐
+│  Status: RUNNING / STOPPED                   │
+│  URL: http://localhost:8787                   │
+│  RStudio login: rstudio (Password: *****)    │
+│  Repo: IMPACTncdGER                          │
+│  Container: IMPACTncdGER_johndoe             │
+│  Location: LOCAL / REMOTE@ INTERNAL_IP_REMOVED     │
+│                                              │
+│  [Start Container]     [Stop Container]      │
+│                                              │
+│  ── Advanced Options ──                      │
+│  ☐ Use Docker Volumes  ☐ Rebuild image       │
+│  ☐ High computational demand                 │
+│  Port Override: [8787]  Custom Params: [   ]  │
+│  sim_design.yaml: [.\inputs\sim_design.yaml] │
+│                                              │
+│  Build: 2.0.0 | Commit: abc1234 | Built: ...│
+│                                        [Close]│
+└──────────────────────────────────────────────┘
+```
+
+**If the container is already running** (from a previous session), the tool detects it, recovers your password and port, and shows connection info immediately.
+
+See [Options Reference](#-options-reference) for details on each option.
+
+---
+
+### Step 7 — Connect to RStudio 🖥️
+
+After clicking **Start Container**, open the displayed URL in your browser:
+
+| Mode | URL |
+|---|---|
+| **Local** | `http://localhost:8787` |
+| **Remote** | `http://<remote-ip>:<port>` (e.g., `http://12.345.678.90:8787`) |
+
+Log in with:
+- **Username:** `rstudio`
+- **Password:** the password you entered in Step 2
+
+Your project files are mounted at `/home/rstudio/<repo-name>/` inside the container. Any changes you make in RStudio are reflected on the host.
+
+---
+
+### Step 8 — Stopping & Data Sync 🔄
+
+Click **Stop Container** in the Container Manager. The tool:
+
+1. ⏹️ **Stops** the Docker container
+2. 📦 **Syncs volumes back** (if Docker Volumes were enabled):
+   - `outputs/` → your host `output_dir` (from `sim_design.yaml`)
+   - `inputs/synthpop/` → your host `synthpop_dir` (from `sim_design.yaml`)
+   - Uses `rsync-alpine` helper image for reliable sync
+   - Removes the volumes after sync
+3. 🗑️ **Cleans** remote metadata (remote mode)
+4. 📝 **Offers a Git commit/push dialog** if changes are detected in the repo:
+   - Shows a diff summary
+   - Enter a commit message
+   - Optionally push to origin (converts GitHub HTTPS remotes to SSH automatically)
+
+> 💡 You can close the dialog and start a new container without stopping — but a warning appears.
+
+---
+
+## ⚙️ Options Reference
+
+| Option | Scope | Default | Description |
+|---|---|---|---|
+| **Use Docker Volumes** | Local & Remote | Off | Creates per-user named volumes for `outputs/` and `inputs/synthpop/`. Data is pre-populated from host on start and rsynced back on stop. Recommended for remote or to avoid bind-mount permission issues. |
+| **Rebuild image** | Local & Remote | Off | Forces a fresh `docker build` even if the image already exists. Use after Dockerfile changes. |
+| **High computational demand** | Remote only | Off | Adds `--cpus 32 -m 384g` to the container. Disabled in local mode. |
+| **Port Override** | Remote only | `8787` | Choose a different port if `8787` is taken by another user. Local mode is locked to `8787`. |
+| **Custom Params** | Local & Remote | *(empty)* | Extra `docker run` flags (space-separated). For advanced users, e.g., `--shm-size 4g`. |
+| **sim_design.yaml** | Local & Remote | `.\inputs\sim_design.yaml` | Path to the YAML file containing `output_dir` and `synthpop_dir` keys. Relative paths resolve against the repo root. |
+
+---
+
+## 🖥️ Connecting to RStudio
+
+| Detail | Value |
+|---|---|
+| **URL (local)** | `http://localhost:8787` |
+| **URL (remote)** | `http://<remote-ip>:<port>` |
+| **Username** | `rstudio` |
+| **Password** | The password you entered at startup |
+| **Working directory** | `/home/rstudio/<repo-name>/` |
+
+> 💡 If you need to access RStudio from a different machine (e.g., via SSH tunnel), see the `access_rstudio_gui.ps1` script in the repository root.
+
+---
+
+## ❓ Frequently Asked Questions & Troubleshooting
+
+### Docker Issues
+
+| Problem | Solution |
+|---|---|
+| **"Docker CLI not found"** | Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) and ensure `docker` is on PATH. |
+| **"Docker daemon is not reachable"** | Start Docker Desktop. The tool tries to start it automatically but may time out after ~30 seconds. |
+| **Docker build fails** | Check the console output. The tool automatically retries with a prerequisite Dockerfile (`Dockerfile.prerequisite.IMPACTncdGER`) then retries the main build. |
+| **Port already in use** | Choose a different port in the Port Override field (remote mode). In local mode, stop any other container using port 8787. |
+
+### SSH / Remote Issues
+
+| Problem | Solution |
+|---|---|
+| **"SSH missing"** on startup | Install the OpenSSH client Windows feature (Settings → Apps → Optional Features → OpenSSH Client). |
+| **Password bootstrap fails** | Ensure you typed the correct password for the `php-workstation` user on the remote machine. If Posh-SSH is unavailable, install PuTTY (`plink.exe`). |
+| **"Posh-SSH not found" prompt** | Click **Yes** to install it (`Install-Module -Name Posh-SSH -Scope CurrentUser`). It's needed for first-time password-based key setup. |
+| **Remote key auth stops working** | Re-run the tool and go through the password bootstrap again. Check that `~/.ssh/id_ed25519_<username>` and `~/.ssh/known_hosts` still exist locally. |
+| **Docker context fails on remote** | The tool falls back to `DOCKER_HOST=ssh://...`. If both fail, check network/firewall and SSH access to the workstation. |
+
+### File & Path Issues
+
+| Problem | Solution |
+|---|---|
+| **"docker_setup folder not found"** | Ensure your repository root contains a `docker_setup/` folder with `Dockerfile.IMPACTncdGER`. |
+| **"YAML file not found"** | Verify the `sim_design.yaml` path (default: `.\inputs\sim_design.yaml`) exists in your repo. |
+| **"Failed to ensure output_dir / synthpop_dir"** | Check that the directories referenced by `output_dir` and `synthpop_dir` in `sim_design.yaml` exist and are accessible. POSIX-style paths (starting with `/`) are rejected in local mode. |
+| **Volume sync issues** | Ensure the `rsync-alpine` helper image can be built. Check console logs for rsync errors. Verify output/synthpop folders are writable. |
+
+### Git Issues
+
+| Problem | Solution |
+|---|---|
+| **Git dialog on stop** | This appears when the repo has uncommitted changes. Enter a commit message and optionally push, or click **Skip** to ignore. |
+| **Push fails** | Ensure your SSH key is added to GitHub. The tool automatically converts HTTPS remotes to SSH for push. |
+
+### UI Issues
+
+| Problem | Solution |
+|---|---|
+| **Dialogs appear off-screen** | Move your mouse cursor to the desired monitor *before* the dialog opens. Forms center on the monitor where the cursor is. |
+| **"PowerShell 7 required"** | Install PowerShell 7: `winget install Microsoft.PowerShell` or download from [https://aka.ms/powershell](https://aka.ms/powershell). |
+
+---
+
+## 📊 Logs & Diagnostics
+
+The tool writes a detailed log file at:
+
+```
+~/.impact_gui/logs/impact.log
+```
+
+(Typically `C:\Users\<you>\.impact_gui\logs\impact.log`)
+
+**Log features:**
+- 📁 Auto-created on first run
+- 🔄 Automatically rotated when the file exceeds **512 KB** (old logs renamed to `impact_<timestamp>.log`)
+- 📊 Four log levels: `Info`, `Warn`, `Error`, `Debug`
+- 🔍 `Debug` messages only appear when **Debug Mode** is enabled in the location selection dialog
+
+**Environment variable overrides:**
+
+| Variable | Purpose |
+|---|---|
+| `IMPACT_LOG_FILE` | Override the log file path |
+| `IMPACT_LOG_DISABLE` | Set to `1` to disable file logging entirely |
+
+> 💡 **Enable Debug Mode** during setup if things aren't working — it captures detailed information about every step.
+
+---
+
+## 👥 Multiple Users on the Same Workstation
+
+The tool is designed for multi-user remote workstations:
+
+- **Unique containers**: Each user gets a container named `<repo>_<username>`, so containers don't collide
+- **Unique volumes**: Docker volumes include the username (e.g., `impactncd_germany_output_johndoe`)
+- **Unique SSH keys**: Keys are stored as `id_ed25519_<username>`, avoiding conflicts
+- **Port selection**: Remote users can choose different ports to avoid conflicts (check which ports are in use — the tool detects occupied ports)
+- **Remote metadata**: Session info is stored at `/tmp/impactncd/<container>.json` on the workstation, enabling session recovery
+
+> ⚠️ **Port coordination**: When working remotely with colleagues, communicate which ports you're using. The tool warns if a port is already taken but relies on users choosing non-conflicting ports.
+
+---
+
+## 📦 Building the EXE
+
+The PowerShell script can be compiled into a standalone `IMPACT.exe` for easy distribution.
+
+### Prerequisites
+- **PowerShell 7** (the compiler enforces this)
+- **ps2exe module** (auto-installed if missing)
+
+### Methods
+
+| Method | Command / Action | Description |
+|---|---|---|
+| **Interactive** | Double-click `Compile-IMPACT-v2.bat` | Uses PowerShell 7, prompts before overwriting |
+| **Silent** | Double-click `Quick-Compile-v2.bat` | Forces overwrite, suppresses output |
+| **Manual** | `pwsh .\Compile-IMPACT-v2.ps1 -Force` | Full control with optional `-Verbose` flag |
+
+### Output
+- `IMPACT.exe` in the same folder
+- Includes the `IMPACT_icon.ico` icon if present
+- Console mode enabled (required for the PS7 relaunch flow)
+
+> 💡 After compiling, distribute `IMPACT.exe` together with the `docker_setup/` folder and `sim_design.yaml` in the project repository.
+
+---
+
+## 📖 Glossary
+
+| Term | Meaning |
+|---|---|
+| 🐳 **Docker** | A platform that runs applications in isolated *containers*. Think of it as a lightweight virtual machine for your simulation environment. |
+| 📦 **Container** | A running instance of a Docker *image* — in this case, an RStudio Server with R and your project files. |
+| 🖼️ **Image** | A blueprint for containers. Built from a `Dockerfile`, it contains the OS, R, RStudio Server, and dependencies. |
+| 💾 **Docker Volume** | A managed storage area that Docker controls. Faster and safer than bind-mounting host folders, especially over SSH. |
+| 🔗 **Bind Mount** | Directly connecting a host folder into the container so files are shared in real time. |
+| 🔑 **SSH (Secure Shell)** | A protocol for secure remote access. Used to connect to the workstation and for Git authentication with GitHub. |
+| 🔑 **SSH Key (Ed25519)** | A cryptographic key pair. The *private key* stays on your machine; the *public key* goes to GitHub and the remote workstation. |
+| 🌐 **Docker Context** | A named configuration telling Docker where to run commands — locally or on a remote host via SSH. |
+| 📋 **sim_design.yaml** | A YAML configuration file in your project that tells the tool where your output and synthpop directories are. |
+| 🔄 **rsync** | A file synchronization tool used to copy data between Docker volumes and host folders efficiently. |
+| 🧰 **Posh-SSH** | A PowerShell module for SSH connections. Used as the primary method for first-time password-based key setup on the remote workstation. |
+| 🧰 **plink.exe** | A PuTTY command-line SSH tool. Used as a fallback for password-based key setup if Posh-SSH is unavailable. |
+| 🧰 **ps2exe** | A PowerShell module that compiles `.ps1` scripts into standalone `.exe` files. |
+| 🖥️ **RStudio Server** | A web-based IDE for R that runs inside the Docker container. You access it through your browser. |
+| 🏷️ **Container Name** | Follows the pattern `<repo>_<username>`, e.g., `IMPACTncdGER_johndoe`. |
+| 🏷️ **Remote User** | The shared Linux account on the workstation (default: `php-workstation`). |
+
+---
+
+*Last updated: 2025 — IMPACT NCD Germany Docker GUI v2.0.0*
