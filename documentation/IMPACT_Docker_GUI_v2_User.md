@@ -26,6 +26,7 @@
 10. [Multiple Users on the Same Workstation](#-multiple-users-on-the-same-workstation)
 11. [Building the EXE](#-building-the-exe)
 12. [Glossary](#-glossary)
+13. [Remote Workstation Setup](#-remote-workstation-setup)
 
 ---
 
@@ -333,7 +334,7 @@ Click **Stop Container** in the Container Manager. The tool:
 
 | Problem | Solution |
 |---|---|
-| **"Docker CLI not found"** | Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows) and ensure `docker` is on PATH. |
+| **"Docker CLI not found"** | Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) on your **local Windows machine** and ensure `docker` is on PATH. The Docker CLI is needed locally even when running containers remotely. |
 | **"Docker daemon is not reachable"** | Start Docker Desktop (local/Windows). The tool tries to start it automatically but may time out after ~30 seconds. |
 | **"Docker Engine Missing (Remote)"** | Install Docker Engine on the remote Linux workstation: `sudo apt-get install docker-ce docker-ce-cli containerd.io`. See [docs.docker.com/engine/install](https://docs.docker.com/engine/install/). |
 | **"Docker Daemon Not Running (Remote)"** | The tool offers to start it via `sudo systemctl start docker` (you will be prompted for the sudo password in the console). You can also start it manually on the workstation. |
