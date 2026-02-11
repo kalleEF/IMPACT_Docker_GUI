@@ -20,6 +20,9 @@ if not exist "Compile-IMPACT-v2.ps1" (
     goto :error
 )
 
+REM Ensure Windows PowerShell path is in PATH (ps2exe needs powershell.exe internally)
+set "PATH=%PATH%;%SystemRoot%\System32\WindowsPowerShell\v1.0"
+
 REM Try PowerShell 7 first (if available), then fallback to Windows PowerShell
 echo Checking for PowerShell 7...
 pwsh.exe -Command "Write-Host 'PowerShell 7 found'" >nul 2>&1

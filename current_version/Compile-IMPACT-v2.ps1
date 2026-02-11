@@ -8,11 +8,17 @@ param(
     [switch]$Force
 )
 
-# Enforce PowerShell 7 host to produce a PS7-native EXE
+# Prefer PowerShell 7 but allow Windows PowerShell as fallback
 if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7) {
-    Write-Host "This compiler must run in PowerShell 7 (pwsh). Current: $($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)" -ForegroundColor Red
-    Write-Host "Launch pwsh and re-run: pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\\Compile-IMPACT-v2.ps1 -Force" -ForegroundColor Yellow
-    exit 1
+    Write-Host "Note: Running under Windows PowerShell $($PSVersionTable.PSVersion). PowerShell 7 (pwsh) is recommended but not required." -ForegroundColor Yellow
+} else {
+    Write-Host "Running under PowerShell 7 ($($PSVersionTable.PSVersion))" -ForegroundColor Green
+}
+
+# Ensure Windows PowerShell path is in PATH (ps2exe needs powershell.exe internally)
+$winPSPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+if (-not ($env:PATH -split ';' | Where-Object { $_ -eq $winPSPath })) {
+    $env:PATH = "$env:PATH;$winPSPath"
 }
 
 # Detect if running from batch file and auto-enable Force mode
@@ -102,6 +108,31 @@ Write-Host "  Console Mode: Enabled (required for admin elevation)" -ForegroundC
 Write-Host ""
 
 # Perform compilation
+# Verify powershell.exe is reachable (ps2exe calls it internally during compilation)
+$psFallback = Get-Command powershell.exe -ErrorAction SilentlyContinue
+if (-not $psFallback) {
+    Write-Host "Warning: powershell.exe not found in PATH. Attempting to locate it..." -ForegroundColor Yellow
+    $psExePaths = @(
+        "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",
+        "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe",
+        "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    )
+    $found = $false
+    foreach ($p in $psExePaths) {
+        if (Test-Path $p) {
+            $env:PATH = "$env:PATH;$(Split-Path $p)"
+            Write-Host "  Found at: $p - added to PATH" -ForegroundColor Green
+            $found = $true
+            break
+        }
+    }
+    if (-not $found) {
+        Write-Host "Error: Cannot locate powershell.exe anywhere. Windows PowerShell is required by ps2exe." -ForegroundColor Red
+        Write-Host "       Please ensure Windows PowerShell 5.1 is installed (it ships with Windows 10/11)." -ForegroundColor Red
+        exit 1
+    }
+}
+
 Write-Host "Starting compilation..." -ForegroundColor Yellow
 try {
     Invoke-PS2EXE @CompileParams

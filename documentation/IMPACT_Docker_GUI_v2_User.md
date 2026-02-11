@@ -8,8 +8,9 @@
 
 1. [What This Tool Does](#-what-this-tool-does)
 2. [System Requirements](#-system-requirements)
-3. [Quick Start (Happy Path)](#-quick-start-happy-path)
-4. [Step-by-Step Workflow](#-step-by-step-workflow)
+3. [First-Time Machine Setup](#-first-time-machine-setup)
+4. [Quick Start (Happy Path)](#-quick-start-happy-path)
+5. [Step-by-Step Workflow](#-step-by-step-workflow)
    - [Step 1 — Launch the Tool](#step-1--launch-the-tool-)
    - [Step 2 — Enter Your Credentials](#step-2--enter-your-credentials-)
    - [Step 3 — SSH Key Setup](#step-3--ssh-key-setup-)
@@ -18,13 +19,13 @@
    - [Step 6 — Container Manager](#step-6--container-manager-)
    - [Step 7 — Connect to RStudio](#step-7--connect-to-rstudio-)
    - [Step 8 — Stopping & Data Sync](#step-8--stopping--data-sync-)
-5. [Options Reference](#-options-reference)
-6. [Connecting to RStudio](#-connecting-to-rstudio)
-7. [Frequently Asked Questions & Troubleshooting](#-frequently-asked-questions--troubleshooting)
-8. [Logs & Diagnostics](#-logs--diagnostics)
-9. [Multiple Users on the Same Workstation](#-multiple-users-on-the-same-workstation)
-10. [Building the EXE](#-building-the-exe)
-11. [Glossary](#-glossary)
+6. [Options Reference](#-options-reference)
+7. [Connecting to RStudio](#-connecting-to-rstudio)
+8. [Frequently Asked Questions & Troubleshooting](#-frequently-asked-questions--troubleshooting)
+9. [Logs & Diagnostics](#-logs--diagnostics)
+10. [Multiple Users on the Same Workstation](#-multiple-users-on-the-same-workstation)
+11. [Building the EXE](#-building-the-exe)
+12. [Glossary](#-glossary)
 
 ---
 
@@ -50,13 +51,68 @@ All of this is done through a series of simple, dark-themed dialog windows — n
 | **Operating System** | Windows 10 or later |
 | **PowerShell** | PowerShell 7+ (pwsh) — the tool auto-relaunches under pwsh if started in Windows PowerShell |
 | **Docker** | Docker Desktop installed and running (for local mode) |
-| **OpenSSH Client** | `ssh` and `ssh-keygen` on PATH (typically built into Windows 10+) |
+| **OpenSSH Client** | `ssh`, `ssh-keygen`, and `ssh-agent` on PATH — the tool offers to install this automatically if missing (one-time UAC prompt) |
 | **Network** | Access to the remote workstation IP (for remote mode) |
-| **Posh-SSH Module** | *(Recommended)* For first-time remote password bootstrap; the tool will offer to install it |
+| **Posh-SSH Module** | *(Recommended)* For first-time remote password bootstrap; the tool will offer to install it (no admin required) |
 | **PuTTY / plink.exe** | *(Fallback)* Used if Posh-SSH is unavailable for initial remote key setup |
 | **Git** | *(Optional)* Required for commit/push on stop |
 
-> 💡 **Tip:** The tool checks for Docker, SSH, and PowerShell 7 on startup and shows clear error messages if anything is missing.
+> 💡 **Tip:** The tool checks for Docker, SSH, and PowerShell 7 on startup and shows clear error messages if anything is missing. On a fresh machine, several prerequisites are installed automatically — see [First-Time Machine Setup](#-first-time-machine-setup).
+
+---
+
+## 🔧 First-Time Machine Setup
+
+When running the tool on a **new Windows machine** for the first time, a few one-time setup steps happen automatically. You may see one or two **UAC (User Account Control) prompts** asking for Administrator permission — these are expected and only happen once.
+
+### What the tool does automatically
+
+| Component | What happens | Admin required? |
+|---|---|---|
+| **OpenSSH Client** | If `ssh` is not found on PATH, the tool detects this and offers to install the Windows OpenSSH Client capability. A UAC prompt appears for the installation. | Yes (one-time UAC prompt) |
+| **ssh-agent service** | The tool starts the Windows `ssh-agent` service and sets it to start automatically on boot. If the service is disabled, a UAC prompt appears to change the startup type. | Yes (one-time UAC prompt) |
+| **SSH key in agent** | Your generated/existing SSH key (`~/.ssh/id_ed25519_<username>`) is automatically loaded into `ssh-agent` on every run, so you don't get repeated passphrase or credential prompts. | No |
+| **SSH config file** | When you connect to a remote workstation, the tool creates/updates `~/.ssh/config` with the correct connection settings for that host (identity file, user, timeouts). This avoids repeated password checks. | No |
+| **Posh-SSH module** | When you first use remote mode and key-based auth isn't set up yet, the tool offers to install the Posh-SSH PowerShell module for password-based key bootstrap. This installs to your user profile only. | No |
+
+### Manual fallback commands
+
+If you prefer to set things up manually (or if the automatic install fails), run these commands in an **Administrator PowerShell**:
+
+```powershell
+# 1. Install OpenSSH Client (if missing)
+Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+
+# 2. Enable and start ssh-agent
+Set-Service ssh-agent -StartupType Automatic
+Start-Service ssh-agent
+
+# 3. Add your key to the agent (run as your normal user, not admin)
+ssh-add $HOME\.ssh\id_ed25519_<username>
+```
+
+To install the Posh-SSH module (no admin needed):
+
+```powershell
+Install-Module -Name Posh-SSH -Scope CurrentUser -Force
+```
+
+### SSH config file details
+
+The tool creates a `~/.ssh/config` file (typically `C:\Users\<you>\.ssh\config`) with an entry like:
+
+```
+Host <workstation-ip>
+    User <remote-user>
+    IdentityFile ~/.ssh/id_ed25519_<username>
+    IdentitiesOnly yes
+    StrictHostKeyChecking accept-new
+    ConnectTimeout 10
+```
+
+This ensures that all SSH connections to the workstation use the correct key automatically, without repeated authentication prompts. The file is only created if no entry for that host exists yet — existing entries are never overwritten.
+
+> 💡 After the first-time setup, subsequent launches will not require any admin prompts.
 
 ---
 
@@ -284,9 +340,11 @@ Click **Stop Container** in the Container Manager. The tool:
 
 | Problem | Solution |
 |---|---|
-| **"SSH missing"** on startup | Install the OpenSSH client Windows feature (Settings → Apps → Optional Features → OpenSSH Client). |
+| **"SSH missing"** on startup | The tool offers to install the OpenSSH Client automatically (UAC prompt). If that fails, install manually: `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0` in an admin PowerShell. |
+| **ssh-agent won't start** | The tool tries to start it automatically with a UAC prompt. If that fails, run in an admin PowerShell: `Set-Service ssh-agent -StartupType Automatic; Start-Service ssh-agent` |
+| **Repeated password/key prompts** | Ensure ssh-agent is running (`Get-Service ssh-agent`) and your key is loaded (`ssh-add -l`). Check that `~/.ssh/config` has an entry for the workstation (see [First-Time Machine Setup](#-first-time-machine-setup)). |
 | **Password bootstrap fails** | Ensure you typed the correct password for the `php-workstation` user on the remote machine. If Posh-SSH is unavailable, install PuTTY (`plink.exe`). |
-| **"Posh-SSH not found" prompt** | Click **Yes** to install it (`Install-Module -Name Posh-SSH -Scope CurrentUser`). It's needed for first-time password-based key setup. |
+| **"Posh-SSH not found" prompt** | Click **Yes** to install it (`Install-Module -Name Posh-SSH -Scope CurrentUser`). No admin required. It's needed for first-time password-based key setup. |
 | **Remote key auth stops working** | Re-run the tool and go through the password bootstrap again. Check that `~/.ssh/id_ed25519_<username>` and `~/.ssh/known_hosts` still exist locally. |
 | **Docker context fails on remote** | The tool falls back to `DOCKER_HOST=ssh://...`. If both fail, check network/firewall and SSH access to the workstation. |
 

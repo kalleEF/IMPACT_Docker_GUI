@@ -761,9 +761,54 @@ function Test-StartupPrerequisites {
 
     $sshCmd = Get-Command ssh -ErrorAction SilentlyContinue
     if (-not $sshCmd) {
-        Write-Log 'OpenSSH client not found on PATH.' 'Error'
-        [System.Windows.Forms.MessageBox]::Show('OpenSSH client (ssh) not found on PATH. Install the OpenSSH client feature and retry.','SSH missing','OK','Error') | Out-Null
-        return $false
+        Write-Log 'OpenSSH client not found on PATH. Attempting auto-install.' 'Warn'
+
+        # Try to auto-install the OpenSSH Client Windows capability
+        $installAttempted = $false
+        try {
+            $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Client*' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($cap -and $cap.State -ne 'Installed') {
+                $installChoice = [System.Windows.Forms.MessageBox]::Show(
+                    "The OpenSSH Client is not installed on this machine.`n`nThe tool needs ssh, ssh-keygen, and ssh-agent to function.`n`nInstall it now? (requires Administrator — a UAC prompt will appear)",
+                    'Install OpenSSH Client?',
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Question)
+
+                if ($installChoice -eq [System.Windows.Forms.DialogResult]::Yes) {
+                    Write-Log 'User agreed to install OpenSSH Client. Launching elevated install.' 'Info'
+                    $capName = $cap.Name
+                    $elevatedCmd = "Add-WindowsCapability -Online -Name '$capName' -ErrorAction Stop"
+                    $pwshPath = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+                    $proc = Start-Process $pwshPath -ArgumentList '-NoProfile','-NoLogo','-Command',$elevatedCmd -Verb RunAs -Wait -PassThru -ErrorAction Stop
+                    $installAttempted = $true
+                    if ($proc.ExitCode -eq 0) {
+                        Write-Log 'OpenSSH Client installed successfully via elevated process.' 'Info'
+                        # Refresh PATH to pick up newly installed ssh
+                        $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+                        $userPath    = [Environment]::GetEnvironmentVariable('Path', 'User')
+                        $env:PATH = "$machinePath;$userPath"
+                    } else {
+                        Write-Log "Elevated OpenSSH install exited with code $($proc.ExitCode)" 'Warn'
+                    }
+                } else {
+                    Write-Log 'User declined OpenSSH Client install.' 'Warn'
+                }
+            }
+        } catch {
+            Write-Log "OpenSSH auto-install failed: $($_.Exception.Message)" 'Warn'
+        }
+
+        # Re-check after install attempt
+        $sshCmd = Get-Command ssh -ErrorAction SilentlyContinue
+        if (-not $sshCmd) {
+            $manualMsg = "OpenSSH Client (ssh) is required but not installed.`n`n" +
+                         "To install manually, run this in an Administrator PowerShell:`n`n" +
+                         "  Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0`n`n" +
+                         "Then restart this tool."
+            Write-Log 'OpenSSH client still not found after install attempt.' 'Error'
+            [System.Windows.Forms.MessageBox]::Show($manualMsg, 'SSH missing', 'OK', 'Error') | Out-Null
+            return $false
+        }
     }
 
     Write-Log "Prereq check passed (Docker=$dockerVersion, ssh present)." 'Info'
@@ -932,6 +977,123 @@ function Show-CredentialDialog {
     return $true
 }
 
+# Helper: ensure ssh-agent Windows service is running and add the user's key
+function Ensure-SshAgentRunning {
+    param([string]$SshKeyPath)
+
+    Write-Log 'Ensuring ssh-agent service is running and key is loaded.' 'Info'
+
+    $sshAgentService = Get-Service ssh-agent -ErrorAction SilentlyContinue
+    if (-not $sshAgentService) {
+        Write-Log 'ssh-agent service not found on this system.' 'Warn'
+        return
+    }
+
+    if ($sshAgentService.Status -ne 'Running') {
+        # First attempt: try starting directly (works if startup type is Manual or Automatic)
+        $started = $false
+        try {
+            Start-Service ssh-agent -ErrorAction Stop
+            $started = $true
+            Write-Log 'ssh-agent service started (no elevation needed).' 'Info'
+        } catch {
+            Write-Log "Direct Start-Service ssh-agent failed: $($_.Exception.Message). Attempting elevated start." 'Info'
+        }
+
+        if (-not $started) {
+            # Targeted elevation: set startup type to Automatic and start the service
+            try {
+                $elevatedCmd = "Set-Service ssh-agent -StartupType Automatic -ErrorAction Stop; Start-Service ssh-agent -ErrorAction Stop"
+                $pwshPath = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+                $proc = Start-Process $pwshPath -ArgumentList '-NoProfile','-NoLogo','-Command',$elevatedCmd -Verb RunAs -Wait -PassThru -ErrorAction Stop
+                if ($proc.ExitCode -eq 0) {
+                    Write-Log 'ssh-agent service started via elevated process.' 'Info'
+                    $started = $true
+                } else {
+                    Write-Log "Elevated ssh-agent start exited with code $($proc.ExitCode)" 'Warn'
+                }
+            } catch {
+                Write-Log "Elevated ssh-agent start failed: $($_.Exception.Message)" 'Warn'
+                Write-Log 'To fix manually, run in an admin PowerShell: Set-Service ssh-agent -StartupType Automatic; Start-Service ssh-agent' 'Warn'
+            }
+        }
+    }
+
+    # Add the key to the agent (only if the service is running)
+    $sshAgentService = Get-Service ssh-agent -ErrorAction SilentlyContinue
+    if ($sshAgentService -and $sshAgentService.Status -eq 'Running') {
+        try {
+            # Check if key is already loaded
+            $loadedKeys = & ssh-add -l 2>&1
+            if ($loadedKeys -notmatch [regex]::Escape($SshKeyPath) -and $loadedKeys -notmatch [regex]::Escape((Split-Path $SshKeyPath -Leaf).Replace('.','_'))) {
+                & ssh-add $SshKeyPath 2>&1 | Out-Null
+                Write-Log "SSH key added to ssh-agent: $SshKeyPath" 'Info'
+            } else {
+                Write-Log 'SSH key already loaded in ssh-agent.' 'Debug'
+            }
+        } catch {
+            Write-Log "ssh-add failed: $($_.Exception.Message)" 'Warn'
+        }
+    } else {
+        Write-Log 'ssh-agent service is not running; skipping ssh-add.' 'Warn'
+    }
+}
+
+# Helper: ensure ~/.ssh/config has an entry for the remote workstation
+function Ensure-SshConfigEntry {
+    param(
+        [string]$RemoteHostIp,
+        [string]$RemoteUser,
+        [string]$IdentityFile
+    )
+
+    if (-not $RemoteHostIp -or -not $RemoteUser -or -not $IdentityFile) {
+        Write-Log 'Ensure-SshConfigEntry: missing parameters, skipping.' 'Debug'
+        return
+    }
+
+    $sshDir = Join-Path $HOME '.ssh'
+    $configPath = Join-Path $sshDir 'config'
+
+    Write-Log "Ensuring SSH config entry for $RemoteHostIp in $configPath" 'Info'
+
+    # Ensure .ssh directory exists
+    if (-not (Test-Path $sshDir)) {
+        New-Item -Path $sshDir -ItemType Directory -Force | Out-Null
+    }
+
+    # Normalize the identity file path to use forward-slash notation for SSH config
+    $identityNorm = $IdentityFile -replace '\\','/'
+
+    # Check if config file already contains an entry for this host
+    if (Test-Path $configPath) {
+        $existingConfig = Get-Content $configPath -Raw -ErrorAction SilentlyContinue
+        if ($existingConfig -match "(?mi)^\s*Host\s+$([regex]::Escape($RemoteHostIp))\s*$") {
+            Write-Log "SSH config already contains entry for Host $RemoteHostIp — skipping." 'Debug'
+            return
+        }
+    }
+
+    # Append a new Host entry (do NOT include BatchMode — it would break the first-time password bootstrap)
+    $entry = @"
+
+# IMPACT Docker GUI — auto-generated entry for remote workstation
+Host $RemoteHostIp
+    User $RemoteUser
+    IdentityFile $identityNorm
+    IdentitiesOnly yes
+    StrictHostKeyChecking accept-new
+    ConnectTimeout 10
+"@
+
+    try {
+        Add-Content -Path $configPath -Value $entry -Encoding UTF8 -ErrorAction Stop
+        Write-Log "SSH config entry added for Host $RemoteHostIp" 'Info'
+    } catch {
+        Write-Log "Failed to write SSH config: $($_.Exception.Message)" 'Warn'
+    }
+}
+
 # 2. GitHub SSH key setup
 function Ensure-GitKeySetup {
     param([pscustomobject]$State)
@@ -963,6 +1125,9 @@ function Ensure-GitKeySetup {
         Write-Host $publicKey
         Write-Host "----------------------------------------"
         Write-Host "If you cannot authenticate with GitHub, add this key in GitHub -> Settings -> SSH and GPG keys"
+
+        # Ensure ssh-agent is running and key is loaded (even for existing keys)
+        Ensure-SshAgentRunning -SshKeyPath $sshKeyPath
         return $true
     }
 
@@ -1108,17 +1273,8 @@ function Ensure-GitKeySetup {
     Write-Host $publicKey
     Write-Host "----------------------------------------"
 
-    # Start and configure ssh-agent
-    try {
-        $sshAgentService = Get-Service ssh-agent -ErrorAction SilentlyContinue
-        if ($sshAgentService -and $sshAgentService.Status -ne 'Running') {
-            Set-Service ssh-agent -StartupType Automatic
-            Start-Service ssh-agent
-        }
-        ssh-add $sshKeyPath
-    } catch {
-        Write-Log 'Could not configure ssh-agent; key may still work for GitHub.' 'Warn'
-    }
+    # Ensure ssh-agent is running and key is loaded
+    Ensure-SshAgentRunning -SshKeyPath $sshKeyPath
 
     return $true
 }
@@ -1499,6 +1655,9 @@ echo SSH_KEY_COPIED
     }
 
     Write-Log 'SSH key present on remote host.' 'Info'
+
+    # Ensure local SSH config has an entry for this remote workstation
+    Ensure-SshConfigEntry -RemoteHostIp $remoteIp -RemoteUser $remoteUser -IdentityFile $sshKeyPath
 
     # Sync SSH private key and known_hosts onto remote for Git inside container
     Write-Log 'Syncing SSH private key and known_hosts to remote host.' 'Info'
