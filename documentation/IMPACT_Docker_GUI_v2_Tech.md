@@ -305,11 +305,6 @@ The application presents 7+ dialogs in sequence. All share the dark theme.
 12. If Docker CLI not found: show error with install instructions (`sudo apt-get install docker-ce ...`) and abort
 13. **Auto-start daemon**: If CLI exists but daemon is not running, offer to start via interactive SSH + `sudo systemctl start docker` (user enters sudo password in console). Wait 3s and re-verify.
 14. **Docker group check**: Run `groups` via SSH; warn if remote user is not in the `docker` group
-6. Sync or create `known_hosts` on remote
-7. Scan repos: `ls -1d <base>/*/ | xargs -n1 basename`
-8. Show repo selection dialog
-9. Create Docker context `remote-<ip>` with `host=ssh://<remoteHost>`
-10. If context fails: set `Flags.UseDirectSsh = $true`, use `DOCKER_HOST` env var
 
 ### Phase 5 — Password Bootstrap (Remote)
 

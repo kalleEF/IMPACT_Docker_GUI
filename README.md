@@ -43,14 +43,14 @@ A Windows GUI tool for building, launching, and managing **IMPACT NCD Germany** 
 
 ```powershell
 # Interactive (prompts before overwriting)
-.\current_major_version\Compile-IMPACT-v2.bat
+.\current_version\Compile-IMPACT-v2.bat
 
 # Or manually with PowerShell 7
-pwsh .\current_major_version\Compile-IMPACT-v2.ps1 -Force
+pwsh .\current_version\Compile-IMPACT-v2.ps1 -Force
 ```
 
-Requires the `ps2exe` module (auto-installed if missing). Outputs `IMPACT.exe` in `current_major_version/`.
+Requires the `ps2exe` module (auto-installed if missing). Outputs `IMPACT.exe` in `current_version/`.
 
 ## License
 
-Internal tool — IMPACT NCD Germany.
+Internal tool under MIT License.
