@@ -50,7 +50,7 @@ All of this is done through a series of simple, dark-themed dialog windows — n
 |---|---|
 | **Operating System** | Windows 10 or later |
 | **PowerShell** | PowerShell 7+ (pwsh) — the tool auto-relaunches under pwsh if started in Windows PowerShell |
-| **Docker** | Docker Desktop installed and running (for local mode) |
+| **Docker** | Docker Desktop installed and running (for local/Windows mode); Docker Engine installed on the remote Linux workstation (for remote mode) |
 | **OpenSSH Client** | `ssh`, `ssh-keygen`, and `ssh-agent` on PATH — the tool offers to install this automatically if missing (one-time UAC prompt) |
 | **Network** | Access to the remote workstation IP (for remote mode) |
 | **Posh-SSH Module** | *(Recommended)* For first-time remote password bootstrap; the tool will offer to install it (no admin required) |
@@ -58,6 +58,8 @@ All of this is done through a series of simple, dark-themed dialog windows — n
 | **Git** | *(Optional)* Required for commit/push on stop |
 
 > 💡 **Tip:** The tool checks for Docker, SSH, and PowerShell 7 on startup and shows clear error messages if anything is missing. On a fresh machine, several prerequisites are installed automatically — see [First-Time Machine Setup](#-first-time-machine-setup).
+
+> 🐧 **Remote workstation prerequisites:** The Linux workstation must have **Docker Engine** (not Docker Desktop) installed, and the remote user (default: `php-workstation`) must be a member of the `docker` group. See [Remote Workstation Setup](#-remote-workstation-setup) below.
 
 ---
 
@@ -191,8 +193,8 @@ A dialog presents two buttons:
 
 | Option | When to Use |
 |---|---|
-| 🖥️ **Local Container** | Testing on your own machine; uses Docker Desktop |
-| 🖧 **Remote Container** | Running heavy simulations on the shared workstation |
+| 🖥️ **Local Container** | Testing on your own machine; uses Docker Desktop (Windows) |
+| 🖧 **Remote Container** | Running heavy simulations on the shared workstation; uses Docker Engine (Linux) |
 
 **Remote mode** requires:
 - The workstation IP address (a default is pre-filled: `... ask you admin ;)`)
@@ -331,8 +333,11 @@ Click **Stop Container** in the Container Manager. The tool:
 
 | Problem | Solution |
 |---|---|
-| **"Docker CLI not found"** | Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) and ensure `docker` is on PATH. |
-| **"Docker daemon is not reachable"** | Start Docker Desktop. The tool tries to start it automatically but may time out after ~30 seconds. |
+| **"Docker CLI not found"** | Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows) and ensure `docker` is on PATH. |
+| **"Docker daemon is not reachable"** | Start Docker Desktop (local/Windows). The tool tries to start it automatically but may time out after ~30 seconds. |
+| **"Docker Engine Missing (Remote)"** | Install Docker Engine on the remote Linux workstation: `sudo apt-get install docker-ce docker-ce-cli containerd.io`. See [docs.docker.com/engine/install](https://docs.docker.com/engine/install/). |
+| **"Docker Daemon Not Running (Remote)"** | The tool offers to start it via `sudo systemctl start docker` (you will be prompted for the sudo password in the console). You can also start it manually on the workstation. |
+| **"Docker Group Warning"** | The remote user needs `docker` group membership: `sudo usermod -aG docker <user>` then re-login. Without this, Docker commands require sudo and may fail. |
 | **Docker build fails** | Check the console output. The tool automatically retries with a prerequisite Dockerfile (`Dockerfile.prerequisite.IMPACTncdGER`) then retries the main build. |
 | **Port already in use** | Choose a different port in the Port Override field (remote mode). In local mode, stop any other container using port 8787. |
 
@@ -444,7 +449,9 @@ The PowerShell script can be compiled into a standalone `IMPACT.exe` for easy di
 | Term | Meaning |
 |---|---|
 | 🐳 **Docker** | A platform that runs applications in isolated *containers*. Think of it as a lightweight virtual machine for your simulation environment. |
-| 📦 **Container** | A running instance of a Docker *image* — in this case, an RStudio Server with R and your project files. |
+| �️ **Docker Desktop** | The GUI-based Docker distribution for Windows and macOS. Used for **local** containers on your Windows machine. |
+| ⚙️ **Docker Engine** | The native Linux Docker daemon (`dockerd`). Used on the **remote** workstation for running containers directly on the host without a VM, giving full access to system RAM. |
+| �📦 **Container** | A running instance of a Docker *image* — in this case, an RStudio Server with R and your project files. |
 | 🖼️ **Image** | A blueprint for containers. Built from a `Dockerfile`, it contains the OS, R, RStudio Server, and dependencies. |
 | 💾 **Docker Volume** | A managed storage area that Docker controls. Faster and safer than bind-mounting host folders, especially over SSH. |
 | 🔗 **Bind Mount** | Directly connecting a host folder into the container so files are shared in real time. |
@@ -459,6 +466,48 @@ The PowerShell script can be compiled into a standalone `IMPACT.exe` for easy di
 | 🖥️ **RStudio Server** | A web-based IDE for R that runs inside the Docker container. You access it through your browser. |
 | 🏷️ **Container Name** | Follows the pattern `<repo>_<username>`, e.g., `IMPACTncdGER_johndoe`. |
 | 🏷️ **Remote User** | The shared Linux account on the workstation (default: `php-workstation`). |
+
+---
+
+## 🐧 Remote Workstation Setup
+
+The remote Linux workstation uses **Docker Engine** (native Docker daemon) instead of Docker Desktop. This gives containers direct access to system RAM without VM overhead.
+
+### One-Time Admin Setup
+
+These steps must be performed **once** by an administrator on the remote workstation:
+
+1. **Install Docker Engine:**
+   ```bash
+   sudo apt-get update
+   sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+   ```
+   See [docs.docker.com/engine/install](https://docs.docker.com/engine/install/) for distribution-specific instructions.
+
+2. **Enable Docker to start on boot:**
+   ```bash
+   sudo systemctl enable docker
+   ```
+
+3. **Add each user to the `docker` group** (so they can run Docker commands without `sudo`):
+   ```bash
+   sudo usermod -aG docker php-workstation
+   ```
+   The user must log out and back in for this to take effect.
+
+4. **Verify** (as the remote user):
+   ```bash
+   docker version
+   docker run --rm hello-world
+   ```
+
+### What the Tool Checks Automatically
+
+When you select remote mode, the tool:
+- Verifies the Docker CLI exists on the remote host
+- Checks that the Docker daemon is running
+- Offers to start the daemon via `sudo systemctl start docker` if it is not running (you will be prompted for the sudo password)
+- Warns if the remote user is not in the `docker` group
 
 ---
 

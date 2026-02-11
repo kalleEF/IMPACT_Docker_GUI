@@ -746,16 +746,16 @@ function Test-StartupPrerequisites {
 
     $dockerCmd = Get-Command docker -ErrorAction SilentlyContinue
     if (-not $dockerCmd) {
-        Write-Log 'Docker CLI not found. Install Docker Desktop or ensure docker is on PATH.' 'Error'
-        [System.Windows.Forms.MessageBox]::Show('Docker CLI not found. Install Docker Desktop and ensure "docker" is on PATH, then retry.','Docker missing','OK','Error') | Out-Null
+        Write-Log 'Docker CLI not found. Install Docker Desktop (Windows) or ensure docker is on PATH.' 'Error'
+        [System.Windows.Forms.MessageBox]::Show('Docker CLI not found.`n`nInstall Docker Desktop (Windows) and ensure "docker" is on PATH, then retry.','Docker missing','OK','Error') | Out-Null
         return $false
     }
 
     $dockerVersion = $null
     try { $dockerVersion = (& docker version --format '{{.Server.Version}}' 2>$null) } catch { $dockerVersion = $null }
     if (-not $dockerVersion) {
-        Write-Log 'Docker daemon is not reachable. Start Docker Desktop and retry.' 'Error'
-        [System.Windows.Forms.MessageBox]::Show('Docker daemon is not reachable. Start Docker Desktop and retry.','Docker not running','OK','Error') | Out-Null
+        Write-Log 'Docker daemon is not reachable. Start Docker Desktop (Windows) and retry.' 'Error'
+        [System.Windows.Forms.MessageBox]::Show('Docker daemon is not reachable.`n`nStart Docker Desktop and retry. The local Docker daemon is required for context management.','Docker not running','OK','Error') | Out-Null
         return $false
     }
 
@@ -1799,6 +1799,101 @@ echo SSH_KEY_COPIED
         $State.Flags.UseDirectSsh = $false
         Write-Log "Docker context set to $contextName" 'Info'
     }
+
+    # 4.1.5: Verify Docker Engine is installed and running on the remote host
+    Write-Log 'Checking remote Docker Engine availability...' 'Info'
+    $remoteDockerOk = $false
+    $remoteDockerCliExists = $false
+    try {
+        $sshCheckArgs = @('-i', $State.Paths.SshPrivate, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', $remoteHost)
+        $dockerVer = & ssh @sshCheckArgs 'docker version --format "{{.Server.Version}}"' 2>&1
+        if ($LASTEXITCODE -eq 0 -and $dockerVer -and $dockerVer -notmatch 'Cannot connect') {
+            $remoteDockerOk = $true
+            $remoteDockerCliExists = $true
+            Write-Log "Remote Docker Engine running (Server version: $dockerVer)" 'Info'
+        } else {
+            # Check if CLI exists but daemon is not running
+            $whichDocker = & ssh @sshCheckArgs 'which docker 2>/dev/null || echo NOT_FOUND' 2>&1
+            if ($whichDocker -and $whichDocker -notmatch 'NOT_FOUND') {
+                $remoteDockerCliExists = $true
+                Write-Log 'Remote Docker CLI found but daemon is not running.' 'Warn'
+            } else {
+                Write-Log 'Remote Docker CLI not found.' 'Error'
+            }
+        }
+    } catch {
+        Write-Log "Remote Docker check failed: $($_.Exception.Message)" 'Warn'
+    }
+
+    if (-not $remoteDockerCliExists) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Docker Engine is not installed on the remote workstation ($remoteIp).`n`nInstall it on the remote host with:`n  sudo apt-get update`n  sudo apt-get install docker-ce docker-ce-cli containerd.io`n`nSee https://docs.docker.com/engine/install/ for details.",
+            'Docker Engine Missing (Remote)', 'OK', 'Error') | Out-Null
+        return $false
+    }
+
+    # 4.1.6: Attempt to start Docker daemon if not running
+    if (-not $remoteDockerOk) {
+        $startChoice = [System.Windows.Forms.MessageBox]::Show(
+            "Docker daemon is not running on the remote workstation ($remoteIp).`n`nAttempt to start it? You will be prompted for the sudo password in the console.",
+            'Docker Daemon Not Running (Remote)', 'YesNo', 'Warning')
+
+        if ($startChoice -eq [System.Windows.Forms.DialogResult]::Yes) {
+            Write-Log 'Attempting to start remote Docker daemon via sudo systemctl...' 'Info'
+            Write-Host ''
+            Write-Host '--- Enter the sudo password on the remote host when prompted ---' -ForegroundColor Yellow
+            try {
+                $startArgs = @('-i', $State.Paths.SshPrivate, '-o', 'IdentitiesOnly=yes', '-o', 'ConnectTimeout=30', '-t', $remoteHost, 'sudo systemctl start docker')
+                $p = Start-Process -FilePath 'ssh' -ArgumentList $startArgs -Wait -PassThru -NoNewWindow
+                if ($p.ExitCode -eq 0) {
+                    Write-Log 'sudo systemctl start docker completed.' 'Info'
+                    # Wait briefly for the daemon socket to become available
+                    Start-Sleep -Seconds 3
+                    # Re-check
+                    $sshCheckArgs2 = @('-i', $State.Paths.SshPrivate, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', $remoteHost)
+                    $dockerVer2 = & ssh @sshCheckArgs2 'docker version --format "{{.Server.Version}}"' 2>&1
+                    if ($LASTEXITCODE -eq 0 -and $dockerVer2 -and $dockerVer2 -notmatch 'Cannot connect') {
+                        $remoteDockerOk = $true
+                        Write-Log "Remote Docker Engine started successfully (Server version: $dockerVer2)" 'Info'
+                    }
+                } else {
+                    Write-Log "sudo systemctl start docker exited with code $($p.ExitCode)" 'Warn'
+                }
+            } catch {
+                Write-Log "Failed to start remote Docker: $($_.Exception.Message)" 'Warn'
+            }
+            Write-Host '--- End of remote sudo session ---' -ForegroundColor Yellow
+            Write-Host ''
+        }
+
+        if (-not $remoteDockerOk) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Docker daemon could not be started on the remote workstation ($remoteIp).`n`nStart it manually on the remote host:`n  sudo systemctl start docker`n  sudo systemctl enable docker",
+                'Docker Daemon Start Failed', 'OK', 'Error') | Out-Null
+            return $false
+        }
+    }
+
+    # 4.1.7: Check docker group membership for the remote user
+    Write-Log 'Checking remote user docker group membership...' 'Info'
+    try {
+        $sshGroupArgs = @('-i', $State.Paths.SshPrivate, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', $remoteHost)
+        $groupsOutput = & ssh @sshGroupArgs 'groups' 2>&1
+        if ($LASTEXITCODE -eq 0 -and $groupsOutput) {
+            $groupList = $groupsOutput -split '\s+'
+            if ($groupList -contains 'docker') {
+                Write-Log "Remote user '$remoteUser' is in the docker group." 'Info'
+            } else {
+                Write-Log "Remote user '$remoteUser' is NOT in the docker group. Groups: $groupsOutput" 'Warn'
+                [System.Windows.Forms.MessageBox]::Show(
+                    "The remote user '$remoteUser' is not in the 'docker' group.`n`nDocker commands may fail with permission errors.`n`nFix this on the remote host:`n  sudo usermod -aG docker $remoteUser`n`nThen log out and back in (or reboot) for it to take effect.",
+                    'Docker Group Warning', 'OK', 'Warning') | Out-Null
+            }
+        }
+    } catch {
+        Write-Log "Could not check docker group membership: $($_.Exception.Message)" 'Debug'
+    }
+
     return $true
 }
 
@@ -1863,13 +1958,13 @@ function Ensure-LocalPreparation {
         $dockerVersion = & docker --version 2>&1
         if ($LASTEXITCODE -ne 0) {
             Write-Log 'Docker is not available locally.' 'Error'
-            [System.Windows.Forms.MessageBox]::Show('Docker is not available on this system.`n`nPlease ensure Docker Desktop is installed and running.', 'Docker Not Available', 'OK', 'Error') | Out-Null
+            [System.Windows.Forms.MessageBox]::Show('Docker is not available on this system.`n`nPlease ensure Docker Desktop is installed and running on your Windows machine.', 'Docker Not Available', 'OK', 'Error') | Out-Null
             return $false
         }
         Write-Log "Docker detected: $dockerVersion" 'Info'
     } catch {
         Write-Log "Could not check Docker availability: $($_.Exception.Message)" 'Error'
-        [System.Windows.Forms.MessageBox]::Show('Could not verify Docker availability.`n`nPlease ensure Docker Desktop is installed and running.', 'Docker Check Failed', 'OK', 'Error') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show('Could not verify Docker availability.`n`nPlease ensure Docker Desktop is installed and running on your Windows machine.', 'Docker Check Failed', 'OK', 'Error') | Out-Null
         return $false
     }
 
@@ -2482,8 +2577,8 @@ function Show-ContainerManager {
             $dockerArgs += @('-v',"$($volOut):/home/rstudio/$($State.SelectedRepo)/outputs",
                              '-v',"$($volSyn):/home/rstudio/$($State.SelectedRepo)/inputs/synthpop")
         } else {
-            $outDocker = Convert-PathToDockerFormat -Path $outputDir
-            $synDocker = Convert-PathToDockerFormat -Path $synthDir
+            $outDocker = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $outputDir } else { $outputDir }
+            $synDocker = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $synthDir } else { $synthDir }
             # repo already mounted above; only bind outputs and synthpop to avoid duplicate mount targets
             $dockerArgs += @('--mount',"type=bind,source=$outDocker,target=/home/rstudio/$($State.SelectedRepo)/outputs",
                              '--mount',"type=bind,source=$synDocker,target=/home/rstudio/$($State.SelectedRepo)/inputs/synthpop")
