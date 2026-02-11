@@ -301,6 +301,15 @@ The application presents 7+ dialogs in sequence. All share the dark theme.
 8. Show repo selection dialog
 9. Create Docker context `remote-<ip>` with `host=ssh://<remoteHost>`
 10. If context fails: set `Flags.UseDirectSsh = $true`, use `DOCKER_HOST` env var
+11. **Verify remote Docker Engine**: SSH into remote host, run `docker version --format '{{.Server.Version}}'`
+12. If Docker CLI not found: show error with install instructions (`sudo apt-get install docker-ce ...`) and abort
+13. **Auto-start daemon**: If CLI exists but daemon is not running, offer to start via interactive SSH + `sudo systemctl start docker` (user enters sudo password in console). Wait 3s and re-verify.
+14. **Docker group check**: Run `groups` via SSH; warn if remote user is not in the `docker` group
+6. Sync or create `known_hosts` on remote
+7. Scan repos: `ls -1d <base>/*/ | xargs -n1 basename`
+8. Show repo selection dialog
+9. Create Docker context `remote-<ip>` with `host=ssh://<remoteHost>`
+10. If context fails: set `Flags.UseDirectSsh = $true`, use `DOCKER_HOST` env var
 
 ### Phase 5 — Password Bootstrap (Remote)
 
@@ -460,8 +469,9 @@ The script uses several consistent error handling strategies:
 | Dependency | Required? | Used By | Install Method |
 |---|---|---|---|
 | **PowerShell 7** | Yes | Entire script | `winget install Microsoft.PowerShell` |
-| **Docker Desktop** | Yes (local) | Build, run, stop, volume ops | [docker.com](https://www.docker.com/products/docker-desktop/) |
-| **Docker CLI** | Yes | All Docker operations | Included with Docker Desktop |
+| **Docker Desktop** | Yes (local/Windows) | Build, run, stop, volume ops (local mode) | [docker.com](https://www.docker.com/products/docker-desktop/) |
+| **Docker Engine** | Yes (remote/Linux) | Build, run, stop, volume ops (remote mode) | `sudo apt-get install docker-ce docker-ce-cli containerd.io` |
+| **Docker CLI** | Yes | All Docker operations | Included with Docker Desktop (Windows) or Docker Engine (Linux) |
 | **OpenSSH (ssh)** | Yes | Remote operations, key generation | Windows Optional Feature |
 | **ssh-keygen** | Yes | Key generation | Included with OpenSSH |
 | **ssh-agent** | Optional | Key management | Windows service |
@@ -544,6 +554,8 @@ If the icon causes a compilation error, the script retries without the icon file
 | **Git push requires SSH key in GitHub** | HTTPS push is not supported; remotes are converted to SSH |
 | **P/Invoke for multi-monitor** | The Win32 `Add-Type` block may conflict if loaded multiple times in the same session (guarded by `-as [type]` check) |
 | **Remote Docker requires SSH access** | No support for Docker over TLS or other remote protocols |
+| **Remote Docker auto-start requires sudo** | `sudo systemctl start docker` runs in an interactive SSH session; the user must type the sudo password. Fully headless/automated auto-start is not supported when passwordless sudo is unavailable. |
+| **Remote user must be in docker group** | The tool warns but does not block if the remote user is not in the `docker` group. Docker commands may fail with permission errors. Fix: `sudo usermod -aG docker <user>` + re-login. |
 | **Volume cleanup on crash** | If the tool crashes during volume sync, orphaned volumes remain until manually removed |
 
 ---
