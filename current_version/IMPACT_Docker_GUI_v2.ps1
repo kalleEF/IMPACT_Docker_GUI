@@ -1019,6 +1019,37 @@ function Ensure-SshAgentRunning {
         }
     }
 
+    # Best-effort cleanup: remove stale keys from agent whose files no longer exist on disk
+    $sshAgentService = Get-Service ssh-agent -ErrorAction SilentlyContinue
+    if ($sshAgentService -and $sshAgentService.Status -eq 'Running') {
+        try {
+            $loadedRaw = & ssh-add -l 2>&1
+            if ($LASTEXITCODE -eq 0 -and $loadedRaw -notmatch 'no identities') {
+                foreach ($kl in ($loadedRaw -split "`n")) {
+                    $kl = $kl.Trim()
+                    if (-not $kl) { continue }
+                    # ssh-add -l format: "bits fingerprint path/comment (type)"
+                    if ($kl -match '^\d+\s+\S+\s+(.+?)\s+\(\S+\)$') {
+                        $keyRef = $Matches[1].Trim()
+                        $nativePath = $keyRef -replace '/', '\'
+                        if ($nativePath.StartsWith('~')) { $nativePath = Join-Path $HOME $nativePath.Substring(2) }
+                        if (($keyRef -match '^(/|[A-Za-z]:\\|~[/\\])') -and -not (Test-Path $nativePath)) {
+                            Write-Log "Stale key in ssh-agent (file deleted): $keyRef" 'Warn'
+                            $pubPath = "${nativePath}.pub"
+                            if (Test-Path $pubPath) {
+                                try { & ssh-add -d $pubPath 2>&1 | Out-Null; Write-Log "Removed stale key from agent: $keyRef" 'Info' } catch { }
+                            } else {
+                                Write-Log "Cannot auto-remove agent key (pub file also missing): $keyRef — consider running 'ssh-add -D' to clear all agent keys." 'Debug'
+                            }
+                        }
+                    }
+                }
+            }
+        } catch {
+            Write-Log "Agent stale-key check failed: $($_.Exception.Message)" 'Debug'
+        }
+    }
+
     # Add the key to the agent (only if the service is running)
     $sshAgentService = Get-Service ssh-agent -ErrorAction SilentlyContinue
     if ($sshAgentService -and $sshAgentService.Status -eq 'Running') {
@@ -1037,6 +1068,58 @@ function Ensure-SshAgentRunning {
     } else {
         Write-Log 'ssh-agent service is not running; skipping ssh-add.' 'Warn'
     }
+}
+
+# Helper: remove an entire Host block (and its preceding IMPACT comment) from ~/.ssh/config
+function Remove-SshConfigHostBlock {
+    param(
+        [string]$ConfigPath,
+        [string]$HostPattern
+    )
+    if (-not (Test-Path $ConfigPath)) { return $false }
+
+    $lines = Get-Content $ConfigPath -ErrorAction SilentlyContinue
+    if (-not $lines) { return $false }
+
+    $resultLines = [System.Collections.Generic.List[string]]::new()
+    $inBlock = $false
+    $removed = $false
+    $hostEscaped = [regex]::Escape($HostPattern)
+
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+
+        if ($line -match "^\s*Host\s+$hostEscaped\s*`$") {
+            $inBlock = $true
+            $removed = $true
+            # Also strip any preceding IMPACT comment and blank lines
+            while ($resultLines.Count -gt 0 -and (
+                $resultLines[$resultLines.Count - 1] -match '^\s*#.*IMPACT' -or
+                [string]::IsNullOrWhiteSpace($resultLines[$resultLines.Count - 1])
+            )) {
+                $resultLines.RemoveAt($resultLines.Count - 1)
+            }
+            continue
+        }
+
+        if ($inBlock) {
+            # Block ends when the next Host directive appears
+            if ($line -match '^\s*Host\s+') {
+                $inBlock = $false
+                $resultLines.Add($line)
+            }
+            continue
+        }
+
+        $resultLines.Add($line)
+    }
+
+    if ($removed) {
+        Set-Content -Path $ConfigPath -Value $resultLines -Encoding UTF8
+        Write-Log "Removed SSH config Host block for $HostPattern" 'Info'
+    }
+
+    return $removed
 }
 
 # Helper: ensure ~/.ssh/config has an entry for the remote workstation
@@ -1068,9 +1151,55 @@ function Ensure-SshConfigEntry {
     # Check if config file already contains an entry for this host
     if (Test-Path $configPath) {
         $existingConfig = Get-Content $configPath -Raw -ErrorAction SilentlyContinue
-        if ($existingConfig -match "(?mi)^\s*Host\s+$([regex]::Escape($RemoteHostIp))\s*$") {
-            Write-Log "SSH config already contains entry for Host $RemoteHostIp — skipping." 'Debug'
-            return
+        if ($existingConfig -match "(?mi)^\s*Host\s+$([regex]::Escape($RemoteHostIp))\s*`$") {
+            # Entry exists — validate that the referenced IdentityFile still exists on disk
+            $configLines = $existingConfig -split "`n"
+            $inBlock = $false
+            $existingIdentityFile = $null
+
+            foreach ($cl in $configLines) {
+                $cl = $cl.TrimEnd("`r")
+                if ($cl -match "^\s*Host\s+$([regex]::Escape($RemoteHostIp))\s*`$") {
+                    $inBlock = $true; continue
+                }
+                if ($inBlock) {
+                    if ($cl -match '^\s*Host\s+') { break }
+                    if ($cl -match '^\s*IdentityFile\s+(.+)$') {
+                        $existingIdentityFile = $Matches[1].Trim()
+                    }
+                }
+            }
+
+            $needsUpdate = $false
+            if ($existingIdentityFile) {
+                # Normalize existing value for comparison (backslashes → forward slashes)
+                $existingNorm = $existingIdentityFile -replace '\\','/'
+                # Convert to native path for existence check on disk
+                $checkPath = $existingIdentityFile -replace '/','\'
+                if ($checkPath.StartsWith('~')) { $checkPath = Join-Path $HOME $checkPath.Substring(2) }
+                if (-not (Test-Path $checkPath)) {
+                    Write-Log "SSH config for $RemoteHostIp points to deleted key: $existingIdentityFile — replacing entry." 'Warn'
+                    $needsUpdate = $true
+                } elseif ($existingNorm -ne $identityNorm) {
+                    Write-Log "SSH config for $RemoteHostIp references different key ($existingIdentityFile vs $identityNorm) — updating." 'Info'
+                    $needsUpdate = $true
+                } elseif ($existingIdentityFile -ne $identityNorm) {
+                    # Same logical path but wrong slash direction — SSH may not resolve backslashes correctly
+                    Write-Log "SSH config for $RemoteHostIp has backslashes in IdentityFile — fixing slash direction." 'Warn'
+                    $needsUpdate = $true
+                }
+            } else {
+                Write-Log "SSH config entry for $RemoteHostIp has no IdentityFile — replacing." 'Warn'
+                $needsUpdate = $true
+            }
+
+            if (-not $needsUpdate) {
+                Write-Log "SSH config already contains valid entry for Host $RemoteHostIp — skipping." 'Debug'
+                return
+            }
+
+            # Remove the stale Host block before re-adding with the correct key
+            Remove-SshConfigHostBlock -ConfigPath $configPath -HostPattern $RemoteHostIp
         }
     }
 
@@ -1449,6 +1578,11 @@ function Ensure-RemotePreparation {
 
     $sshKeyPath = $State.Paths.SshPrivate
 
+    # Validate/repair SSH config entry BEFORE any SSH operations.
+    # If a previous session wrote a config entry pointing to a key that was later deleted,
+    # SSH (and Docker over SSH) will fail because IdentitiesOnly=yes prevents fallback.
+    Ensure-SshConfigEntry -RemoteHostIp $remoteIp -RemoteUser $remoteUser -IdentityFile $sshKeyPath
+
     # Quick probe to see if key auth already works to avoid prompting for password unnecessarily
     $keyAuthorized = $false
     try {
@@ -1478,6 +1612,9 @@ touch "$AUTH_KEYS" && chmod 600 "$AUTH_KEYS"
 echo "{2}" > "$KEY_TARGET_PUB"
 chown {0}:{0} "$KEY_TARGET_PUB"
 chmod 644 "$KEY_TARGET_PUB"
+
+# Remove any previous keys for this IMPACT user (comment marker: IMPACT_{1})
+sed -i '/IMPACT_{1}/d' "$AUTH_KEYS" 2>/dev/null || true
 
 if ! grep -qxF "{2}" "$AUTH_KEYS"; then
     echo "{2}" >> "$AUTH_KEYS"
@@ -1595,6 +1732,10 @@ chown ${ACTUAL_USER}:${ACTUAL_USER} "$KEY_TARGET_PUB"
 chmod 644 "$KEY_TARGET_PUB"
 
 NEW_KEY=$(cat "$KEY_TARGET_PUB")
+
+# Remove any previous keys for this IMPACT user (comment marker: IMPACT___USERNAME__)
+sed -i '/IMPACT___USERNAME__/d' "$AUTH_KEYS" 2>/dev/null || true
+
 if ! grep -qxF "$NEW_KEY" "$AUTH_KEYS"; then
     echo "$NEW_KEY" >> "$AUTH_KEYS"
     echo KEY_ADDED
@@ -1656,8 +1797,7 @@ echo SSH_KEY_COPIED
 
     Write-Log 'SSH key present on remote host.' 'Info'
 
-    # Ensure local SSH config has an entry for this remote workstation
-    Ensure-SshConfigEntry -RemoteHostIp $remoteIp -RemoteUser $remoteUser -IdentityFile $sshKeyPath
+    # SSH config was already validated/created at the top of this function.
 
     # Sync SSH private key and known_hosts onto remote for Git inside container
     Write-Log 'Syncing SSH private key and known_hosts to remote host.' 'Info'
@@ -2517,11 +2657,13 @@ function Show-ContainerManager {
 
         $repoMountSource = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $projectRoot } else { $projectRoot }
 
+        # Use a writable path for the SSH key inside the container so permissions can be fixed for the rstudio user (uid 1000)
+        $containerKeyPath = "/home/rstudio/.ssh/id_ed25519_$($State.UserName)"
         $dockerArgs = @('run','-d','--rm','--name',$State.ContainerName,
             '-e',"PASSWORD=$($State.Password)",
             '-e','DISABLE_AUTH=false',
             '-e','USERID=1000','-e','GROUPID=1000',
-            '-e',"GIT_SSH_COMMAND=ssh -i /keys/id_ed25519_$($State.UserName) -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/ssh/ssh_known_hosts -o StrictHostKeyChecking=yes",
+            '-e',"GIT_SSH_COMMAND=ssh -i $containerKeyPath -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/ssh/ssh_known_hosts -o StrictHostKeyChecking=yes",
             '--mount',"type=bind,source=$repoMountSource,target=/host-repo",
             '--mount',"type=bind,source=$repoMountSource,target=/home/rstudio/$($State.SelectedRepo)",
             '-e','REPO_SYNC_PATH=/host-repo','-e','SYNC_ENABLED=true',
@@ -2599,6 +2741,22 @@ function Show-ContainerManager {
         if ($LASTEXITCODE -ne 0) {
             [System.Windows.Forms.MessageBox]::Show("Failed to start container: $rc",'Container start failed','OK','Error') | Out-Null
             return
+        }
+
+        # Copy the SSH key from the readonly bind mount to a writable location with correct ownership.
+        # The bind mount preserves host-side ownership (e.g. php-workstation), but inside the container
+        # the rstudio user (uid 1000) needs to own the private key for SSH to accept it.
+        $fixKeyCmd = "mkdir -p /home/rstudio/.ssh && cp /keys/id_ed25519_$($State.UserName) $containerKeyPath && chmod 600 $containerKeyPath && chown 1000:1000 $containerKeyPath && cp /etc/ssh/ssh_known_hosts /home/rstudio/.ssh/known_hosts 2>/dev/null; chmod 644 /home/rstudio/.ssh/known_hosts 2>/dev/null; chown 1000:1000 /home/rstudio/.ssh/known_hosts 2>/dev/null; echo KEY_FIXED"
+        $fixCtx = (Get-DockerContextArgs -State $State) + @('exec', $State.ContainerName, 'sh', '-c', $fixKeyCmd)
+        try {
+            $fixOut = & docker $fixCtx 2>&1
+            if ($fixOut -match 'KEY_FIXED') {
+                Write-Log 'SSH key permissions fixed inside container.' 'Info'
+            } else {
+                Write-Log "SSH key permission fix may have failed: $fixOut" 'Warn'
+            }
+        } catch {
+            Write-Log "SSH key permission fix failed: $($_.Exception.Message)" 'Warn'
         }
 
         if ($State.ContainerLocation -like 'REMOTE@*') {
