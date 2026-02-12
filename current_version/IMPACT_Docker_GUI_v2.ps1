@@ -57,6 +57,7 @@ function Get-BuildInfo {
     } catch { $commit = $null }
 
     $commitTag = if ($commit) { $commit + $(if($dirty){'*'}) } else { 'unknown' }
+    Write-Log "Build info resolved: commit=$commitTag dirty=$dirty" 'Debug'
     return [pscustomobject]@{ Version=$version; Built=$built; Commit=$commitTag }
 }
 
@@ -96,7 +97,7 @@ function New-SessionState {
         Metadata          = @{}
     }
 
-    Write-Log 'Initialized session state.' 'Info'
+    Write-Log "Initialized session state (PID=$PID)." 'Info'
     Write-Log "State defaults -> RemoteUser=$($state.RemoteUser), PS7Requested=$($state.Flags.PS7Requested), Debug=$($state.Flags.Debug)" 'Debug'
     return $state
 }
@@ -195,7 +196,7 @@ function Ensure-PowerShell7 {
 # Build ssh:// target from state
 function Get-RemoteHostString {
     param([pscustomobject]$State)
-    Write-Log 'Resolving remote host target.' 'Info'
+    Write-Log "Resolving remote host target (RemoteHost=$($State.RemoteHost), IP=$($State.RemoteHostIp))." 'Debug'
     if ($State.RemoteHost) { return $State.RemoteHost }
     return $State.RemoteHostIp
 }
@@ -230,7 +231,7 @@ function Set-DockerSSHEnvironment {
 # Helper to standardize docker context/host arguments based on connection mode
 function Get-DockerContextArgs {
     param([pscustomobject]$State)
-    Write-Log "Selecting Docker context arguments for $($State.ContainerLocation)" 'Info'
+    Write-Log "Selecting Docker context arguments for $($State.ContainerLocation)" 'Debug'
     $result = @()
     if ($State.ContainerLocation -like 'REMOTE@*') {
         if ($State.Flags.UseDirectSsh) {
@@ -248,7 +249,7 @@ function Get-DockerContextArgs {
 # Convert Windows path to Docker/WSL style
 function Convert-PathToDockerFormat {
     param([string]$Path)
-    Write-Log "Converting path to Docker format: $Path" 'Info'
+    Write-Log "Converting path to Docker format: $Path" 'Debug'
     if ($Path -match '^([A-Za-z]):\\?(.*)$') {
         $drive = $matches[1].ToLower()
         $rest = $matches[2] -replace '\\','/'
@@ -312,7 +313,9 @@ function Write-RemoteContainerMetadata {
     try {
         & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "mkdir -p /tmp/impactncd && umask 177 && echo $b64 | base64 -d > '$metaPath'" 2>$null
         Write-Log 'Remote metadata saved.' 'Info'
-    } catch { }
+    } catch {
+        Write-Log "Remote metadata SSH write failed: $($_.Exception.Message)" 'Warn'
+    }
 }
 
 function Remove-RemoteContainerMetadata {
@@ -322,7 +325,9 @@ function Remove-RemoteContainerMetadata {
     $keyPath = $State.Paths.SshPrivate
     $metaPath = "/tmp/impactncd/$($State.ContainerName).json"
     Write-Log "Removing remote metadata at $metaPath on $remoteHost" 'Info'
-    try { & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "rm -f '$metaPath'" 2>$null } catch { }
+    try { & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "rm -f '$metaPath'" 2>$null } catch {
+        Write-Log "Remote metadata removal failed: $($_.Exception.Message)" 'Warn'
+    }
 }
 
 function Read-RemoteContainerMetadata {
@@ -434,7 +439,7 @@ function Test-AndCreateDirectory {
                 Write-Log "Remote path missing (no auto-create): $Path" 'Error'
                 return $false
             }
-            Write-Log "Remote path exists." 'Debug'
+            Write-Log "Remote path verified for ${PathKey}: $Path" 'Debug'
             return $true
         } catch {
             Write-Log "Failed to validate remote directory ${Path}: $($_.Exception.Message)" 'Debug'
@@ -618,6 +623,7 @@ function Invoke-GitChangeDetection {
             Pop-Location
         }
     } catch {
+        Write-Log "Git change detection error: $($_.Exception.Message)" 'Warn'
         [System.Windows.Forms.MessageBox]::Show('Git commit/push encountered an error. See console for details.','Git error','OK','Error') | Out-Null
     }
 }
@@ -750,14 +756,10 @@ function Test-StartupPrerequisites {
         [System.Windows.Forms.MessageBox]::Show('Docker CLI not found.`n`nInstall Docker Desktop (Windows) and ensure "docker" is on PATH, then retry.','Docker missing','OK','Error') | Out-Null
         return $false
     }
-
-    $dockerVersion = $null
-    try { $dockerVersion = (& docker version --format '{{.Server.Version}}' 2>$null) } catch { $dockerVersion = $null }
-    if (-not $dockerVersion) {
-        Write-Log 'Docker daemon is not reachable. Start Docker Desktop (Windows) and retry.' 'Error'
-        [System.Windows.Forms.MessageBox]::Show('Docker daemon is not reachable.`n`nStart Docker Desktop and retry. The local Docker daemon is required for context management.','Docker not running','OK','Error') | Out-Null
-        return $false
-    }
+    Write-Log "Docker CLI found at $($dockerCmd.Source)." 'Debug'
+    # NOTE: Docker daemon reachability is NOT checked here. For LOCAL mode, Ensure-LocalPreparation
+    # handles auto-start of Docker Desktop with polling and user prompts. For REMOTE mode, a local
+    # daemon is not required. This avoids misleading error dialogs before the user has chosen a mode.
 
     $sshCmd = Get-Command ssh -ErrorAction SilentlyContinue
     if (-not $sshCmd) {
@@ -811,7 +813,7 @@ function Test-StartupPrerequisites {
         }
     }
 
-    Write-Log "Prereq check passed (Docker=$dockerVersion, ssh present)." 'Info'
+    Write-Log "Prereq check passed (Docker CLI at $($dockerCmd.Source), ssh present)." 'Info'
     return $true
 }
 
@@ -828,7 +830,7 @@ function Ensure-Prerequisites {
 
     Write-Log "Detected PowerShell $($PSVersionTable.PSVersion) (Major=$($PSVersionTable.PSVersion.Major))" 'Debug'
 
-    if (-not (Test-StartupPrerequisites -State $State)) { return }
+    if (-not (Test-StartupPrerequisites -State $State)) { return $false }
 
     $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')
     Write-Log "Administrative privileges: $isAdmin" 'Debug'
@@ -847,12 +849,13 @@ function Ensure-Prerequisites {
         Write-Log 'Could not adjust console colors.' 'Debug'
     }
 
+    return $true
 }
 
 # 1. Credential dialog
 function Show-CredentialDialog {
     param([pscustomobject]$State)
-    Write-Log 'Collecting credentials' 'Info'
+    Write-Log 'Collecting credentials — opening dialog.' 'Info'
 
     Write-Log 'Opening credential dialog for username/password input.' 'Debug'
 
@@ -997,7 +1000,7 @@ function Ensure-SshAgentRunning {
             $started = $true
             Write-Log 'ssh-agent service started (no elevation needed).' 'Info'
         } catch {
-            Write-Log "Direct Start-Service ssh-agent failed: $($_.Exception.Message). Attempting elevated start." 'Info'
+            Write-Log "Direct Start-Service ssh-agent failed: $($_.Exception.Message). Attempting elevated start." 'Warn'
         }
 
         if (-not $started) {
@@ -1076,6 +1079,7 @@ function Remove-SshConfigHostBlock {
         [string]$ConfigPath,
         [string]$HostPattern
     )
+    Write-Log "Remove-SshConfigHostBlock called for HostPattern='$HostPattern' ConfigPath='$ConfigPath'" 'Debug'
     if (-not (Test-Path $ConfigPath)) { return $false }
 
     $lines = Get-Content $ConfigPath -ErrorAction SilentlyContinue
@@ -1116,7 +1120,9 @@ function Remove-SshConfigHostBlock {
 
     if ($removed) {
         Set-Content -Path $ConfigPath -Value $resultLines -Encoding UTF8
-        Write-Log "Removed SSH config Host block for $HostPattern" 'Info'
+        Write-Log "Removed SSH config Host block for '$HostPattern' from $ConfigPath" 'Info'
+    } else {
+        Write-Log "No matching Host block found for '$HostPattern'." 'Debug'
     }
 
     return $removed
@@ -1137,6 +1143,7 @@ function Ensure-SshConfigEntry {
 
     $sshDir = Join-Path $HOME '.ssh'
     $configPath = Join-Path $sshDir 'config'
+    Write-Log "Ensure-SshConfigEntry: sshDir='$sshDir' configPath='$configPath' RemoteHostIp='$RemoteHostIp'" 'Debug'
 
     Write-Log "Ensuring SSH config entry for $RemoteHostIp in $configPath" 'Info'
 
@@ -1266,7 +1273,7 @@ function Ensure-GitKeySetup {
         Write-Log "Created .ssh directory at $sshDir" 'Info'
     }
 
-    Write-Host "Generating SSH key..."
+    Write-Log "Generating SSH key at $sshKeyPath (comment=IMPACT_$($State.UserName))" 'Info'
     $sshKeyGenArgs = @(
         '-t', 'ed25519',
         '-C', "IMPACT_$($State.UserName)",
@@ -1289,6 +1296,7 @@ function Ensure-GitKeySetup {
         return $false
     }
 
+    Write-Log "SSH key generated successfully at $sshKeyPath" 'Info'
     $publicKey = Get-Content $sshPublicKeyPath -ErrorAction Stop
     $State.Metadata.PublicKey = ($publicKey -join "`n")
 
@@ -1411,7 +1419,7 @@ function Ensure-GitKeySetup {
 # 3. Location selection (local vs remote)
 function Select-Location {
     param([pscustomobject]$State)
-    Write-Log 'Container location selection' 'Info'
+    Write-Log 'Opening container location selection dialog.' 'Info'
 
     $formConnection = New-Object System.Windows.Forms.Form -Property @{
         Text = 'Container Location - IMPACT NCD Germany'
@@ -1510,6 +1518,7 @@ function Select-Location {
         $State.RemoteHost = $null
         $State.RemoteHostIp = $null
         $State.RemoteRepoBase = "/home/$($State.RemoteUser)/Schreibtisch/Repositories"
+        Write-Log 'User selected LOCAL container location.' 'Info'
         $formConnection.DialogResult = [System.Windows.Forms.DialogResult]::Yes
         $formConnection.Close()
     })
@@ -1530,6 +1539,7 @@ function Select-Location {
         $State.RemoteHost = "$($State.RemoteUser)@$userProvidedIP"
         $State.RemoteRepoBase = "/home/$($State.RemoteUser)/Schreibtisch/Repositories"
         $State.ContainerLocation = "REMOTE@$userProvidedIP"
+        Write-Log "User selected REMOTE container location at IP=$userProvidedIP." 'Info'
         $formConnection.DialogResult = [System.Windows.Forms.DialogResult]::No
         $formConnection.Close()
     })
@@ -1763,7 +1773,7 @@ echo SSH_KEY_COPIED
             Write-Log "Posh-SSH bootstrap failed: $($_.Exception.Message)" 'Warn'
         } finally {
             if ($sshSession) { try { Remove-SSHSession -SessionId $sshSession.SessionId -ErrorAction SilentlyContinue | Out-Null } catch { } }
-            if (Get-Variable tempKeyFile -Scope 0 -ErrorAction SilentlyContinue) { try { Remove-Item $tempKeyFile -Force -ErrorAction SilentlyContinue } catch { } }
+            if (Get-Variable tempKeyFile -Scope 0 -ErrorAction SilentlyContinue) { try { Remove-Item $tempKeyFile -Force -ErrorAction SilentlyContinue; Write-Log 'Removed temporary key file.' 'Debug' } catch { } }
         }
 
         if (-not $keyAuthorized) {
@@ -1795,7 +1805,7 @@ echo SSH_KEY_COPIED
         }
     }
 
-    Write-Log 'SSH key present on remote host.' 'Info'
+    Write-Log "SSH key authorized on remote host for user $($State.UserName)." 'Info'
 
     # SSH config was already validated/created at the top of this function.
 
@@ -1822,6 +1832,7 @@ echo SSH_KEY_COPIED
     } else {
         $createKhCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && rm -f ~/.ssh/known_hosts && touch ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts && chown ${remoteUser}:${remoteUser} ~/.ssh/known_hosts && echo KNOWN_HOSTS_EMPTY"
         & ssh @sshArgs $createKhCmd 2>&1 | Out-Null
+        Write-Log 'Created empty known_hosts on remote host.' 'Debug'
     }
 
     # 4.1.2: Scan remote repo list
@@ -2092,12 +2103,12 @@ function Ensure-LocalPreparation {
         Write-Log 'Git repository detected in selected folder.' 'Info'
     }
 
-    Write-Log 'Checking local Docker availability and context' 'Info'
+    Write-Log 'Checking local Docker availability and context.' 'Info'
 
     try {
         $dockerVersion = & docker --version 2>&1
         if ($LASTEXITCODE -ne 0) {
-            Write-Log 'Docker is not available locally.' 'Error'
+            Write-Log "Docker CLI returned non-zero exit code (exit=$LASTEXITCODE). Output: $dockerVersion" 'Error'
             [System.Windows.Forms.MessageBox]::Show('Docker is not available on this system.`n`nPlease ensure Docker Desktop is installed and running on your Windows machine.', 'Docker Not Available', 'OK', 'Error') | Out-Null
             return $false
         }
@@ -2199,7 +2210,7 @@ function Ensure-LocalPreparation {
     if (-not $dockerRunning) {
         Write-Log 'Docker engine may still be unavailable; continuing with caution.' 'Warn'
     } else {
-        Write-Log 'Docker engine is running.' 'Info'
+        Write-Log "Docker engine is running (version: $quickCheck)." 'Info'
     }
 
     $LocalContextName = 'local'
@@ -2245,7 +2256,7 @@ function Ensure-LocalPreparation {
 # 5. Container status detection
 function Get-ContainerStatus {
     param([pscustomobject]$State)
-    Write-Log 'Container status check' 'Info'
+    Write-Log "Checking status of container '$($State.ContainerName)' on $($State.ContainerLocation)." 'Info'
 
     Set-DockerSSHEnvironment -State $State
     $ctxArgs = Get-DockerContextArgs -State $State
@@ -2305,6 +2316,11 @@ function Get-ContainerStatus {
         Write-Log "Running check failed: $($_.Exception.Message)" 'Warn'
     }
     $State.Metadata.ContainerRunning = $isRunning
+    if ($isRunning) {
+        Write-Log "Container '$($State.ContainerName)' is currently running." 'Debug'
+    } else {
+        Write-Log "Container '$($State.ContainerName)' is not running." 'Debug'
+    }
 
     # If running, attempt to recover connection details
     if ($isRunning) {
@@ -2643,7 +2659,11 @@ function Show-ContainerManager {
                 $status = & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cd '$projectRoot' && git status --porcelain" 2>$null
                 $State.Metadata.GitBaseline = @{ Repo=$projectRoot; Commit=$hash; Status=$status; Timestamp=Get-Date }
             }
-        } catch { $State.Metadata.GitBaseline = $null }
+            Write-Log "Captured git baseline: commit=$hash" 'Debug'
+        } catch {
+            Write-Log "Git baseline capture failed: $($_.Exception.Message)" 'Debug'
+            $State.Metadata.GitBaseline = $null
+        }
 
         # Resolve output/synthpop from sim_design
         $baseDirForYaml = ($projectRoot -replace '\\','/')
@@ -2691,8 +2711,10 @@ function Show-ContainerManager {
             $ctxPrefix = Get-DockerContextArgs -State $State
 
             # Ensure rsync-alpine exists (for later sync)
+            Write-Log 'Checking/building rsync-alpine helper image.' 'Debug'
             & docker @ctxPrefix @('image','inspect','rsync-alpine') 2>$null
             if ($LASTEXITCODE -ne 0) {
+                Write-Log 'rsync-alpine image not found; building inline.' 'Debug'
                 $dockerfileInline = "FROM alpine:latest`nRUN apk add --no-cache rsync"
                 if ($State.ContainerLocation -like 'REMOTE@*') {
                     $dockerfileInline | & docker @ctxPrefix @('build','-t','rsync-alpine','-f','-','.')
@@ -2701,16 +2723,19 @@ function Show-ContainerManager {
                 }
             }
 
+            Write-Log "Creating Docker volumes: $volOut, $volSyn" 'Debug'
             & docker @ctxPrefix @('volume','rm',$volOut,'-f') 2>$null
             & docker @ctxPrefix @('volume','rm',$volSyn,'-f') 2>$null
             & docker @ctxPrefix @('volume','create',$volOut) | Out-Null
             & docker @ctxPrefix @('volume','create',$volSyn) | Out-Null
 
             # Fix ownership
+            Write-Log 'Setting volume ownership (chown 1000:1000).' 'Debug'
             & docker @ctxPrefix @('run','--rm','-v',"${volOut}:/volume",'alpine','sh','-c',"chown 1000:1000 /volume") 2>$null
             & docker @ctxPrefix @('run','--rm','-v',"${volSyn}:/volume",'alpine','sh','-c',"chown 1000:1000 /volume") 2>$null
 
             # Pre-populate volumes from host dirs
+            Write-Log 'Pre-populating volumes from host directories.' 'Debug'
             $dockerOutputSource = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $outputDir } else { $outputDir }
             $dockerSynthSource  = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $synthDir } else { $synthDir }
             & docker @ctxPrefix @('run','--rm','--user','1000:1000','-v',"${dockerOutputSource}:/source",'-v',"${volOut}:/volume",'alpine','sh','-c','cp -r /source/. /volume/ 2>/dev/null || cp -a /source/. /volume/ 2>/dev/null || true') 2>$null
@@ -2736,6 +2761,7 @@ function Show-ContainerManager {
                          $imageName)
 
         $runCmd = (Get-DockerContextArgs -State $State) + $dockerArgs
+        Write-Log "Starting container with: docker $($runCmd -join ' ')" 'Debug'
 
         $rc = & docker $runCmd 2>&1
         if ($LASTEXITCODE -ne 0) {
@@ -2789,6 +2815,7 @@ function Show-ContainerManager {
         $stopCmd = $ctxArgs + @('stop',$State.ContainerName)
         Write-Log "Stopping container $($State.ContainerName)" 'Info'
         & docker $stopCmd 2>$null
+        Write-Log "docker stop exit=$LASTEXITCODE" 'Debug'
         if ($LASTEXITCODE -ne 0) {
             [System.Windows.Forms.MessageBox]::Show('Failed to stop container; check Docker.','Stop failed','OK','Error') | Out-Null
             return
@@ -2812,9 +2839,12 @@ function Show-ContainerManager {
                 $outBackup = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $State.Paths.OutputDir } else { $State.Paths.OutputDir }
                 $synBackup = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $State.Paths.SynthpopDir } else { $State.Paths.SynthpopDir }
                 Write-Log "Syncing volumes back -> outVol=$volOut to $outBackup; synVol=$volSyn to $synBackup" 'Debug'
+                Write-Log "Syncing volume $volOut back to $outBackup" 'Debug'
                 & docker @ctxPrefix @('run','--rm','-v',"$($volOut):/volume",'-v',"$($outBackup):/backup",'rsync-alpine','rsync','-avc','--no-owner','--no-group','--no-times','--no-perms','--chmod=ugo=rwX','/volume/','/backup/') 2>$null
+                Write-Log "Syncing volume $volSyn back to $synBackup" 'Debug'
                 & docker @ctxPrefix @('run','--rm','-v',"$($volSyn):/volume",'-v',"$($synBackup):/backup",'rsync-alpine','rsync','-avc','--no-owner','--no-group','--no-times','--no-perms','--chmod=ugo=rwX','/volume/','/backup/') 2>$null
                 & docker @ctxPrefix @('volume','rm',$volOut,$volSyn,'-f') 2>$null
+                Write-Log "Removed volumes $volOut, $volSyn after sync." 'Debug'
             }
         }
 
@@ -2850,7 +2880,7 @@ function Invoke-ImpactGui {
     $bi = $state.Metadata.BuildInfo
     Write-Log ("Build info -> Version={0} Commit={1} Built={2}" -f $bi.Version, $bi.Commit, $bi.Built) 'Info'
 
-    Ensure-Prerequisites -State $state
+    if (-not (Ensure-Prerequisites -State $state)) { return }
     if (-not (Show-CredentialDialog -State $state)) { return }
     if (-not (Ensure-GitKeySetup -State $state)) { return }
     if (-not (Select-Location -State $state)) { return }
