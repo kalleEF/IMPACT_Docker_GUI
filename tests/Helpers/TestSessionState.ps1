@@ -17,8 +17,11 @@ function New-TestSessionState {
         [string]$Location     = 'LOCAL',          # 'LOCAL' or 'REMOTE@<ip>'
         [string]$RemoteHostIp = $null,
         [string]$SelectedRepo = 'IMPACTncd_Germany',
-        [string]$SshKeyDir    = $null              # defaults to $env:TEMP
+        [string]$SshKeyDir    = $null              # defaults to system temp
     )
+
+    # Cross-platform temp directory ($env:TEMP is null on Linux)
+    $TempDir = [System.IO.Path]::GetTempPath()
 
     # Import the module if not already loaded
     $modulePath = Join-Path $PSScriptRoot '..' 'current_version' 'IMPACT_Docker_GUI.psm1'
@@ -44,14 +47,14 @@ function New-TestSessionState {
     $state.ContainerName = "impact-$UserName"
 
     # Seed SSH key paths (use temp dir so tests don't touch real keys)
-    $keyDir = if ($SshKeyDir) { $SshKeyDir } else { Join-Path $env:TEMP 'impact_test_ssh' }
+    $keyDir = if ($SshKeyDir) { $SshKeyDir } else { Join-Path $TempDir 'impact_test_ssh' }
     if (-not (Test-Path $keyDir)) { New-Item -ItemType Directory -Path $keyDir -Force | Out-Null }
     $state.Paths.SshPrivate = Join-Path $keyDir "id_ed25519_$UserName"
     $state.Paths.SshPublic  = "$($state.Paths.SshPrivate).pub"
 
     # Repo paths for LOCAL mode
     if ($state.ContainerLocation -eq 'LOCAL') {
-        $state.Paths.LocalRepo = Join-Path $env:TEMP "impact_test_repo/$SelectedRepo"
+        $state.Paths.LocalRepo = Join-Path $TempDir "impact_test_repo/$SelectedRepo"
     } else {
         $state.RemoteRepoBase = "/home/$($state.RemoteUser)/Schreibtisch/Repositories"
         $state.Paths.RemoteRepo = "$($state.RemoteRepoBase)/$SelectedRepo"
@@ -67,7 +70,7 @@ function New-DummySshKeyPair {
     #>
     param([string]$Label = 'test')
 
-    $dir = Join-Path $env:TEMP "impact_test_ssh_$([guid]::NewGuid().ToString('N').Substring(0,8))"
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) "impact_test_ssh_$([guid]::NewGuid().ToString('N').Substring(0,8))"
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     $keyPath = Join-Path $dir "id_ed25519_$Label"
 
