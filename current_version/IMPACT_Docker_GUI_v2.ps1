@@ -1,4 +1,4 @@
-<# IMPACT Docker GUI v2 #>
+﻿<# IMPACT Docker GUI v2 #>
 <# This is the launcher script. Core functions live in IMPACT_Docker_GUI.psm1 #>
 
 [CmdletBinding()]
@@ -10,12 +10,25 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Import the companion module (same directory)
-$modulePath = Join-Path $PSScriptRoot 'IMPACT_Docker_GUI.psm1'
+# Determine the directory where this script (or compiled EXE) lives.
+# $PSScriptRoot works when running as .ps1 but is empty/wrong in a ps2exe EXE.
+if ($PSScriptRoot -and (Test-Path $PSScriptRoot)) {
+    $script:ScriptDir = $PSScriptRoot
+} else {
+    # Fallback for ps2exe-compiled EXE: use the process executable's directory
+    $script:ScriptDir = Split-Path -Parent ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
+}
+
+# Import the companion module (same directory as script/EXE)
+$modulePath = Join-Path $script:ScriptDir 'IMPACT_Docker_GUI.psm1'
 if (Test-Path $modulePath) {
     Import-Module $modulePath -Force -DisableNameChecking
 } else {
-    Write-Error "Module not found at $modulePath — cannot continue."
+    Write-Host "ERROR: Module not found at $modulePath" -ForegroundColor Red
+    Write-Host "The file 'IMPACT_Docker_GUI.psm1' must be in the same folder as this script/EXE." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Press any key to exit..." -ForegroundColor Yellow
+    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     exit 1
 }
 

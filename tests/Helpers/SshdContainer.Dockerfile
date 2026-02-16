@@ -39,7 +39,9 @@ RUN mkdir -p /home/testuser/Schreibtisch/Repositories/IMPACTncd_Germany/docker_s
     chown -R testuser:testuser /mnt/Storage_1
 
 # Initialize the fake repo as a git repository so git commands work
-RUN cd /home/testuser/Schreibtisch/Repositories/IMPACTncd_Germany && \
+# safe.directory needed because the dir is owned by testuser but we run as root
+RUN git config --global --add safe.directory '*' && \
+    cd /home/testuser/Schreibtisch/Repositories/IMPACTncd_Germany && \
     git init && \
     git config user.email "test@test.com" && \
     git config user.name "Test User" && \

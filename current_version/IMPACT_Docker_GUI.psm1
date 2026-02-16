@@ -1,4 +1,4 @@
-<# IMPACT Docker GUI v2 — Module #>
+﻿<# IMPACT Docker GUI v2 - Module #>
 # All core functions for IMPACT Docker GUI. Imported by the launcher script and by Pester tests.
 
 Set-StrictMode -Version Latest
@@ -178,7 +178,13 @@ function Ensure-PowerShell7 {
         }
         if ($invokedPath) { try { $invokedPath = [System.IO.Path]::GetFullPath($invokedPath) } catch { Write-Log "Could not normalize invoked path: $invokedPath" 'Warn' } }
 
+        # $PSCommandPath inside a .psm1 module points to the module file itself,
+        # NOT the calling launcher script. Skip it if it ends in .psm1.
         $scriptPath = $PSCommandPath
+        if ($scriptPath -and $scriptPath -match '\.psm1$') {
+            Write-Log "Ignoring PSCommandPath ($scriptPath) because it points to the module, not the launcher." 'Debug'
+            $scriptPath = $null
+        }
         if (-not $scriptPath -and $invokedPath -match '\.exe$') {
             $candidate = [System.IO.Path]::ChangeExtension($invokedPath, '.ps1')
             if (Test-Path $candidate) { $scriptPath = $candidate }
@@ -802,7 +808,7 @@ function Test-StartupPrerequisites {
             $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Client*' -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($cap -and $cap.State -ne 'Installed' -and -not $script:NonInteractive) {
                 $installChoice = [System.Windows.Forms.MessageBox]::Show(
-                    "The OpenSSH Client is not installed on this machine.`n`nThe tool needs ssh, ssh-keygen, and ssh-agent to function.`n`nInstall it now? (requires Administrator — a UAC prompt will appear)",
+                    "The OpenSSH Client is not installed on this machine.`n`nThe tool needs ssh, ssh-keygen, and ssh-agent to function.`n`nInstall it now? (requires Administrator - a UAC prompt will appear)",
                     'Install OpenSSH Client?',
                     [System.Windows.Forms.MessageBoxButtons]::YesNo,
                     [System.Windows.Forms.MessageBoxIcon]::Question)
@@ -897,7 +903,7 @@ function Show-CredentialDialog {
         return $true
     }
 
-    Write-Log 'Collecting credentials — opening dialog.' 'Info'
+    Write-Log 'Collecting credentials - opening dialog.' 'Info'
 
     $form = New-Object System.Windows.Forms.Form -Property @{
         Text = 'Remote Access - IMPACT NCD Germany'
@@ -1055,7 +1061,7 @@ function Ensure-SshAgentRunning {
                             if (Test-Path $pubPath) {
                                 try { & ssh-add -d $pubPath 2>&1 | Out-Null; Write-Log "Removed stale key from agent: $keyRef" 'Info' } catch { }
                             } else {
-                                Write-Log "Cannot auto-remove agent key (pub file also missing): $keyRef — consider running 'ssh-add -D' to clear all agent keys." 'Debug'
+                                Write-Log "Cannot auto-remove agent key (pub file also missing): $keyRef - consider running 'ssh-add -D' to clear all agent keys." 'Debug'
                             }
                         }
                     }
@@ -1176,21 +1182,21 @@ function Ensure-SshConfigEntry {
                 $checkPath = $existingIdentityFile -replace '/','\'
                 if ($checkPath.StartsWith('~')) { $checkPath = Join-Path $HOME $checkPath.Substring(2) }
                 if (-not (Test-Path $checkPath)) {
-                    Write-Log "SSH config for $RemoteHostIp points to deleted key: $existingIdentityFile — replacing entry." 'Warn'
+                    Write-Log "SSH config for $RemoteHostIp points to deleted key: $existingIdentityFile - replacing entry." 'Warn'
                     $needsUpdate = $true
                 } elseif ($existingNorm -ne $identityNorm) {
-                    Write-Log "SSH config for $RemoteHostIp references different key ($existingIdentityFile vs $identityNorm) — updating." 'Info'
+                    Write-Log "SSH config for $RemoteHostIp references different key ($existingIdentityFile vs $identityNorm) - updating." 'Info'
                     $needsUpdate = $true
                 } elseif ($existingIdentityFile -ne $identityNorm) {
-                    Write-Log "SSH config for $RemoteHostIp has backslashes in IdentityFile — fixing slash direction." 'Warn'
+                    Write-Log "SSH config for $RemoteHostIp has backslashes in IdentityFile - fixing slash direction." 'Warn'
                     $needsUpdate = $true
                 }
             } else {
-                Write-Log "SSH config entry for $RemoteHostIp has no IdentityFile — replacing." 'Warn'
+                Write-Log "SSH config entry for $RemoteHostIp has no IdentityFile - replacing." 'Warn'
                 $needsUpdate = $true
             }
             if (-not $needsUpdate) {
-                Write-Log "SSH config already contains valid entry for Host $RemoteHostIp — skipping." 'Debug'
+                Write-Log "SSH config already contains valid entry for Host $RemoteHostIp - skipping." 'Debug'
                 return
             }
             Remove-SshConfigHostBlock -ConfigPath $configPath -HostPattern $RemoteHostIp
@@ -1199,7 +1205,7 @@ function Ensure-SshConfigEntry {
 
     $entry = @"
 
-# IMPACT Docker GUI — auto-generated entry for remote workstation
+# IMPACT Docker GUI - auto-generated entry for remote workstation
 Host $RemoteHostIp
     User $RemoteUser
     IdentityFile $identityNorm
@@ -1509,7 +1515,7 @@ function Select-Location {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Container lifecycle — EXTRACTED from Show-ContainerManager event handlers
+#  Container lifecycle - EXTRACTED from Show-ContainerManager event handlers
 # ══════════════════════════════════════════════════════════════════════════════
 
 <#

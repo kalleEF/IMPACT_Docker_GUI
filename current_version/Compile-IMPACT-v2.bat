@@ -1,14 +1,14 @@
 @echo off
-REM IMPACT_v2.exe Quick Compilation Batch File
+REM IMPACT.exe Quick Compilation Batch File
 REM ========================================
-REM Double-click this file to quickly recompile IMPACT_v2.exe
+REM Double-click this file to quickly recompile IMPACT.exe
 
 REM Change to the directory where the batch file is located
 cd /d "%~dp0"
 
 echo.
-echo IMPACT_v2.exe Quick Compilation
-echo ============================
+echo IMPACT.exe Quick Compilation
+echo ==============================
 echo Current directory: %CD%
 echo.
 
