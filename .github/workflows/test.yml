@@ -1,4 +1,4 @@
-name: IMPACT Docker GUI — Tests
+name: IMPACT Docker GUI - Tests
 
 on:
   push:
@@ -10,57 +10,38 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-    # Allows manual triggering from the Actions tab (needed for E2E tests)
+    inputs:
+      run_e2e:
+        description: 'Run E2E tests (ImageValidation + RemoteE2E)'
+        type: boolean
+        default: false
   schedule:
-    # Run E2E tests weekly on Sunday at 03:00 UTC
+    # E2E tests weekly on Sunday at 03:00 UTC
     - cron: '0 3 * * 0'
 
 permissions:
   contents: read
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Architecture note:
+#  The IMPACT Docker GUI is a Windows-only PowerShell + WinForms app.
+#  However, windows-latest GitHub runners only support Windows containers
+#  (no Docker Desktop / WSL2), so Linux-container tests must run on Ubuntu
+#  with pwsh. The PowerShell module functions are cross-platform.
+#
+#  Test tiers:
+#    1. Unit (Windows)           - pure logic, no deps
+#    2. Integration (Windows)    - mocked Docker/SSH, WinForms loads
+#    3. DockerSsh (Ubuntu)       - SSH to SSHD container, tests remote funcs
+#    4. ImageValidation (Ubuntu) - builds real IMPACT image, validates container
+#    5. RemoteE2E (Ubuntu)       - full SSH -> Docker build -> container lifecycle
+# ═══════════════════════════════════════════════════════════════════════════════
+
 jobs:
   # ─────────────────────────────────────────────────────────────────────────
-  #  Unit tests — cross-platform (no Docker, no SSH required)
+  #  Unit tests - Windows (primary platform for the script)
   # ─────────────────────────────────────────────────────────────────────────
-  unit-tests-ubuntu:
-    name: Unit Tests (Ubuntu)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install PowerShell 7
-        shell: bash
-        run: |
-          # pwsh is pre-installed on ubuntu-latest, verify
-          pwsh --version
-
-      - name: Install Pester
-        shell: pwsh
-        run: |
-          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
-
-      - name: Run Unit Tests
-        shell: pwsh
-        run: |
-          Import-Module Pester -MinimumVersion 5.0.0
-          $config = New-PesterConfiguration
-          $config.Run.Path = './tests/Unit.Tests.ps1'
-          $config.Filter.Tag = @('Unit')
-          $config.Output.Verbosity = 'Detailed'
-          $config.Run.Exit = $true
-          $config.TestResult.Enabled = $true
-          $config.TestResult.OutputFormat = 'NUnitXml'
-          $config.TestResult.OutputPath = './tests/TestResults-Unit-Ubuntu.xml'
-          Invoke-Pester -Configuration $config
-
-      - name: Upload Test Results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results-unit-ubuntu
-          path: tests/TestResults-Unit-Ubuntu.xml
-
-  unit-tests-windows:
+  unit-tests:
     name: Unit Tests (Windows)
     runs-on: windows-latest
     steps:
@@ -82,23 +63,23 @@ jobs:
           $config.Run.Exit = $true
           $config.TestResult.Enabled = $true
           $config.TestResult.OutputFormat = 'NUnitXml'
-          $config.TestResult.OutputPath = './tests/TestResults-Unit-Windows.xml'
+          $config.TestResult.OutputPath = './tests/TestResults-Unit.xml'
           Invoke-Pester -Configuration $config
 
       - name: Upload Test Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-unit-windows
-          path: tests/TestResults-Unit-Windows.xml
+          name: test-results-unit
+          path: tests/TestResults-Unit.xml
 
   # ─────────────────────────────────────────────────────────────────────────
-  #  Integration tests — Windows only (needs WinForms, Docker, SSH)
+  #  Integration tests - Windows (needs WinForms, mocked Docker/SSH)
   # ─────────────────────────────────────────────────────────────────────────
-  integration-tests-windows:
+  integration-tests:
     name: Integration Tests (Windows)
     runs-on: windows-latest
-    needs: [unit-tests-windows]
+    needs: [unit-tests]
     steps:
       - uses: actions/checkout@v4
 
@@ -124,23 +105,24 @@ jobs:
           $config.Run.Exit = $true
           $config.TestResult.Enabled = $true
           $config.TestResult.OutputFormat = 'NUnitXml'
-          $config.TestResult.OutputPath = './tests/TestResults-Integration-Windows.xml'
+          $config.TestResult.OutputPath = './tests/TestResults-Integration.xml'
           Invoke-Pester -Configuration $config
 
       - name: Upload Test Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-integration-windows
-          path: tests/TestResults-Integration-Windows.xml
+          name: test-results-integration
+          path: tests/TestResults-Integration.xml
 
   # ─────────────────────────────────────────────────────────────────────────
-  #  Docker SSH integration test — Ubuntu (builds SSHD container, tests remote)
+  #  Docker SSH tests - Ubuntu (needs Linux containers for SSHD)
+  #  Tests the module's SSH functions against a real SSHD container.
   # ─────────────────────────────────────────────────────────────────────────
   docker-ssh-tests:
-    name: Docker SSH Target Tests (Ubuntu)
+    name: Docker SSH Tests (Ubuntu)
     runs-on: ubuntu-latest
-    needs: [unit-tests-ubuntu]
+    needs: [unit-tests]
     steps:
       - uses: actions/checkout@v4
 
@@ -150,32 +132,26 @@ jobs:
           Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
 
       - name: Build SSHD Test Container
-        shell: bash
         run: |
           docker build -t impact-sshd-test -f tests/Helpers/SshdContainer.Dockerfile .
 
-      - name: Generate Test SSH Key and Start SSHD Container
-        shell: bash
+      - name: Start SSHD Container with SSH Key
         run: |
-          # Generate a throwaway key pair
           mkdir -p /tmp/test_ssh
           ssh-keygen -t ed25519 -C "ci-test" -f /tmp/test_ssh/id_ed25519_testuser -N "" -q
 
-          # Start the SSHD container
           docker run -d -p 2222:22 --name sshd-test impact-sshd-test
 
-          # Copy the public key into the container
           docker cp /tmp/test_ssh/id_ed25519_testuser.pub sshd-test:/home/testuser/.ssh/authorized_keys
           docker exec sshd-test chown testuser:testuser /home/testuser/.ssh/authorized_keys
           docker exec sshd-test chmod 600 /home/testuser/.ssh/authorized_keys
 
-          # Wait for SSHD to be ready
           sleep 2
 
           # Verify connectivity
           ssh -p 2222 -i /tmp/test_ssh/id_ed25519_testuser \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o IdentitiesOnly=yes \
               testuser@localhost "echo SSH_OK"
 
       - name: Run SSH Target Tests
@@ -183,7 +159,6 @@ jobs:
         run: |
           Import-Module Pester -MinimumVersion 5.0.0
 
-          # Set environment variables for the SSH tests
           $env:IMPACT_TEST_SSH_HOST = 'localhost'
           $env:IMPACT_TEST_SSH_PORT = '2222'
           $env:IMPACT_TEST_SSH_USER = 'testuser'
@@ -201,7 +176,6 @@ jobs:
 
       - name: Cleanup SSHD Container
         if: always()
-        shell: bash
         run: |
           docker stop sshd-test 2>/dev/null || true
           docker rm sshd-test 2>/dev/null || true
@@ -215,16 +189,16 @@ jobs:
           path: tests/TestResults-DockerSsh.xml
 
   # ─────────────────────────────────────────────────────────────────────────
-  #  E2E tests — full container lifecycle with real IMPACT repo
-  #  Clones repo, builds Docker image, starts container, validates
-  #  RStudio + global.R + GitHub SSH auth. Triggered manually or on schedule.
+  #  Image validation - Ubuntu (builds real IMPACT image, validates container)
+  #  Only on manual dispatch (with run_e2e=true) or weekly schedule.
   # ─────────────────────────────────────────────────────────────────────────
-  e2e-tests:
-    name: E2E Container Lifecycle Tests
+  image-validation:
+    name: Image Validation (Ubuntu)
     runs-on: ubuntu-latest
-    # Only run on manual dispatch or schedule — too heavy for every push
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    needs: [unit-tests-ubuntu]
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_e2e == 'true')
+    needs: [docker-ssh-tests]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -235,38 +209,136 @@ jobs:
           Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
 
       - name: Verify Docker
-        shell: bash
         run: |
           docker --version
           docker info
 
-      - name: Run E2E Tests
+      - name: Run Image Validation Tests
         shell: pwsh
         env:
           IMPACT_E2E_GITHUB_TOKEN: ${{ secrets.IMPACT_E2E_GITHUB_TOKEN }}
         run: |
           Import-Module Pester -MinimumVersion 5.0.0
           $config = New-PesterConfiguration
-          $config.Run.Path = './tests/E2E.Tests.ps1'
-          $config.Filter.Tag = @('E2E')
+          $config.Run.Path = './tests/ImageValidation.Tests.ps1'
+          $config.Filter.Tag = @('ImageValidation')
           $config.Output.Verbosity = 'Detailed'
           $config.Run.Exit = $true
           $config.TestResult.Enabled = $true
           $config.TestResult.OutputFormat = 'NUnitXml'
-          $config.TestResult.OutputPath = './tests/TestResults-E2E.xml'
+          $config.TestResult.OutputPath = './tests/TestResults-ImageValidation.xml'
           Invoke-Pester -Configuration $config
 
       - name: Upload Test Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-e2e
-          path: tests/TestResults-E2E.xml
+          name: test-results-image-validation
+          path: tests/TestResults-ImageValidation.xml
 
       - name: Cleanup Docker resources
         if: always()
-        shell: bash
         run: |
-          docker stop impact_e2e_test_container 2>/dev/null || true
-          docker rm impact_e2e_test_container 2>/dev/null || true
-          docker rmi impactncd_germany_e2e_test 2>/dev/null || true
+          docker stop impact_imgval_test_container 2>/dev/null || true
+          docker rm impact_imgval_test_container 2>/dev/null || true
+          docker rmi impactncd_germany_imgval_test 2>/dev/null || true
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  Remote E2E - Ubuntu with pwsh (simulates Windows -> SSH -> Docker)
+  #  Uses a workstation container with Docker-out-of-Docker (DooD).
+  #  Full flow: SSH into workstation -> clone repo -> build image -> start
+  #  container -> validate RStudio + global.R + git pull.
+  #  Only on manual dispatch (with run_e2e=true) or weekly schedule.
+  # ─────────────────────────────────────────────────────────────────────────
+  remote-e2e:
+    name: Remote E2E (Ubuntu + DooD)
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_e2e == 'true')
+    needs: [docker-ssh-tests]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+
+      - name: Build Workstation Container
+        run: |
+          docker build -t impact-workstation-test -f tests/Helpers/WorkstationContainer.Dockerfile .
+
+      - name: Start Workstation Container with DooD
+        run: |
+          mkdir -p /tmp/remote_e2e_ssh
+          ssh-keygen -t ed25519 -C "remote-e2e-ci" -f /tmp/remote_e2e_ssh/id_test -N "" -q
+
+          # Start with Docker socket mounted (Docker-out-of-Docker)
+          docker run -d -p 2222:22 \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              --name workstation-test impact-workstation-test
+
+          # Copy SSH key
+          docker cp /tmp/remote_e2e_ssh/id_test.pub workstation-test:/home/testuser/.ssh/authorized_keys
+          docker exec workstation-test chown testuser:testuser /home/testuser/.ssh/authorized_keys
+          docker exec workstation-test chmod 600 /home/testuser/.ssh/authorized_keys
+
+          sleep 3
+
+          # Verify SSH
+          ssh -p 2222 -i /tmp/remote_e2e_ssh/id_test \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o IdentitiesOnly=yes \
+              testuser@localhost "echo SSH_OK"
+
+          # Verify Docker through SSH
+          ssh -p 2222 -i /tmp/remote_e2e_ssh/id_test \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o IdentitiesOnly=yes \
+              testuser@localhost "docker --version"
+
+      - name: Run Remote E2E Tests
+        shell: pwsh
+        env:
+          IMPACT_E2E_GITHUB_TOKEN: ${{ secrets.IMPACT_E2E_GITHUB_TOKEN }}
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0
+
+          $env:IMPACT_REMOTE_E2E_SSH_HOST = 'localhost'
+          $env:IMPACT_REMOTE_E2E_SSH_PORT = '2222'
+          $env:IMPACT_REMOTE_E2E_SSH_USER = 'testuser'
+          $env:IMPACT_REMOTE_E2E_SSH_KEY  = '/tmp/remote_e2e_ssh/id_test'
+
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests/RemoteE2E.Tests.ps1'
+          $config.Filter.Tag = @('RemoteE2E')
+          $config.Output.Verbosity = 'Detailed'
+          $config.Run.Exit = $true
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputFormat = 'NUnitXml'
+          $config.TestResult.OutputPath = './tests/TestResults-RemoteE2E.xml'
+          Invoke-Pester -Configuration $config
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Stop inner container (running via DooD on host daemon)
+          docker stop impact_remote_e2e_inner 2>/dev/null || true
+          docker rm impact_remote_e2e_inner 2>/dev/null || true
+          docker rmi impactncd_remote_e2e_test 2>/dev/null || true
+
+          # Stop workstation container
+          docker stop workstation-test 2>/dev/null || true
+          docker rm workstation-test 2>/dev/null || true
+          docker rmi impact-workstation-test 2>/dev/null || true
+
+          rm -rf /tmp/remote_e2e_ssh
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-remote-e2e
+          path: tests/TestResults-RemoteE2E.xml
