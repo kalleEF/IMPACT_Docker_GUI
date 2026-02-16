@@ -1,0 +1,272 @@
+name: IMPACT Docker GUI — Tests
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'current_version/**'
+      - 'tests/**'
+      - '.github/workflows/test.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    # Allows manual triggering from the Actions tab (needed for E2E tests)
+  schedule:
+    # Run E2E tests weekly on Sunday at 03:00 UTC
+    - cron: '0 3 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  #  Unit tests — cross-platform (no Docker, no SSH required)
+  # ─────────────────────────────────────────────────────────────────────────
+  unit-tests-ubuntu:
+    name: Unit Tests (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PowerShell 7
+        shell: bash
+        run: |
+          # pwsh is pre-installed on ubuntu-latest, verify
+          pwsh --version
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+
+      - name: Run Unit Tests
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests/Unit.Tests.ps1'
+          $config.Filter.Tag = @('Unit')
+          $config.Output.Verbosity = 'Detailed'
+          $config.Run.Exit = $true
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputFormat = 'NUnitXml'
+          $config.TestResult.OutputPath = './tests/TestResults-Unit-Ubuntu.xml'
+          Invoke-Pester -Configuration $config
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-unit-ubuntu
+          path: tests/TestResults-Unit-Ubuntu.xml
+
+  unit-tests-windows:
+    name: Unit Tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+
+      - name: Run Unit Tests
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests/Unit.Tests.ps1'
+          $config.Filter.Tag = @('Unit')
+          $config.Output.Verbosity = 'Detailed'
+          $config.Run.Exit = $true
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputFormat = 'NUnitXml'
+          $config.TestResult.OutputPath = './tests/TestResults-Unit-Windows.xml'
+          Invoke-Pester -Configuration $config
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-unit-windows
+          path: tests/TestResults-Unit-Windows.xml
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  Integration tests — Windows only (needs WinForms, Docker, SSH)
+  # ─────────────────────────────────────────────────────────────────────────
+  integration-tests-windows:
+    name: Integration Tests (Windows)
+    runs-on: windows-latest
+    needs: [unit-tests-windows]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+
+      - name: Verify Docker CLI is available
+        shell: pwsh
+        run: |
+          docker --version
+          if ($LASTEXITCODE -ne 0) { Write-Error 'Docker CLI not available'; exit 1 }
+
+      - name: Run Integration Tests
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests/Integration.Tests.ps1'
+          $config.Filter.Tag = @('Integration')
+          $config.Output.Verbosity = 'Detailed'
+          $config.Run.Exit = $true
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputFormat = 'NUnitXml'
+          $config.TestResult.OutputPath = './tests/TestResults-Integration-Windows.xml'
+          Invoke-Pester -Configuration $config
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-integration-windows
+          path: tests/TestResults-Integration-Windows.xml
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  Docker SSH integration test — Ubuntu (builds SSHD container, tests remote)
+  # ─────────────────────────────────────────────────────────────────────────
+  docker-ssh-tests:
+    name: Docker SSH Target Tests (Ubuntu)
+    runs-on: ubuntu-latest
+    needs: [unit-tests-ubuntu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+
+      - name: Build SSHD Test Container
+        shell: bash
+        run: |
+          docker build -t impact-sshd-test -f tests/Helpers/SshdContainer.Dockerfile .
+
+      - name: Generate Test SSH Key and Start SSHD Container
+        shell: bash
+        run: |
+          # Generate a throwaway key pair
+          mkdir -p /tmp/test_ssh
+          ssh-keygen -t ed25519 -C "ci-test" -f /tmp/test_ssh/id_ed25519_testuser -N "" -q
+
+          # Start the SSHD container
+          docker run -d -p 2222:22 --name sshd-test impact-sshd-test
+
+          # Copy the public key into the container
+          docker cp /tmp/test_ssh/id_ed25519_testuser.pub sshd-test:/home/testuser/.ssh/authorized_keys
+          docker exec sshd-test chown testuser:testuser /home/testuser/.ssh/authorized_keys
+          docker exec sshd-test chmod 600 /home/testuser/.ssh/authorized_keys
+
+          # Wait for SSHD to be ready
+          sleep 2
+
+          # Verify connectivity
+          ssh -p 2222 -i /tmp/test_ssh/id_ed25519_testuser \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              testuser@localhost "echo SSH_OK"
+
+      - name: Run SSH Target Tests
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0
+
+          # Set environment variables for the SSH tests
+          $env:IMPACT_TEST_SSH_HOST = 'localhost'
+          $env:IMPACT_TEST_SSH_PORT = '2222'
+          $env:IMPACT_TEST_SSH_USER = 'testuser'
+          $env:IMPACT_TEST_SSH_KEY  = '/tmp/test_ssh/id_ed25519_testuser'
+
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests/DockerSsh.Tests.ps1'
+          $config.Filter.Tag = @('DockerSsh')
+          $config.Output.Verbosity = 'Detailed'
+          $config.Run.Exit = $true
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputFormat = 'NUnitXml'
+          $config.TestResult.OutputPath = './tests/TestResults-DockerSsh.xml'
+          Invoke-Pester -Configuration $config
+
+      - name: Cleanup SSHD Container
+        if: always()
+        shell: bash
+        run: |
+          docker stop sshd-test 2>/dev/null || true
+          docker rm sshd-test 2>/dev/null || true
+          rm -rf /tmp/test_ssh
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-docker-ssh
+          path: tests/TestResults-DockerSsh.xml
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  E2E tests — full container lifecycle with real IMPACT repo
+  #  Clones repo, builds Docker image, starts container, validates
+  #  RStudio + global.R + GitHub SSH auth. Triggered manually or on schedule.
+  # ─────────────────────────────────────────────────────────────────────────
+  e2e-tests:
+    name: E2E Container Lifecycle Tests
+    runs-on: ubuntu-latest
+    # Only run on manual dispatch or schedule — too heavy for every push
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    needs: [unit-tests-ubuntu]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+
+      - name: Verify Docker
+        shell: bash
+        run: |
+          docker --version
+          docker info
+
+      - name: Run E2E Tests
+        shell: pwsh
+        env:
+          IMPACT_E2E_GITHUB_TOKEN: ${{ secrets.IMPACT_E2E_GITHUB_TOKEN }}
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests/E2E.Tests.ps1'
+          $config.Filter.Tag = @('E2E')
+          $config.Output.Verbosity = 'Detailed'
+          $config.Run.Exit = $true
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputFormat = 'NUnitXml'
+          $config.TestResult.OutputPath = './tests/TestResults-E2E.xml'
+          Invoke-Pester -Configuration $config
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-e2e
+          path: tests/TestResults-E2E.xml
+
+      - name: Cleanup Docker resources
+        if: always()
+        shell: bash
+        run: |
+          docker stop impact_e2e_test_container 2>/dev/null || true
+          docker rm impact_e2e_test_container 2>/dev/null || true
+          docker rmi impactncd_germany_e2e_test 2>/dev/null || true
