@@ -32,6 +32,8 @@ if ($runningFromBatch -and -not $Force) {
 $ScriptName = "IMPACT_Docker_GUI_v2.ps1"
 $OutputExe = "IMPACT.exe"
 $IconFile = "IMPACT_icon.ico"
+$ModuleFile = "IMPACT_Docker_GUI.psm1"
+$ManifestFile = "IMPACT_Docker_GUI.psd1"
 
 Write-Host ""
 Write-Host "IMPACT_v2.exe Compilation Script" -ForegroundColor Cyan
@@ -58,6 +60,20 @@ if (-not $ps2exeModule) {
 if (-not (Test-Path $ScriptName)) {
     Write-Host "Error: Source script '$ScriptName' not found in current directory." -ForegroundColor Red
     exit 1
+}
+
+# Check if companion module exists (required at runtime alongside the EXE)
+if (-not (Test-Path $ModuleFile)) {
+    Write-Host "Error: Module file '$ModuleFile' not found in current directory." -ForegroundColor Red
+    Write-Host "       The EXE requires this module to run. It must be in the same folder." -ForegroundColor Red
+    exit 1
+} else {
+    Write-Host "Module file found: $ModuleFile" -ForegroundColor Green
+}
+if (-not (Test-Path $ManifestFile)) {
+    Write-Host "Warning: Module manifest '$ManifestFile' not found (optional but recommended)." -ForegroundColor Yellow
+} else {
+    Write-Host "Module manifest found: $ManifestFile" -ForegroundColor Green
 }
 
 # Check if icon file exists
@@ -147,6 +163,13 @@ try {
         Write-Host ""
         Write-Host "Usage: Right-click '$OutputExe' and select 'Run as Administrator'" -ForegroundColor Yellow
         Write-Host "       or double-click to start with automatic elevation prompt." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "IMPORTANT: The following files must remain together in the same folder:" -ForegroundColor Yellow
+        Write-Host "  - $OutputExe  (compiled launcher)" -ForegroundColor White
+        Write-Host "  - $ModuleFile  (core module — required)" -ForegroundColor White
+        if (Test-Path $ManifestFile) {
+            Write-Host "  - $ManifestFile  (module manifest)" -ForegroundColor White
+        }
     } else {
         Write-Host "Error: Compilation completed but output file not found." -ForegroundColor Red
         exit 1
