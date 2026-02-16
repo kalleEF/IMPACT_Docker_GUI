@@ -1266,6 +1266,24 @@ function Show-ContainerManager {
             Write-Log "SSH key permission fix failed: $($_.Exception.Message)" 'Warn'
         }
 
+        # Configure git inside the container for the rstudio user.
+        # - pull.rebase=false  → use merge strategy (same as GitKraken default), avoids
+        #   the "divergent branches" error on git pull with newer git (2.27+).
+        # - safe.directory='*' → allows rstudio to operate on bind-mounted repos
+        #   even if the directory ownership doesn't match.
+        $gitCfgCmd = "git config --global pull.rebase false && git config --global --add safe.directory '*' && echo GIT_CONFIGURED"
+        $gitCfgCtx = (Get-DockerContextArgs -State $State) + @('exec', '--user', 'rstudio', $State.ContainerName, 'sh', '-c', $gitCfgCmd)
+        try {
+            $gitCfgOut = & docker $gitCfgCtx 2>&1
+            if ($gitCfgOut -match 'GIT_CONFIGURED') {
+                Write-Log 'Git pull strategy (merge) configured inside container.' 'Info'
+            } else {
+                Write-Log "Git config inside container may have failed: $gitCfgOut" 'Warn'
+            }
+        } catch {
+            Write-Log "Git config inside container failed: $($_.Exception.Message)" 'Warn'
+        }
+
         if ($State.ContainerLocation -like 'REMOTE@*') {
             $portStore = if ($portOverride) { $portOverride } else { '8787' }
             Write-RemoteContainerMetadata -State $State -Password $State.Password -Port $portStore -UseVolumes $useVolumes

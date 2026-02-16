@@ -291,6 +291,6 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
     It 'Can execute git pull from inside the IMPACT container' -Skip:($script:SkipTests -or -not $env:IMPACT_E2E_GITHUB_TOKEN) {
         $cmd = "docker exec --user rstudio --workdir /home/rstudio/$($script:REPO_NAME) $($script:INNER_CONTAINER) git pull 2>&1"
         $out = Invoke-WsSshCommand $cmd
-        ($out -join "`n") | Should -Match 'Already up to date|Updating|Fast-forward'
+        ($out -join "`n") | Should -Match 'Already up to date|Updating|Fast-forward|Merge made'
     }
 }

@@ -293,6 +293,6 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
     It 'Can execute git pull from inside the container' -Skip:(-not $env:IMPACT_E2E_GITHUB_TOKEN) {
         $out = docker exec --user rstudio --workdir "/home/rstudio/$($script:REPO_NAME)" $script:CONTAINER_NAME `
             git pull 2>&1
-        ($out -join "`n") | Should -Match 'Already up to date|Updating|Fast-forward'
+        ($out -join "`n") | Should -Match 'Already up to date|Updating|Fast-forward|Merge made'
     }
 }
