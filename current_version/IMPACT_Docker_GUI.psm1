@@ -475,7 +475,7 @@ function Test-AndCreateDirectory {
         }
     }
 
-    if ($State.ContainerLocation -eq 'LOCAL' -and $Path -match '^(?:/|~)') {
+    if ($IsWindows -and $State.ContainerLocation -eq 'LOCAL' -and $Path -match '^(?:/|~)') {
         Write-Log "POSIX-style path not allowed in local mode for ${PathKey}: $Path" 'Error'
         return $false
     }

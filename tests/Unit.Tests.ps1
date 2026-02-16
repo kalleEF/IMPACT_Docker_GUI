@@ -636,7 +636,7 @@ Describe 'Test-AndCreateDirectory' -Tag Unit {
         $result | Should -BeFalse
     }
 
-    It 'Rejects POSIX absolute path in LOCAL mode' {
+    It 'Rejects POSIX absolute path in LOCAL mode' -Skip:(-not $IsWindows) {
         $state = New-TestSessionState -Location 'LOCAL'
         $result = Test-AndCreateDirectory -State $state -Path '/home/user/data' -PathKey 'test'
         $result | Should -BeFalse
