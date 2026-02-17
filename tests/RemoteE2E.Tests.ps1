@@ -322,7 +322,10 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
     }
 
     It 'global.R can be sourced inside the IMPACT container' -Skip:$script:SkipTests {
-        $cmd = "docker exec --user rstudio $($script:INNER_CONTAINER) Rscript -e `"setwd('/home/rstudio/$($script:REPO_NAME)'); tryCatch({ source('global.R'); cat('GLOBAL_OK') }, error = function(e) cat(paste('GLOBAL_ERROR:', e\`\$message)))`""
+        # Build the R one-liner in a single-quoted PowerShell string so `$message` is not expanded
+        $rScript = 'setwd(''/home/rstudio/' + $script:REPO_NAME + '''); tryCatch({ source(''global.R''); cat(''GLOBAL_OK'') }, error = function(e) cat(paste(''GLOBAL_ERROR:'', e$message)))'
+        $cmd = "docker exec --user rstudio $($script:INNER_CONTAINER) Rscript -e `"$rScript`""
+
         $out = Invoke-WsSshCommand $cmd
         $joined = $out -join "`n"
         $joined | Should -Match 'GLOBAL_OK'
@@ -339,6 +342,9 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
     }
 
     It 'Can execute git pull from inside the IMPACT container' -Skip:($script:SkipTests -or -not $env:IMPACT_E2E_GITHUB_TOKEN) {
+        # Mark the bind-mounted repo as safe to avoid 'dubious ownership' git errors inside the container
+        Invoke-WsSshCommand "docker exec --user rstudio $($script:INNER_CONTAINER) git config --global --add safe.directory /home/rstudio/$($script:REPO_NAME)" | Out-Null
+
         $cmd = "docker exec --user rstudio --workdir /home/rstudio/$($script:REPO_NAME) $($script:INNER_CONTAINER) git pull 2>&1"
         $out = Invoke-WsSshCommand $cmd
         ($out -join "`n") | Should -Match 'Already up to date|Updating|Fast-forward|Merge made'
