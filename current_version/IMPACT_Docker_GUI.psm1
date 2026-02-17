@@ -623,13 +623,29 @@ function Invoke-GitChangeDetection {
             if ($LASTEXITCODE -eq 0) { Write-Log 'Git commit completed on remote.' 'Info' }
             if ($doPush) {
                 $remoteKey = "~/.ssh/id_ed25519_$($State.UserName)"
+                # Try 1: IMPACT-specific key via ssh-agent
                 $pushAgent = "cd '$RepoPath' && eval `$(ssh-agent -s) && ssh-add $remoteKey 2>/dev/null && GIT_SSH_COMMAND='ssh -i $remoteKey -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' git push"
                 $pushOut = & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost $pushAgent 2>&1
                 Write-Log "Remote git push (agent) exit=$LASTEXITCODE output=$pushOut" 'Debug'
                 if ($LASTEXITCODE -ne 0) {
+                    # Try 2: IMPACT-specific key directly (no agent)
                     $pushDirect = "cd '$RepoPath' && GIT_SSH_COMMAND='ssh -i $remoteKey -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' git push"
                     $pushOut = & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost $pushDirect 2>&1
                     Write-Log "Remote git push (direct) exit=$LASTEXITCODE output=$pushOut" 'Debug'
+                }
+                if ($LASTEXITCODE -ne 0) {
+                    # Try 3: workstation's own key (commonly named id_ed25519_workstation)
+                    Write-Log 'IMPACT key push failed; trying workstation SSH keys.' 'Warn'
+                    $pushWs = "cd '$RepoPath' && for k in ~/.ssh/id_ed25519_workstation ~/.ssh/id_ed25519 ~/.ssh/id_rsa; do [ -f `"`$k`" ] && GIT_SSH_COMMAND='ssh -i `$k -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' git push && exit 0; done; exit 1"
+                    $pushOut = & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost $pushWs 2>&1
+                    Write-Log "Remote git push (workstation keys) exit=$LASTEXITCODE output=$pushOut" 'Debug'
+                }
+                if ($LASTEXITCODE -ne 0) {
+                    # Try 4: let the workstation's SSH config / agent decide
+                    Write-Log 'Explicit key push failed; falling back to default SSH identity.' 'Warn'
+                    $pushDefault = "cd '$RepoPath' && git push"
+                    $pushOut = & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost $pushDefault 2>&1
+                    Write-Log "Remote git push (default SSH) exit=$LASTEXITCODE output=$pushOut" 'Debug'
                 }
                 if ($LASTEXITCODE -ne 0) {
                     if (-not $script:NonInteractive) { [System.Windows.Forms.MessageBox]::Show("Git push failed on remote: $pushOut",'Git push failed','OK','Error') | Out-Null }
@@ -1535,7 +1551,9 @@ function Build-DockerRunCommand {
         [string]$OutputDir,
         [string]$SynthpopDir,
         [string]$SshKeyPath,
-        [string]$KnownHostsPath
+        [string]$KnownHostsPath,
+        [string]$ContainerUid  = '1000',
+        [string]$ContainerGid  = '1000'
     )
 
     $repoMountSource = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $ProjectRoot } else { $ProjectRoot }
@@ -1544,11 +1562,11 @@ function Build-DockerRunCommand {
     $dockerArgs = @('run','-d','--rm','--name',$State.ContainerName,
         '-e',"PASSWORD=$($State.Password)",
         '-e','DISABLE_AUTH=false',
-        '-e','USERID=1000','-e','GROUPID=1000',
+        '-e',"USERID=$ContainerUid",'-e',"GROUPID=$ContainerGid",
+        '-e',"CONTAINER_REPO_NAME=$($State.SelectedRepo)",
+        '-e','SYNC_ENABLED=false',
         '-e',"GIT_SSH_COMMAND=ssh -i $containerKeyPath -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/ssh/ssh_known_hosts -o StrictHostKeyChecking=yes",
-        '--mount',"type=bind,source=$repoMountSource,target=/host-repo",
         '--mount',"type=bind,source=$repoMountSource,target=/home/rstudio/$($State.SelectedRepo)",
-        '-e','REPO_SYNC_PATH=/host-repo','-e','SYNC_ENABLED=true',
         '-p',"${Port}:8787"
     )
 
