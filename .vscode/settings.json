@@ -7,6 +7,10 @@
         "/^pwsh -NoProfile -Command \"Import-Module Pester -MinimumVersion 5\\.0\\.0; Invoke-Pester -Path '\\./tests/Integration\\.Tests\\.ps1' -Tag Integration -Output Detailed 2>&1 \\| Out-String\" \\| Select-String '\\\\\\[-\\\\\\]' -Context 0,5$/": {
             "approve": true,
             "matchCommandLine": true
+        },
+        "/^pwsh -File Run-AllTests\\.ps1 -Level Unit 2>&1 \\| Select-String -Pattern \"\\(Passed\\|Failed\\|Skipped\\|Tests\\|Result\\|FAIL\\|error\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
         }
     }
 }
