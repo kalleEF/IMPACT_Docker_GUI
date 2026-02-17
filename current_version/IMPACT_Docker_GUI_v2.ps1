@@ -1,4 +1,5 @@
-<# IMPACT Docker GUI v2 #>
+﻿<# IMPACT Docker GUI v2 #>
+<# This is the launcher script. Core functions live in IMPACT_Docker_GUI.psm1 #>
 
 [CmdletBinding()]
 param(
@@ -8,1549 +9,27 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:GlobalDebugFlag = $false
-$script:ThemePalette = $null
-$script:LogFile = $null
-$script:LogInit = $false
 
-function Initialize-Logging {
-    if ($script:LogInit) { return }
-    $script:LogInit = $true
-
-    $disable = $env:IMPACT_LOG_DISABLE
-    if ($disable -and $disable -match '^(1|true|yes)$') { return }
-
-    $logPath = if ($env:IMPACT_LOG_FILE) { $env:IMPACT_LOG_FILE } else { Join-Path $HOME '.impact_gui/logs/impact.log' }
-    try {
-        $logDir = Split-Path -Parent $logPath
-        if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
-        if (Test-Path $logPath) {
-            $info = Get-Item $logPath -ErrorAction SilentlyContinue
-            if ($info -and $info.Length -gt 512KB) {
-                Move-Item -Force -Path $logPath -Destination "$logPath.1" -ErrorAction SilentlyContinue
-            }
-        }
-        $script:LogFile = $logPath
-        $header = "[{0}] [INFO] log start (pid={1})" -f (Get-Date -Format 's'), $PID
-        Add-Content -Path $logPath -Value $header -Encoding UTF8 -ErrorAction SilentlyContinue
-    } catch { }
+# Determine the directory where this script (or compiled EXE) lives.
+# $PSScriptRoot works when running as .ps1 but is empty/wrong in a ps2exe EXE.
+if ($PSScriptRoot -and (Test-Path $PSScriptRoot)) {
+    $script:ScriptDir = $PSScriptRoot
+} else {
+    # Fallback for ps2exe-compiled EXE: use the process executable's directory
+    $script:ScriptDir = Split-Path -Parent ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
 }
 
-function Get-BuildInfo {
-    $version = '2.0.0'
-    $built = (Get-Date).ToString('s')
-    $commit = $null
-    $dirty = $false
-
-    try {
-        $git = Get-Command git -ErrorAction SilentlyContinue
-        if ($git) {
-            $scriptDir = Split-Path -Parent $PSCommandPath
-            if ($scriptDir) { Push-Location $scriptDir }
-            try {
-                $commit = git rev-parse --short HEAD 2>$null
-                $status = git status --porcelain 2>$null
-                if ($status) { $dirty = $true }
-            } catch { }
-            if ($scriptDir) { Pop-Location }
-        }
-    } catch { $commit = $null }
-
-    $commitTag = if ($commit) { $commit + $(if($dirty){'*'}) } else { 'unknown' }
-    Write-Log "Build info resolved: commit=$commitTag dirty=$dirty" 'Debug'
-    return [pscustomobject]@{ Version=$version; Built=$built; Commit=$commitTag }
-}
-
-# Global/session state container; pass this object between steps.
-function New-SessionState {
-    $state = [PSCustomObject]@{
-        UserName          = $null
-        Password          = $null
-        RemoteHost        = $null
-        RemoteHostIp      = $null
-        RemoteUser        = 'php-workstation'
-        RemoteRepoBase    = $null
-        ContainerLocation = $null  # "LOCAL" or "REMOTE@<ip>"
-        SelectedRepo      = $null
-        ContainerName     = $null
-        Paths             = @{
-            LocalRepo   = $null
-            RemoteRepo  = $null
-            OutputDir   = $null
-            SynthpopDir = $null
-            SshPrivate  = $null
-            SshPublic   = $null
-        }
-        Flags             = @{
-            Debug            = $false
-            UseDirectSsh     = $false
-            UseVolumes       = $false
-            Rebuild          = $false
-            HighComputeDemand= $false
-            PS7Requested     = $PS7Requested.IsPresent
-        }
-        Ports             = @{
-            Requested = $null
-            Assigned  = $null
-            Used      = @()
-        }
-        Metadata          = @{}
-    }
-
-    Write-Log "Initialized session state (PID=$PID)." 'Info'
-    Write-Log "State defaults -> RemoteUser=$($state.RemoteUser), PS7Requested=$($state.Flags.PS7Requested), Debug=$($state.Flags.Debug)" 'Debug'
-    return $state
-}
-
-# Lightweight logging helper; expand to file later.
-function Write-Log {
-    param(
-        [string]$Message,
-        [ValidateSet('Info','Warn','Error','Debug')][string]$Level = 'Info'
-    )
-    Initialize-Logging
-    if ($Level -ne 'Debug' -or $script:GlobalDebugFlag) {
-        switch ($Level) {
-            'Info'  { Write-Host "[INFO]  $Message" -ForegroundColor Cyan }
-            'Warn'  { Write-Host "[WARN]  $Message" -ForegroundColor Yellow }
-            'Error' { Write-Host "[ERROR] $Message" -ForegroundColor Red }
-            'Debug' { Write-Host "[DEBUG] $Message" -ForegroundColor DarkGray }
-        }
-    }
-
-    if ($script:LogFile) {
-        try {
-            $stamp = Get-Date -Format 's'
-            Add-Content -Path $script:LogFile -Value "[$stamp] [$Level] $Message" -Encoding UTF8 -ErrorAction SilentlyContinue
-        } catch { }
-    }
-}
-
-# Ensure the host is PowerShell 7+; restart under pwsh when available, else fail fast.
-function Ensure-PowerShell7 {
-    param([bool]$PS7RequestedFlag = $false)
-
-    $isCore = $PSVersionTable.PSEdition -eq 'Core'
-    $isSevenPlus = $isCore -and $PSVersionTable.PSVersion.Major -ge 7
-    if ($isSevenPlus) { return }
-
-    $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
-    if ($pwsh) {
-        Write-Log 'PowerShell 7 is required. Restarting under pwsh...' 'Warn'
-        $invokedPath = $null
-        try { $invokedPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { }
-        if (-not $invokedPath) {
-            $invokedPath = $MyInvocation.MyCommand.Path
-        }
-        if (-not $invokedPath) {
-            $candidate = [Environment]::GetCommandLineArgs() | Select-Object -First 1
-            if ($candidate -and $candidate -notmatch '\r|\n') { $invokedPath = $candidate }
-        }
-        if (-not $invokedPath) {
-            $candidate = $MyInvocation.MyCommand.Definition
-            if ($candidate -and $candidate -notmatch '\r|\n') { $invokedPath = $candidate }
-        }
-        if ($invokedPath) { try { $invokedPath = [System.IO.Path]::GetFullPath($invokedPath) } catch { Write-Log "Could not normalize invoked path: $invokedPath" 'Warn' } }
-
-        $scriptPath = $PSCommandPath
-        if (-not $scriptPath -and $invokedPath -match '\.exe$') {
-            $candidate = [System.IO.Path]::ChangeExtension($invokedPath, '.ps1')
-            if (Test-Path $candidate) { $scriptPath = $candidate }
-        }
-        if (-not $scriptPath -and $invokedPath) {
-            $exeDir = Split-Path -Parent $invokedPath
-            $fallback = Join-Path $exeDir 'IMPACT_Docker_GUI_v2.ps1'
-            if (Test-Path $fallback) { $scriptPath = $fallback }
-        }
-        if ($scriptPath) { try { $scriptPath = [System.IO.Path]::GetFullPath($scriptPath) } catch { Write-Log "Could not normalize script path: $scriptPath" 'Warn' } }
-
-        if (-not $invokedPath -and -not $scriptPath) {
-            Write-Log 'Cannot determine executable or script path; aborting PS7 relaunch.' 'Error'
-            throw 'Unable to relaunch under pwsh (no path).'
-        }
-
-        $args = @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass')
-        if ($scriptPath -and (Test-Path $scriptPath)) {
-            $args += '-File'
-            $args += "`"$scriptPath`""
-            Write-Log "Relaunching under pwsh with script: $scriptPath" 'Info'
-        } else {
-            $args += '-Command'
-            $args += "& '" + $invokedPath + "'"
-            Write-Log "Relaunching under pwsh by invoking: $invokedPath" 'Info'
-        }
-
-        if (-not $PS7RequestedFlag) { $args += '-PS7Requested' }
-
-        # Stay in the same window to show logs and block until pwsh returns.
-        Start-Process -FilePath $pwsh.Source -ArgumentList $args -WorkingDirectory $PWD.Path -NoNewWindow -Wait | Out-Null
-        exit
-    }
-
-    try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue } catch { }
-    try { [System.Windows.Forms.MessageBox]::Show('PowerShell 7 (pwsh) is required. Please install PowerShell 7 and try again.','PowerShell 7 required','OK','Error') | Out-Null } catch { }
-    Write-Log 'PowerShell 7 (pwsh) is required but not installed.' 'Error'
-    throw 'PowerShell 7 (pwsh) is required.'
-}
-
-# Build ssh:// target from state
-function Get-RemoteHostString {
-    param([pscustomobject]$State)
-    Write-Log "Resolving remote host target (RemoteHost=$($State.RemoteHost), IP=$($State.RemoteHostIp))." 'Debug'
-    if ($State.RemoteHost) { return $State.RemoteHost }
-    return $State.RemoteHostIp
-}
-
-# Ensure Docker SSH opts are populated when targeting remote
-function Set-DockerSSHEnvironment {
-    param([pscustomobject]$State)
-    if ($State.ContainerLocation -like 'REMOTE@*') {
-        if (-not $env:DOCKER_SSH_OPTS -or [string]::IsNullOrEmpty($env:DOCKER_SSH_OPTS)) {
-            $keyPath = $State.Paths.SshPrivate
-            if (-not $keyPath) { $keyPath = "$HOME/.ssh/id_ed25519_$($State.UserName)" }
-            $env:DOCKER_SSH_OPTS = "-i `"$keyPath`" -o IdentitiesOnly=yes -o ConnectTimeout=30"
-            Write-Log "Prepared DOCKER_SSH_OPTS for remote Docker access." 'Info'
-        }
-
-        if ($State.Flags.UseDirectSsh) {
-            $remoteHost = Get-RemoteHostString -State $State
-            if (-not $env:DOCKER_HOST -or $env:DOCKER_HOST -notmatch 'ssh://') {
-                $env:DOCKER_HOST = "ssh://$remoteHost"
-                Write-Log "Using direct SSH Docker host at $remoteHost" 'Info'
-            }
-            Write-Log "Direct SSH Docker mode active; DOCKER_HOST=$env:DOCKER_HOST" 'Debug'
-        }
-    } else {
-        Write-Log 'Using local Docker engine (no remote SSH context).' 'Info'
-        Write-Log 'Clearing DOCKER_HOST/DOCKER_SSH_OPTS for local mode.' 'Debug'
-        $env:DOCKER_SSH_OPTS = $null
-        $env:DOCKER_HOST = $null
-    }
-}
-
-# Helper to standardize docker context/host arguments based on connection mode
-function Get-DockerContextArgs {
-    param([pscustomobject]$State)
-    Write-Log "Selecting Docker context arguments for $($State.ContainerLocation)" 'Debug'
-    $result = @()
-    if ($State.ContainerLocation -like 'REMOTE@*') {
-        if ($State.Flags.UseDirectSsh) {
-            $result = @()
-        } elseif ($State.Metadata.RemoteDockerContext) {
-            $result = @('--context',$State.Metadata.RemoteDockerContext)
-        }
-    } elseif ($State.ContainerLocation -eq 'LOCAL' -and $State.Metadata.LocalDockerContext) {
-        $result = @('--context',$State.Metadata.LocalDockerContext)
-    }
-    Write-Log "Docker context args: $([string]::Join(' ', $result))" 'Debug'
-    return $result
-}
-
-# Convert Windows path to Docker/WSL style
-function Convert-PathToDockerFormat {
-    param([string]$Path)
-    Write-Log "Converting path to Docker format: $Path" 'Debug'
-    if ($Path -match '^([A-Za-z]):\\?(.*)$') {
-        $drive = $matches[1].ToLower()
-        $rest = $matches[2] -replace '\\','/'
-        $converted = "/$drive/$rest" -replace '/{2,}','/' -replace '/$',''
-        Write-Log "Converted path: $converted" 'Debug'
-        return $converted
-    }
-    $converted = $Path -replace '\\','/'
-    Write-Log "Converted path: $converted" 'Debug'
-    return $converted
-}
-
-# Verify remote SSH key and known_hosts exist (fast check)
-function Test-RemoteSSHKeyFiles {
-    param(
-        [pscustomobject]$State
-    )
-    if ($State.ContainerLocation -notlike 'REMOTE@*') { return $true }
-    $remoteHost = Get-RemoteHostString -State $State
-    Write-Log "Checking remote SSH key and known_hosts on $remoteHost" 'Info'
-    $localKeyPath = $State.Paths.SshPrivate
-    $remoteKeyPath = "/home/$($State.RemoteUser)/.ssh/id_ed25519_$($State.UserName)"
-    $knownHosts = "/home/$($State.RemoteUser)/.ssh/known_hosts"
-    try {
-        $keyCheck = & ssh -i $localKeyPath -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "[ -f '$remoteKeyPath' ] && echo OK" 2>$null
-        $khCheck  = & ssh -i $localKeyPath -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "[ -f '$knownHosts' ] && echo OK" 2>$null
-        $present = ($keyCheck -match 'OK' -and $khCheck -match 'OK')
-        Write-Log "Remote SSH check raw outputs -> key:'$keyCheck' kh:'$khCheck'" 'Debug'
-        Write-Log ("Remote SSH prerequisites present: key={0} known_hosts={1}" -f ($keyCheck -match 'OK'), ($khCheck -match 'OK')) 'Info'
-        return $present
-    } catch {
-        Write-Log "Remote SSH prerequisite check failed: $($_.Exception.Message)" 'Debug'
-        return $false
-    }
-}
-
-# Remote container metadata helpers
-function Write-RemoteContainerMetadata {
-    param(
-        [pscustomobject]$State,
-        [string]$Password,
-        [string]$Port,
-        [bool]$UseVolumes
-    )
-    if ($State.ContainerLocation -notlike 'REMOTE@*') { return }
-    $remoteHost = Get-RemoteHostString -State $State
-    $keyPath = $State.Paths.SshPrivate
-    $metaPath = "/tmp/impactncd/$($State.ContainerName).json"
-    Write-Log "Writing remote container metadata to $metaPath on $remoteHost" 'Info'
-    $payload = [ordered]@{
-        container = $State.ContainerName
-        repo      = $State.SelectedRepo
-        user      = $State.UserName
-        password  = $Password
-        port      = $Port
-        useVolumes= $UseVolumes
-        timestamp = (Get-Date).ToString('s')
-    } | ConvertTo-Json -Compress
-    Write-Log ("Metadata payload (masked): container={0} repo={1} port={2} useVolumes={3}" -f $State.ContainerName, $State.SelectedRepo, $Port, $UseVolumes) 'Debug'
-    $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload))
-    try {
-        & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "mkdir -p /tmp/impactncd && umask 177 && echo $b64 | base64 -d > '$metaPath'" 2>$null
-        Write-Log 'Remote metadata saved.' 'Info'
-    } catch {
-        Write-Log "Remote metadata SSH write failed: $($_.Exception.Message)" 'Warn'
-    }
-}
-
-function Remove-RemoteContainerMetadata {
-    param([pscustomobject]$State)
-    if ($State.ContainerLocation -notlike 'REMOTE@*') { return }
-    $remoteHost = Get-RemoteHostString -State $State
-    $keyPath = $State.Paths.SshPrivate
-    $metaPath = "/tmp/impactncd/$($State.ContainerName).json"
-    Write-Log "Removing remote metadata at $metaPath on $remoteHost" 'Info'
-    try { & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "rm -f '$metaPath'" 2>$null } catch {
-        Write-Log "Remote metadata removal failed: $($_.Exception.Message)" 'Warn'
-    }
-}
-
-function Read-RemoteContainerMetadata {
-    param([pscustomobject]$State)
-    if ($State.ContainerLocation -notlike 'REMOTE@*') { return $null }
-    $remoteHost = Get-RemoteHostString -State $State
-    $keyPath = $State.Paths.SshPrivate
-    $metaPath = "/tmp/impactncd/$($State.ContainerName).json"
-    Write-Log "Attempting to read remote metadata from $metaPath on $remoteHost" 'Info'
-    try {
-        $json = & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "cat '$metaPath' 2>/dev/null" 2>$null
-        if ($json) {
-            Write-Log 'Remote metadata read successfully.' 'Info'
-            return $json | ConvertFrom-Json -ErrorAction Stop
-        }
-        Write-Log 'Remote metadata not found or empty.' 'Debug'
-    } catch {
-        Write-Log "Failed to read remote metadata: $($_.Exception.Message)" 'Debug'
-    }
-    return $null
-}
-
-function Get-ContainerRuntimeInfo {
-    param([pscustomobject]$State)
-    $info = @{ Password = $null; Port = $null }
-    $cmdEnv = @('inspect','-f','{{range .Config.Env}}{{println .}}{{end}}',$State.ContainerName)
-    $cmdPort= @('inspect','-f','{{range $p, $c := .NetworkSettings.Ports}}{{if eq $p "8787/tcp"}}{{range $c}}{{println .HostPort}}{{end}}{{end}}{{end}}',$State.ContainerName)
-    $ctxArgs = Get-DockerContextArgs -State $State
-    $cmdEnv = $ctxArgs + $cmdEnv
-    $cmdPort= $ctxArgs + $cmdPort
-    Write-Log "Inspecting container $($State.ContainerName) for runtime info." 'Info'
-    try {
-        $envLines = & docker @cmdEnv 2>$null
-        $portLine = & docker @cmdPort 2>$null
-        Write-Log "Inspect env output: $envLines" 'Debug'
-        Write-Log "Inspect port output: $portLine" 'Debug'
-        if ($envLines) {
-            foreach ($line in ($envLines -split "`n")) { if ($line -like 'PASSWORD=*') { $info.Password = $line.Substring(9) } }
-        }
-        if ($portLine) {
-            # In case multiple bindings are present (e.g., IPv4/IPv6), take the first non-empty entry
-            $info.Port = (($portLine -split "`n|`r") | Where-Object { $_ -match '\S' } | Select-Object -First 1).Trim()
-        }
-        Write-Log "Recovered runtime info -> PasswordPresent=$([bool]$info.Password) Port=$($info.Port)" 'Debug'
-    } catch {
-        Write-Log "Failed to inspect container runtime info: $($_.Exception.Message)" 'Debug'
-    }
-    return $info
-}
-
-# Read a YAML key value (simple single-line `key: value`) optionally over SSH
-function Get-YamlPathValue {
-    param(
-        [pscustomobject]$State,
-        [string]$YamlPath,
-        [string]$Key,
-        [string]$BaseDir
-    )
-
-    Write-Log "Reading YAML key '$Key' from $YamlPath" 'Info'
-    $content = $null
-    if ($State.ContainerLocation -like 'REMOTE@*') {
-        Set-DockerSSHEnvironment -State $State
-        $remoteHost = Get-RemoteHostString -State $State
-        $keyPath = $State.Paths.SshPrivate
-        try {
-            $content = & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=30 -o BatchMode=yes $remoteHost "cat '$YamlPath'" 2>$null
-        } catch {
-            return $null
-        }
-    } else {
-        if (-not (Test-Path $YamlPath)) { return $null }
-        $content = Get-Content -Path $YamlPath -Raw
-    }
-
-    Write-Log ("Fetched YAML content length: {0}" -f ($content.Length)) 'Debug'
-    if (-not $content) { Write-Log 'YAML content empty; aborting parse.' 'Debug'; return $null }
-    $line = ($content -split "`n") | Where-Object { $_ -match "^$Key\s*:" } | Select-Object -First 1
-    if (-not $line) { Write-Log "YAML key '$Key' not found." 'Debug'; return $null }
-    $value = ($line -split ":\s*",2)[1].Split('#')[0].Trim()
-    Write-Log "Raw YAML value for '$Key': $value" 'Debug'
-
-    if ([System.IO.Path]::IsPathRooted($value) -or $value.StartsWith('/')) {
-        return ($value -replace '\\','/')
-    }
-    $joined = "$BaseDir/$($value -replace '\\','/')"
-    $resolved = ($joined -replace '(?<!:)/{2,}','/')
-    Write-Log "Resolved YAML key '$Key' to $resolved" 'Info'
-    return $resolved
-}
-
-# Ensure directory exists locally or remotely
-function Test-AndCreateDirectory {
-    param(
-        [pscustomobject]$State,
-        [string]$Path,
-        [string]$PathKey
-    )
-    if (-not $Path) { return $false }
-
-    Write-Log "Ensuring directory for ${PathKey}: $Path" 'Info'
-
-    if ($State.ContainerLocation -like 'REMOTE@*') {
-        $remoteHost = Get-RemoteHostString -State $State
-        $keyPath = $State.Paths.SshPrivate
-        try {
-            $check = & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "test -d '$Path' && echo EXISTS || echo MISSING" 2>$null
-            if ($check -notmatch 'EXISTS') {
-                Write-Log "Remote path missing (no auto-create): $Path" 'Error'
-                return $false
-            }
-            Write-Log "Remote path verified for ${PathKey}: $Path" 'Debug'
-            return $true
-        } catch {
-            Write-Log "Failed to validate remote directory ${Path}: $($_.Exception.Message)" 'Debug'
-            return $false
-        }
-    }
-
-    # In local mode, block POSIX-style absolute paths (likely remote/Linux paths) to avoid fake mounts.
-    if ($State.ContainerLocation -eq 'LOCAL' -and $Path -match '^(?:/|~)') {
-        Write-Log "POSIX-style path not allowed in local mode for ${PathKey}: $Path" 'Error'
-        return $false
-    }
-
-    if ($State.ContainerLocation -eq 'LOCAL') {
-        try {
-            $resolved = Resolve-Path -LiteralPath $Path -ErrorAction Stop
-            $native = $resolved.Path
-        } catch {
-            Write-Log "Local path missing or not a directory (no auto-create): $Path" 'Error'
-            return $false
-        }
-    } else {
-        $native = $Path
-    }
-
-    if (-not (Test-Path $native -PathType Container)) {
-        Write-Log "Local path missing or not a directory (no auto-create): $native" 'Error'
-        return $false
-    }
-    Write-Log "Local directory exists for ${PathKey}: $native" 'Debug'
-    return $true
-}
-
-# Capture git status and branch info (local or remote)
-function Get-GitRepositoryState {
-    param(
-        [pscustomobject]$State,
-        [string]$RepoPath,
-        [bool]$IsRemote
-    )
-    if (-not $RepoPath) { return $null }
-    Write-Log "Checking git status for repo at $RepoPath (remote=$IsRemote)" 'Info'
-    try {
-        if ($IsRemote) {
-            $remoteHost = Get-RemoteHostString -State $State
-            $keyPath = $State.Paths.SshPrivate
-            $cmd = "cd '$RepoPath' && git status --porcelain=v1 && git rev-parse --abbrev-ref HEAD && git remote get-url origin"
-            $out = & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=20 -o BatchMode=yes $remoteHost $cmd 2>$null
-            $lines = ($out -split "`n")
-            $statusLines = @()
-            $branch = ''
-            $remote = ''
-            foreach ($line in $lines) {
-                if ($line -match '^(\?\?| M|A |D )') { $statusLines += $line; continue }
-                if (-not $branch) { $branch = $line; continue }
-                if (-not $remote) { $remote = $line }
-            }
-            Write-Log "Git status (remote) lines: $([string]::Join(';', $statusLines)) branch=$branch remote=$remote" 'Debug'
-            return [pscustomobject]@{ HasChanges = [bool]$statusLines; StatusText = ($statusLines -join "`n"); Branch=$branch; Remote=$remote }
-        } else {
-            Push-Location $RepoPath
-            $lines = @(git status --porcelain=v1 2>$null)
-            if (-not $lines) { $lines = @() }
-            $branch = (git rev-parse --abbrev-ref HEAD 2>$null)
-            $remote = git remote get-url origin 2>$null
-            Pop-Location
-            Write-Log "Git status (local) lines: $([string]::Join(';', $lines)) branch=$branch remote=$remote" 'Debug'
-            return [pscustomobject]@{ HasChanges = [bool]$lines; StatusText = ($lines -join "`n"); Branch=$branch; Remote=$remote }
-        }
-    } catch {
-        Write-Log "Git status retrieval failed: $($_.Exception.Message)" 'Debug'
-        return $null
-    }
-}
-
-# Show commit dialog and return commit message + push preference
-function Show-GitCommitDialog {
-    param(
-        [string]$ChangesText
-    )
-    Write-Log 'Prompting user to commit/push git changes.' 'Info'
-    $form = New-Object System.Windows.Forms.Form -Property @{ Text='Git Changes Detected'; Size=New-Object System.Drawing.Size(640,540); FormBorderStyle='FixedDialog'; MaximizeBox=$false }
-    Set-FormCenterOnCurrentScreen -Form $form
-    Apply-ThemeToForm -Form $form
-
-    $lbl = New-Object System.Windows.Forms.Label -Property @{ Text='Uncommitted changes detected. Review and commit?'; Location=New-Object System.Drawing.Point(14,12); Size=New-Object System.Drawing.Size(600,22) }
-    Style-Label -Label $lbl -Style ([System.Drawing.FontStyle]::Bold)
-    $form.Controls.Add($lbl)
-
-    $txtChanges = New-Object System.Windows.Forms.TextBox -Property @{ Location=New-Object System.Drawing.Point(14,40); Size=New-Object System.Drawing.Size(600,310); Multiline=$true; ScrollBars='Vertical'; ReadOnly=$true; Font=New-Object System.Drawing.Font('Consolas',9); Text=$ChangesText }
-    Style-TextBox -TextBox $txtChanges
-    $txtChanges.BackColor = $script:ThemePalette.Panel
-    $txtChanges.Font = New-Object System.Drawing.Font('Consolas',9,[System.Drawing.FontStyle]::Regular)
-    $form.Controls.Add($txtChanges)
-
-    $lblMsg = New-Object System.Windows.Forms.Label -Property @{ Text='Commit message:'; Location=New-Object System.Drawing.Point(14,360); Size=New-Object System.Drawing.Size(200,22) }
-    Style-Label -Label $lblMsg
-    $form.Controls.Add($lblMsg)
-
-    $txtMsg = New-Object System.Windows.Forms.TextBox -Property @{ Location=New-Object System.Drawing.Point(14,385); Size=New-Object System.Drawing.Size(600,26) }
-    Style-TextBox -TextBox $txtMsg
-    $form.Controls.Add($txtMsg)
-
-    $chkPush = New-Object System.Windows.Forms.CheckBox -Property @{ Text='Push to origin after commit'; Location=New-Object System.Drawing.Point(14,420); Size=New-Object System.Drawing.Size(280,24); Checked=$true }
-    Style-CheckBox -CheckBox $chkPush
-    $form.Controls.Add($chkPush)
-
-    $btnOk = New-Object System.Windows.Forms.Button -Property @{ Text='Commit'; Location=New-Object System.Drawing.Point(360,460); Size=New-Object System.Drawing.Size(110,36) }
-    $btnCancel = New-Object System.Windows.Forms.Button -Property @{ Text='Skip'; Location=New-Object System.Drawing.Point(504,460); Size=New-Object System.Drawing.Size(110,36); DialogResult=[System.Windows.Forms.DialogResult]::Cancel }
-    Style-Button -Button $btnOk -Variant 'primary'
-    Style-Button -Button $btnCancel -Variant 'secondary'
-    $btnOk.Add_Click({ if (-not $txtMsg.Text.Trim()) { [System.Windows.Forms.MessageBox]::Show('Enter a commit message.','Message required','OK','Warning') | Out-Null; return }; $form.DialogResult=[System.Windows.Forms.DialogResult]::OK; $form.Close() })
-    $form.AcceptButton=$btnOk; $form.CancelButton=$btnCancel; $form.Controls.Add($btnOk); $form.Controls.Add($btnCancel)
-    $result = $form.ShowDialog()
-    if ($result -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
-    return @{ Message=$txtMsg.Text.Trim(); Push=$chkPush.Checked }
-}
-
-# Detect changes and optionally commit/push
-function Invoke-GitChangeDetection {
-    param(
-        [pscustomobject]$State,
-        [string]$RepoPath,
-        [bool]$IsRemote
-    )
-    Write-Log "Detecting git changes at $RepoPath (remote=$IsRemote)" 'Info'
-    $gitState = Get-GitRepositoryState -State $State -RepoPath $RepoPath -IsRemote $IsRemote
-    if (-not $gitState -or -not $gitState.HasChanges) { return }
-    $dialogResult = Show-GitCommitDialog -ChangesText $gitState.StatusText
-    if (-not $dialogResult) { Write-Log 'User skipped git commit/push.' 'Info'; return }
-
-    $msg = $dialogResult.Message
-    $doPush = $dialogResult.Push
-    $safeMsg = $msg.Replace('"','\"')
-
-    try {
-        if ($IsRemote) {
-            $remoteHost = Get-RemoteHostString -State $State
-            $keyPath = $State.Paths.SshPrivate
-            # Ensure remote origin uses SSH (convert GitHub HTTPS to SSH if needed)
-            $remoteUrl = & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost "cd '$RepoPath' && git remote get-url origin" 2>$null
-            if ($remoteUrl -and $remoteUrl -match '^https://github.com/(.+)$') {
-                $sshUrl = "git@github.com:$($matches[1])"
-                & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost "cd '$RepoPath' && git remote set-url origin '$sshUrl'" 2>$null
-            }
-
-            $commitCmd = "cd '$RepoPath' && git add -A && git commit -m `"$safeMsg`""
-            $commitOut = & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost $commitCmd 2>&1
-            Write-Log "Remote git commit exit=$LASTEXITCODE output=$commitOut" 'Debug'
-            if ($LASTEXITCODE -ne 0 -and $commitOut -notmatch 'nothing to commit') { [System.Windows.Forms.MessageBox]::Show("Git commit failed on remote: $commitOut",'Git commit failed','OK','Error') | Out-Null; return }
-            if ($LASTEXITCODE -eq 0) { Write-Log 'Git commit completed on remote.' 'Info' }
-            if ($doPush) {
-                $remoteKey = "~/.ssh/id_ed25519_$($State.UserName)"
-                $pushAgent = "cd '$RepoPath' && eval `$(ssh-agent -s) && ssh-add $remoteKey 2>/dev/null && GIT_SSH_COMMAND='ssh -i $remoteKey -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' git push"
-                $pushOut = & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost $pushAgent 2>&1
-                Write-Log "Remote git push (agent) exit=$LASTEXITCODE output=$pushOut" 'Debug'
-                if ($LASTEXITCODE -ne 0) {
-                    $pushDirect = "cd '$RepoPath' && GIT_SSH_COMMAND='ssh -i $remoteKey -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' git push"
-                    $pushOut = & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost $pushDirect 2>&1
-                    Write-Log "Remote git push (direct) exit=$LASTEXITCODE output=$pushOut" 'Debug'
-                }
-                if ($LASTEXITCODE -ne 0) { [System.Windows.Forms.MessageBox]::Show("Git push failed on remote: $pushOut",'Git push failed','OK','Error') | Out-Null }
-                else { Write-Log 'Git push completed on remote.' 'Info' }
-            }
-        } else {
-            Push-Location $RepoPath
-            $url = git remote get-url origin 2>$null
-            if ($url -and $url -match '^https://github.com/(.+)$') {
-                $sshUrl = "git@github.com:$($matches[1])"
-                git remote set-url origin $sshUrl 2>$null
-            }
-            git add -A | Out-Null
-            $commitLocal = git commit -m $msg 2>&1
-            Write-Log "Local git commit output: $commitLocal" 'Debug'
-            Write-Log 'Git commit completed locally.' 'Info'
-            if ($doPush) {
-                $pushLocal = git push 2>&1
-                Write-Log "Local git push output: $pushLocal" 'Debug'
-                Write-Log 'Git push completed locally.' 'Info'
-            }
-            Pop-Location
-        }
-    } catch {
-        Write-Log "Git change detection error: $($_.Exception.Message)" 'Warn'
-        [System.Windows.Forms.MessageBox]::Show('Git commit/push encountered an error. See console for details.','Git error','OK','Error') | Out-Null
-    }
-}
-
-# Center a WinForms dialog on the monitor with the current cursor.
-function Set-FormCenterOnCurrentScreen {
-    param(
-        [System.Windows.Forms.Form]$Form
-    )
-    try {
-        if (-not ('Win32' -as [type])) {
-            Add-Type -TypeDefinition @"
-        using System;
-        using System.Runtime.InteropServices;
-        using System.Drawing;
-        public struct POINT { public int X; public int Y; }
-        public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-        public class Win32 {
-            [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
-            [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
-            [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
-        }
-        [StructLayout(LayoutKind.Sequential)]
-        public struct MONITORINFO { public uint cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
-"@
-        }
-        $cursorPos = New-Object POINT
-        [Win32]::GetCursorPos([ref]$cursorPos) | Out-Null
-        $monitor = [Win32]::MonitorFromPoint($cursorPos, 2)
-        $monitorInfo = New-Object MONITORINFO
-        $monitorInfo.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($monitorInfo)
-        [Win32]::GetMonitorInfo($monitor, [ref]$monitorInfo) | Out-Null
-        $screenWidth = $monitorInfo.rcWork.Right - $monitorInfo.rcWork.Left
-        $screenHeight = $monitorInfo.rcWork.Bottom - $monitorInfo.rcWork.Top
-        $screenLeft = $monitorInfo.rcWork.Left
-        $screenTop = $monitorInfo.rcWork.Top
-        $centerX = $screenLeft + (($screenWidth - $Form.Width) / 2)
-        $centerY = $screenTop + (($screenHeight - $Form.Height) / 2)
-        $Form.StartPosition = 'Manual'
-        $Form.Location = New-Object System.Drawing.Point([int]$centerX, [int]$centerY)
-    } catch {
-        Write-Log "Failed to center form on current screen: $($_.Exception.Message)" 'Debug'
-        $Form.StartPosition = 'CenterScreen'
-    }
-}
-
-# Lightweight theming helpers to keep a consistent visual language across dialogs.
-function Initialize-ThemePalette {
-    if ($script:ThemePalette) { return }
-    $script:ThemePalette = @{
-        Back      = [System.Drawing.Color]::FromArgb(12,15,25)
-        Panel     = [System.Drawing.Color]::FromArgb(23,28,44)
-        Accent    = [System.Drawing.Color]::FromArgb(31,122,140)
-        AccentAlt = [System.Drawing.Color]::FromArgb(240,180,60)
-        Text      = [System.Drawing.Color]::FromArgb(229,233,240)
-        Muted     = [System.Drawing.Color]::FromArgb(157,165,180)
-        Danger    = [System.Drawing.Color]::FromArgb(200,70,70)
-        Success   = [System.Drawing.Color]::FromArgb(76,161,115)
-        Field     = [System.Drawing.Color]::FromArgb(28,34,52)
-    }
-}
-
-function Apply-ThemeToForm {
-    param([System.Windows.Forms.Form]$Form)
-    Initialize-ThemePalette
-    $Form.BackColor = $script:ThemePalette.Back
-    $Form.ForeColor = $script:ThemePalette.Text
-    $Form.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Regular)
-}
-
-function Style-Label {
-    param([System.Windows.Forms.Label]$Label,[bool]$Muted=$false,[System.Drawing.FontStyle]$Style=[System.Drawing.FontStyle]::Regular)
-    Initialize-ThemePalette
-    $Label.ForeColor = if ($Muted) { $script:ThemePalette.Muted } else { $script:ThemePalette.Text }
-    if ($Label.Font) {
-        $Label.Font = New-Object System.Drawing.Font('Segoe UI', $Label.Font.Size, $Style)
-    } else {
-        $Label.Font = New-Object System.Drawing.Font('Segoe UI', 10, $Style)
-    }
-}
-
-function Style-TextBox {
-    param([System.Windows.Forms.TextBox]$TextBox)
-    Initialize-ThemePalette
-    $TextBox.BorderStyle = 'FixedSingle'
-    $TextBox.BackColor = $script:ThemePalette.Field
-    $TextBox.ForeColor = $script:ThemePalette.Text
-    $TextBox.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Regular)
-}
-
-function Style-CheckBox {
-    param([System.Windows.Forms.CheckBox]$CheckBox)
-    Initialize-ThemePalette
-    $CheckBox.ForeColor = $script:ThemePalette.Text
-    if ($CheckBox.Font) {
-        $CheckBox.Font = New-Object System.Drawing.Font('Segoe UI', $CheckBox.Font.Size, [System.Drawing.FontStyle]::Regular)
-    }
-}
-
-function Style-Button {
-    param([System.Windows.Forms.Button]$Button,[ValidateSet('primary','secondary','danger','ghost')]$Variant='primary')
-    Initialize-ThemePalette
-    $Button.FlatStyle = 'Flat'
-    $Button.FlatAppearance.BorderSize = 0
-    $Button.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10, [System.Drawing.FontStyle]::Bold)
-    switch ($Variant) {
-        'primary'   { $Button.BackColor = $script:ThemePalette.Accent;    $Button.ForeColor = $script:ThemePalette.Text }
-        'secondary' { $Button.BackColor = $script:ThemePalette.Panel;     $Button.ForeColor = $script:ThemePalette.Text }
-        'danger'    { $Button.BackColor = $script:ThemePalette.Danger;    $Button.ForeColor = $script:ThemePalette.Text }
-        'ghost'     { $Button.BackColor = $script:ThemePalette.Field;     $Button.ForeColor = $script:ThemePalette.Text }
-    }
-}
-
-function Style-InfoBox {
-    param([System.Windows.Forms.RichTextBox]$Box)
-    Initialize-ThemePalette
-    $Box.BorderStyle = 'None'
-    $Box.BackColor = $script:ThemePalette.Back
-    $Box.ForeColor = $script:ThemePalette.Text
-    $Box.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Regular)
-    $Box.ReadOnly = $true
-}
-
-function Test-StartupPrerequisites {
-    param([pscustomobject]$State)
-
-    $dockerCmd = Get-Command docker -ErrorAction SilentlyContinue
-    if (-not $dockerCmd) {
-        Write-Log 'Docker CLI not found. Install Docker Desktop (Windows) or ensure docker is on PATH.' 'Error'
-        [System.Windows.Forms.MessageBox]::Show('Docker CLI not found.`n`nInstall Docker Desktop (Windows) and ensure "docker" is on PATH, then retry.','Docker missing','OK','Error') | Out-Null
-        return $false
-    }
-    Write-Log "Docker CLI found at $($dockerCmd.Source)." 'Debug'
-    # NOTE: Docker daemon reachability is NOT checked here. For LOCAL mode, Ensure-LocalPreparation
-    # handles auto-start of Docker Desktop with polling and user prompts. For REMOTE mode, a local
-    # daemon is not required. This avoids misleading error dialogs before the user has chosen a mode.
-
-    $sshCmd = Get-Command ssh -ErrorAction SilentlyContinue
-    if (-not $sshCmd) {
-        Write-Log 'OpenSSH client not found on PATH. Attempting auto-install.' 'Warn'
-
-        # Try to auto-install the OpenSSH Client Windows capability
-        $installAttempted = $false
-        try {
-            $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Client*' -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($cap -and $cap.State -ne 'Installed') {
-                $installChoice = [System.Windows.Forms.MessageBox]::Show(
-                    "The OpenSSH Client is not installed on this machine.`n`nThe tool needs ssh, ssh-keygen, and ssh-agent to function.`n`nInstall it now? (requires Administrator — a UAC prompt will appear)",
-                    'Install OpenSSH Client?',
-                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
-                    [System.Windows.Forms.MessageBoxIcon]::Question)
-
-                if ($installChoice -eq [System.Windows.Forms.DialogResult]::Yes) {
-                    Write-Log 'User agreed to install OpenSSH Client. Launching elevated install.' 'Info'
-                    $capName = $cap.Name
-                    $elevatedCmd = "Add-WindowsCapability -Online -Name '$capName' -ErrorAction Stop"
-                    $pwshPath = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
-                    $proc = Start-Process $pwshPath -ArgumentList '-NoProfile','-NoLogo','-Command',$elevatedCmd -Verb RunAs -Wait -PassThru -ErrorAction Stop
-                    $installAttempted = $true
-                    if ($proc.ExitCode -eq 0) {
-                        Write-Log 'OpenSSH Client installed successfully via elevated process.' 'Info'
-                        # Refresh PATH to pick up newly installed ssh
-                        $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-                        $userPath    = [Environment]::GetEnvironmentVariable('Path', 'User')
-                        $env:PATH = "$machinePath;$userPath"
-                    } else {
-                        Write-Log "Elevated OpenSSH install exited with code $($proc.ExitCode)" 'Warn'
-                    }
-                } else {
-                    Write-Log 'User declined OpenSSH Client install.' 'Warn'
-                }
-            }
-        } catch {
-            Write-Log "OpenSSH auto-install failed: $($_.Exception.Message)" 'Warn'
-        }
-
-        # Re-check after install attempt
-        $sshCmd = Get-Command ssh -ErrorAction SilentlyContinue
-        if (-not $sshCmd) {
-            $manualMsg = "OpenSSH Client (ssh) is required but not installed.`n`n" +
-                         "To install manually, run this in an Administrator PowerShell:`n`n" +
-                         "  Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0`n`n" +
-                         "Then restart this tool."
-            Write-Log 'OpenSSH client still not found after install attempt.' 'Error'
-            [System.Windows.Forms.MessageBox]::Show($manualMsg, 'SSH missing', 'OK', 'Error') | Out-Null
-            return $false
-        }
-    }
-
-    Write-Log "Prereq check passed (Docker CLI at $($dockerCmd.Source), ssh present)." 'Info'
-    return $true
-}
-
-# 0. Environment prep (PowerShell version, elevation, colors, WinForms load)
-function Ensure-Prerequisites {
-    param([pscustomobject]$State)
-    Write-Log 'Checking PowerShell version and elevation' 'Info'
-
-    Write-Log 'Loading UI dependencies (WinForms, Drawing).' 'Debug'
-    # Load WinForms early for dialogs used below
-    Add-Type -AssemblyName System.Windows.Forms
-    Add-Type -AssemblyName System.Drawing
-    [System.Windows.Forms.Application]::EnableVisualStyles()
-
-    Write-Log "Detected PowerShell $($PSVersionTable.PSVersion) (Major=$($PSVersionTable.PSVersion.Major))" 'Debug'
-
-    if (-not (Test-StartupPrerequisites -State $State)) { return $false }
-
-    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')
-    Write-Log "Administrative privileges: $isAdmin" 'Debug'
-    if (-not $isAdmin) {
-        Write-Log 'Administrator privileges not present; continuing without elevation.' 'Warn'
-    }
-
-    try {
-        $raw = $Host.UI.RawUI
-        $raw.BackgroundColor = 'Black'
-        $raw.ForegroundColor = 'White'
-        $raw.WindowTitle = 'IMPACT NCD Germany - Docker GUI'
-        Clear-Host
-        Write-Log 'Console cleared; prerequisites complete.' 'Debug'
-    } catch {
-        Write-Log 'Could not adjust console colors.' 'Debug'
-    }
-
-    return $true
-}
-
-# 1. Credential dialog
-function Show-CredentialDialog {
-    param([pscustomobject]$State)
-    Write-Log 'Collecting credentials — opening dialog.' 'Info'
-
-    Write-Log 'Opening credential dialog for username/password input.' 'Debug'
-
-    $form = New-Object System.Windows.Forms.Form -Property @{
-        Text = 'Remote Access - IMPACT NCD Germany'
-        Size = New-Object System.Drawing.Size(540,320)
-        StartPosition = 'CenterScreen'
-        FormBorderStyle = 'FixedDialog'
-        MaximizeBox = $false
-    }
-    Set-FormCenterOnCurrentScreen -Form $form
-    Apply-ThemeToForm -Form $form
-
-    $rtbInstruction = New-Object System.Windows.Forms.RichTextBox -Property @{
-        Location = New-Object System.Drawing.Point(14,12)
-        Size = New-Object System.Drawing.Size(500,130)
-        Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Regular)
-        ReadOnly = $true
-        BorderStyle = 'None'
-        BackColor = $form.BackColor
-        ScrollBars = 'None'
-    }
-    $rtbInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 9, [System.Drawing.FontStyle]::Bold)
-    $rtbInstruction.AppendText('Please enter a username and a password!')
-    $rtbInstruction.AppendText("`n`n")
-    $rtbInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 9, [System.Drawing.FontStyle]::Bold)
-    $rtbInstruction.SelectionColor = [System.Drawing.Color]::DarkRed
-    $rtbInstruction.AppendText('Important:')
-    $rtbInstruction.SelectionColor = [System.Drawing.Color]::Black
-    $rtbInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 9, [System.Drawing.FontStyle]::Regular)
-    $rtbInstruction.AppendText("`nThe username will be used for an SSH key and for container management.`nThe password will be used to login to your RStudio Server session.`n`n")
-    $rtbInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 8, [System.Drawing.FontStyle]::Regular)
-    $rtbInstruction.SelectionColor = [System.Drawing.Color]::DarkGray
-    $rtbInstruction.AppendText('(Username will be normalized: spaces removed, lowercase)')
-    Style-InfoBox -Box $rtbInstruction
-    $form.Controls.Add($rtbInstruction)
-
-    $labelUser = New-Object System.Windows.Forms.Label -Property @{
-        Text = 'Username'
-        Location = New-Object System.Drawing.Point(14,150)
-        Size = New-Object System.Drawing.Size(100,22)
-    }
-    Style-Label -Label $labelUser -Style ([System.Drawing.FontStyle]::Bold)
-    $form.Controls.Add($labelUser)
-    $textUser = New-Object System.Windows.Forms.TextBox -Property @{
-        Location = New-Object System.Drawing.Point(120,148)
-        Size = New-Object System.Drawing.Size(360,26)
-    }
-    Style-TextBox -TextBox $textUser
-    $form.Controls.Add($textUser)
-
-    $labelPass = New-Object System.Windows.Forms.Label -Property @{
-        Text = 'Password'
-        Location = New-Object System.Drawing.Point(14,185)
-        Size = New-Object System.Drawing.Size(100,22)
-    }
-    Style-Label -Label $labelPass -Style ([System.Drawing.FontStyle]::Bold)
-    $form.Controls.Add($labelPass)
-    $textPass = New-Object System.Windows.Forms.TextBox -Property @{
-        Location = New-Object System.Drawing.Point(120,183)
-        Size = New-Object System.Drawing.Size(360,26)
-        UseSystemPasswordChar = $true
-    }
-    Style-TextBox -TextBox $textPass
-    $form.Controls.Add($textPass)
-
-    $buttonOK = New-Object System.Windows.Forms.Button -Property @{
-        Text = 'Continue'
-        Location = New-Object System.Drawing.Point(120,228)
-        Size = New-Object System.Drawing.Size(110,34)
-    }
-    Style-Button -Button $buttonOK -Variant 'primary'
-    $form.Controls.Add($buttonOK)
-
-    $buttonCancel = New-Object System.Windows.Forms.Button -Property @{
-        Text = 'Cancel'
-        Location = New-Object System.Drawing.Point(240,228)
-        Size = New-Object System.Drawing.Size(110,34)
-        DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    }
-    Style-Button -Button $buttonCancel -Variant 'secondary'
-    $form.Controls.Add($buttonCancel)
-
-    $form.AcceptButton = $buttonOK
-    $form.CancelButton = $buttonCancel
-    $form.Add_Shown({ $textUser.Focus() })
-
-    $buttonOK.Add_Click({
-        if ([string]::IsNullOrWhiteSpace($textUser.Text)) {
-            [System.Windows.Forms.MessageBox]::Show('Please enter a username.', 'Error', 'OK', 'Error') | Out-Null
-            $textUser.Focus()
-            return
-        }
-        if ([string]::IsNullOrWhiteSpace($textPass.Text)) {
-            [System.Windows.Forms.MessageBox]::Show('Please enter a password.', 'Error', 'OK', 'Error') | Out-Null
-            $textPass.Focus()
-            return
-        }
-        $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
-        $form.Close()
-    })
-
-    $result = $form.ShowDialog()
-    Write-Log "Credential dialog result: $result" 'Debug'
-    if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
-        Write-Log 'User cancelled the credential dialog.' 'Warn'
-        return $false
-    }
-
-    $originalUsername = $textUser.Text.Trim()
-    $normalizedUsername = ($originalUsername -replace '\s+', '').ToLower()
-    if ([string]::IsNullOrWhiteSpace($normalizedUsername)) {
-        [System.Windows.Forms.MessageBox]::Show('Username cannot be empty after removing spaces.', 'Invalid Username', 'OK', 'Error') | Out-Null
-        Write-Log 'Username empty after normalization; aborting.' 'Error'
-        return $false
-    }
-
-    $State.UserName = $normalizedUsername
-    $State.Password = $textPass.Text
-
-    Write-Log "Credentials collected for user $($State.UserName)" 'Info'
-    return $true
-}
-
-# Helper: ensure ssh-agent Windows service is running and add the user's key
-function Ensure-SshAgentRunning {
-    param([string]$SshKeyPath)
-
-    Write-Log 'Ensuring ssh-agent service is running and key is loaded.' 'Info'
-
-    $sshAgentService = Get-Service ssh-agent -ErrorAction SilentlyContinue
-    if (-not $sshAgentService) {
-        Write-Log 'ssh-agent service not found on this system.' 'Warn'
-        return
-    }
-
-    if ($sshAgentService.Status -ne 'Running') {
-        # First attempt: try starting directly (works if startup type is Manual or Automatic)
-        $started = $false
-        try {
-            Start-Service ssh-agent -ErrorAction Stop
-            $started = $true
-            Write-Log 'ssh-agent service started (no elevation needed).' 'Info'
-        } catch {
-            Write-Log "Direct Start-Service ssh-agent failed: $($_.Exception.Message). Attempting elevated start." 'Warn'
-        }
-
-        if (-not $started) {
-            # Targeted elevation: set startup type to Automatic and start the service
-            try {
-                $elevatedCmd = "Set-Service ssh-agent -StartupType Automatic -ErrorAction Stop; Start-Service ssh-agent -ErrorAction Stop"
-                $pwshPath = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
-                $proc = Start-Process $pwshPath -ArgumentList '-NoProfile','-NoLogo','-Command',$elevatedCmd -Verb RunAs -Wait -PassThru -ErrorAction Stop
-                if ($proc.ExitCode -eq 0) {
-                    Write-Log 'ssh-agent service started via elevated process.' 'Info'
-                    $started = $true
-                } else {
-                    Write-Log "Elevated ssh-agent start exited with code $($proc.ExitCode)" 'Warn'
-                }
-            } catch {
-                Write-Log "Elevated ssh-agent start failed: $($_.Exception.Message)" 'Warn'
-                Write-Log 'To fix manually, run in an admin PowerShell: Set-Service ssh-agent -StartupType Automatic; Start-Service ssh-agent' 'Warn'
-            }
-        }
-    }
-
-    # Best-effort cleanup: remove stale keys from agent whose files no longer exist on disk
-    $sshAgentService = Get-Service ssh-agent -ErrorAction SilentlyContinue
-    if ($sshAgentService -and $sshAgentService.Status -eq 'Running') {
-        try {
-            $loadedRaw = & ssh-add -l 2>&1
-            if ($LASTEXITCODE -eq 0 -and $loadedRaw -notmatch 'no identities') {
-                foreach ($kl in ($loadedRaw -split "`n")) {
-                    $kl = $kl.Trim()
-                    if (-not $kl) { continue }
-                    # ssh-add -l format: "bits fingerprint path/comment (type)"
-                    if ($kl -match '^\d+\s+\S+\s+(.+?)\s+\(\S+\)$') {
-                        $keyRef = $Matches[1].Trim()
-                        $nativePath = $keyRef -replace '/', '\'
-                        if ($nativePath.StartsWith('~')) { $nativePath = Join-Path $HOME $nativePath.Substring(2) }
-                        if (($keyRef -match '^(/|[A-Za-z]:\\|~[/\\])') -and -not (Test-Path $nativePath)) {
-                            Write-Log "Stale key in ssh-agent (file deleted): $keyRef" 'Warn'
-                            $pubPath = "${nativePath}.pub"
-                            if (Test-Path $pubPath) {
-                                try { & ssh-add -d $pubPath 2>&1 | Out-Null; Write-Log "Removed stale key from agent: $keyRef" 'Info' } catch { }
-                            } else {
-                                Write-Log "Cannot auto-remove agent key (pub file also missing): $keyRef — consider running 'ssh-add -D' to clear all agent keys." 'Debug'
-                            }
-                        }
-                    }
-                }
-            }
-        } catch {
-            Write-Log "Agent stale-key check failed: $($_.Exception.Message)" 'Debug'
-        }
-    }
-
-    # Add the key to the agent (only if the service is running)
-    $sshAgentService = Get-Service ssh-agent -ErrorAction SilentlyContinue
-    if ($sshAgentService -and $sshAgentService.Status -eq 'Running') {
-        try {
-            # Check if key is already loaded
-            $loadedKeys = & ssh-add -l 2>&1
-            if ($loadedKeys -notmatch [regex]::Escape($SshKeyPath) -and $loadedKeys -notmatch [regex]::Escape((Split-Path $SshKeyPath -Leaf).Replace('.','_'))) {
-                & ssh-add $SshKeyPath 2>&1 | Out-Null
-                Write-Log "SSH key added to ssh-agent: $SshKeyPath" 'Info'
-            } else {
-                Write-Log 'SSH key already loaded in ssh-agent.' 'Debug'
-            }
-        } catch {
-            Write-Log "ssh-add failed: $($_.Exception.Message)" 'Warn'
-        }
-    } else {
-        Write-Log 'ssh-agent service is not running; skipping ssh-add.' 'Warn'
-    }
-}
-
-# Helper: remove an entire Host block (and its preceding IMPACT comment) from ~/.ssh/config
-function Remove-SshConfigHostBlock {
-    param(
-        [string]$ConfigPath,
-        [string]$HostPattern
-    )
-    Write-Log "Remove-SshConfigHostBlock called for HostPattern='$HostPattern' ConfigPath='$ConfigPath'" 'Debug'
-    if (-not (Test-Path $ConfigPath)) { return $false }
-
-    $lines = Get-Content $ConfigPath -ErrorAction SilentlyContinue
-    if (-not $lines) { return $false }
-
-    $resultLines = [System.Collections.Generic.List[string]]::new()
-    $inBlock = $false
-    $removed = $false
-    $hostEscaped = [regex]::Escape($HostPattern)
-
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        $line = $lines[$i]
-
-        if ($line -match "^\s*Host\s+$hostEscaped\s*`$") {
-            $inBlock = $true
-            $removed = $true
-            # Also strip any preceding IMPACT comment and blank lines
-            while ($resultLines.Count -gt 0 -and (
-                $resultLines[$resultLines.Count - 1] -match '^\s*#.*IMPACT' -or
-                [string]::IsNullOrWhiteSpace($resultLines[$resultLines.Count - 1])
-            )) {
-                $resultLines.RemoveAt($resultLines.Count - 1)
-            }
-            continue
-        }
-
-        if ($inBlock) {
-            # Block ends when the next Host directive appears
-            if ($line -match '^\s*Host\s+') {
-                $inBlock = $false
-                $resultLines.Add($line)
-            }
-            continue
-        }
-
-        $resultLines.Add($line)
-    }
-
-    if ($removed) {
-        Set-Content -Path $ConfigPath -Value $resultLines -Encoding UTF8
-        Write-Log "Removed SSH config Host block for '$HostPattern' from $ConfigPath" 'Info'
-    } else {
-        Write-Log "No matching Host block found for '$HostPattern'." 'Debug'
-    }
-
-    return $removed
-}
-
-# Helper: ensure ~/.ssh/config has an entry for the remote workstation
-function Ensure-SshConfigEntry {
-    param(
-        [string]$RemoteHostIp,
-        [string]$RemoteUser,
-        [string]$IdentityFile
-    )
-
-    if (-not $RemoteHostIp -or -not $RemoteUser -or -not $IdentityFile) {
-        Write-Log 'Ensure-SshConfigEntry: missing parameters, skipping.' 'Debug'
-        return
-    }
-
-    $sshDir = Join-Path $HOME '.ssh'
-    $configPath = Join-Path $sshDir 'config'
-    Write-Log "Ensure-SshConfigEntry: sshDir='$sshDir' configPath='$configPath' RemoteHostIp='$RemoteHostIp'" 'Debug'
-
-    Write-Log "Ensuring SSH config entry for $RemoteHostIp in $configPath" 'Info'
-
-    # Ensure .ssh directory exists
-    if (-not (Test-Path $sshDir)) {
-        New-Item -Path $sshDir -ItemType Directory -Force | Out-Null
-    }
-
-    # Normalize the identity file path to use forward-slash notation for SSH config
-    $identityNorm = $IdentityFile -replace '\\','/'
-
-    # Check if config file already contains an entry for this host
-    if (Test-Path $configPath) {
-        $existingConfig = Get-Content $configPath -Raw -ErrorAction SilentlyContinue
-        if ($existingConfig -match "(?mi)^\s*Host\s+$([regex]::Escape($RemoteHostIp))\s*`$") {
-            # Entry exists — validate that the referenced IdentityFile still exists on disk
-            $configLines = $existingConfig -split "`n"
-            $inBlock = $false
-            $existingIdentityFile = $null
-
-            foreach ($cl in $configLines) {
-                $cl = $cl.TrimEnd("`r")
-                if ($cl -match "^\s*Host\s+$([regex]::Escape($RemoteHostIp))\s*`$") {
-                    $inBlock = $true; continue
-                }
-                if ($inBlock) {
-                    if ($cl -match '^\s*Host\s+') { break }
-                    if ($cl -match '^\s*IdentityFile\s+(.+)$') {
-                        $existingIdentityFile = $Matches[1].Trim()
-                    }
-                }
-            }
-
-            $needsUpdate = $false
-            if ($existingIdentityFile) {
-                # Normalize existing value for comparison (backslashes → forward slashes)
-                $existingNorm = $existingIdentityFile -replace '\\','/'
-                # Convert to native path for existence check on disk
-                $checkPath = $existingIdentityFile -replace '/','\'
-                if ($checkPath.StartsWith('~')) { $checkPath = Join-Path $HOME $checkPath.Substring(2) }
-                if (-not (Test-Path $checkPath)) {
-                    Write-Log "SSH config for $RemoteHostIp points to deleted key: $existingIdentityFile — replacing entry." 'Warn'
-                    $needsUpdate = $true
-                } elseif ($existingNorm -ne $identityNorm) {
-                    Write-Log "SSH config for $RemoteHostIp references different key ($existingIdentityFile vs $identityNorm) — updating." 'Info'
-                    $needsUpdate = $true
-                } elseif ($existingIdentityFile -ne $identityNorm) {
-                    # Same logical path but wrong slash direction — SSH may not resolve backslashes correctly
-                    Write-Log "SSH config for $RemoteHostIp has backslashes in IdentityFile — fixing slash direction." 'Warn'
-                    $needsUpdate = $true
-                }
-            } else {
-                Write-Log "SSH config entry for $RemoteHostIp has no IdentityFile — replacing." 'Warn'
-                $needsUpdate = $true
-            }
-
-            if (-not $needsUpdate) {
-                Write-Log "SSH config already contains valid entry for Host $RemoteHostIp — skipping." 'Debug'
-                return
-            }
-
-            # Remove the stale Host block before re-adding with the correct key
-            Remove-SshConfigHostBlock -ConfigPath $configPath -HostPattern $RemoteHostIp
-        }
-    }
-
-    # Append a new Host entry (do NOT include BatchMode — it would break the first-time password bootstrap)
-    $entry = @"
-
-# IMPACT Docker GUI — auto-generated entry for remote workstation
-Host $RemoteHostIp
-    User $RemoteUser
-    IdentityFile $identityNorm
-    IdentitiesOnly yes
-    StrictHostKeyChecking accept-new
-    ConnectTimeout 10
-"@
-
-    try {
-        Add-Content -Path $configPath -Value $entry -Encoding UTF8 -ErrorAction Stop
-        Write-Log "SSH config entry added for Host $RemoteHostIp" 'Info'
-    } catch {
-        Write-Log "Failed to write SSH config: $($_.Exception.Message)" 'Warn'
-    }
-}
-
-# 2. GitHub SSH key setup
-function Ensure-GitKeySetup {
-    param([pscustomobject]$State)
-    Write-Log 'Preparing SSH keys for GitHub integration' 'Info'
-
-    if (-not $State.UserName) {
-        Write-Log 'Username missing before SSH key setup.' 'Error'
-        return $false
-    }
-
-    $sshDir = Join-Path $HOME '.ssh'
-    $sshKeyPath = Join-Path $sshDir "id_ed25519_$($State.UserName)"
-    $sshPublicKeyPath = "$sshKeyPath.pub"
-
-    $State.Paths.SshPrivate = $sshKeyPath
-    $State.Paths.SshPublic = $sshPublicKeyPath
-
-    $privateKeyExists = Test-Path $sshKeyPath
-    $publicKeyExists = Test-Path $sshPublicKeyPath
-    Write-Log "Existing SSH key? private=$privateKeyExists, public=$publicKeyExists" 'Debug'
-
-    if ($privateKeyExists -and $publicKeyExists) {
-        Write-Log "Using existing SSH key at $sshKeyPath" 'Info'
-        $publicKey = Get-Content $sshPublicKeyPath -ErrorAction Stop
-        $State.Metadata.PublicKey = ($publicKey -join "`n")
-
-        Write-Host "The following Public Key will be used:" 
-        Write-Host "----------------------------------------"
-        Write-Host $publicKey
-        Write-Host "----------------------------------------"
-        Write-Host "If you cannot authenticate with GitHub, add this key in GitHub -> Settings -> SSH and GPG keys"
-
-        # Ensure ssh-agent is running and key is loaded (even for existing keys)
-        Ensure-SshAgentRunning -SshKeyPath $sshKeyPath
-        return $true
-    }
-
-    # Ensure .ssh directory exists
-    if (-not (Test-Path $sshDir)) {
-        New-Item -Path $sshDir -ItemType Directory -Force | Out-Null
-        Write-Log "Created .ssh directory at $sshDir" 'Info'
-    }
-
-    Write-Log "Generating SSH key at $sshKeyPath (comment=IMPACT_$($State.UserName))" 'Info'
-    $sshKeyGenArgs = @(
-        '-t', 'ed25519',
-        '-C', "IMPACT_$($State.UserName)",
-        '-f', $sshKeyPath,
-        '-N', '',
-        '-q'
-    )
-
-    try {
-        & ssh-keygen @sshKeyGenArgs
-        $keyGenResult = $LASTEXITCODE
-    } catch {
-        Write-Log "ssh-keygen failed: $($_.Exception.Message)" 'Error'
-        return $false
-    }
-
-    $publicKeyGenerated = Test-Path $sshPublicKeyPath
-    if (($keyGenResult -ne 0) -or -not $publicKeyGenerated) {
-        Write-Log "SSH key generation failed (exit $keyGenResult)" 'Error'
-        return $false
-    }
-
-    Write-Log "SSH key generated successfully at $sshKeyPath" 'Info'
-    $publicKey = Get-Content $sshPublicKeyPath -ErrorAction Stop
-    $State.Metadata.PublicKey = ($publicKey -join "`n")
-
-    # Copy to clipboard (best-effort)
-    try { $publicKey | Set-Clipboard | Out-Null } catch { Write-Log 'Could not copy key to clipboard.' 'Warn' }
-
-    $message = "A new SSH public key has been generated.`n`n" +
-               "Path: $sshPublicKeyPath`n`n" +
-               "Add this key to GitHub: Settings -> SSH and GPG keys -> New SSH key."
-    [System.Windows.Forms.MessageBox]::Show($message, 'SSH Key Setup', 'OK', 'Information') | Out-Null
-
-    $formKeyDisplay = New-Object System.Windows.Forms.Form -Property @{
-        Text = 'SSH Public Key - GitHub Integration'
-        Size = New-Object System.Drawing.Size(820,520)
-        FormBorderStyle = 'FixedDialog'
-        MaximizeBox = $false
-        MinimizeBox = $false
-    }
-    Set-FormCenterOnCurrentScreen -Form $formKeyDisplay
-    Apply-ThemeToForm -Form $formKeyDisplay
-
-    $labelTitle = New-Object System.Windows.Forms.Label -Property @{
-        Text = 'SSH Public Key Generated'
-        Location = New-Object System.Drawing.Point(24,16)
-        Size = New-Object System.Drawing.Size(780,36)
-        TextAlign = 'MiddleCenter'
-    }
-    Style-Label -Label $labelTitle -Style ([System.Drawing.FontStyle]::Bold)
-    $formKeyDisplay.Controls.Add($labelTitle)
-
-    $labelKeyInstruction = New-Object System.Windows.Forms.Label -Property @{
-        Text = "To enable GitHub integration, copy this SSH public key to your GitHub account:`n`nGitHub > Settings > SSH and GPG keys > New SSH key"
-        Location = New-Object System.Drawing.Point(24,58)
-        Size = New-Object System.Drawing.Size(780,64)
-    }
-    Style-Label -Label $labelKeyInstruction
-    $formKeyDisplay.Controls.Add($labelKeyInstruction)
-
-    $textBoxKey = New-Object System.Windows.Forms.TextBox -Property @{
-        Location = New-Object System.Drawing.Point(24,132)
-        Size = New-Object System.Drawing.Size(780,260)
-        Multiline = $true
-        ScrollBars = 'Vertical'
-        ReadOnly = $true
-        Font = New-Object System.Drawing.Font('Consolas', 10, [System.Drawing.FontStyle]::Regular)
-        Text = $publicKey
-        WordWrap = $false
-        BorderStyle = 'FixedSingle'
-    }
-    Style-TextBox -TextBox $textBoxKey
-    $textBoxKey.BackColor = $script:ThemePalette.Panel
-    $textBoxKey.Font = New-Object System.Drawing.Font('Consolas', 10, [System.Drawing.FontStyle]::Regular)
-    $formKeyDisplay.Controls.Add($textBoxKey)
-
-    $formKeyDisplay.Add_Shown({
-        $textBoxKey.SelectAll()
-        $textBoxKey.Focus()
-    })
-
-    $buttonCopyKey = New-Object System.Windows.Forms.Button -Property @{
-        Text = 'Copy to Clipboard'
-        Location = New-Object System.Drawing.Point(520,412)
-        Size = New-Object System.Drawing.Size(140,36)
-    }
-    Style-Button -Button $buttonCopyKey -Variant 'primary'
-    $formKeyDisplay.Controls.Add($buttonCopyKey)
-
-    $buttonCopyKey.Add_Click({
-        try {
-            $publicKey | Set-Clipboard | Out-Null
-            $buttonCopyKey.Text = 'Copied!'
-            $buttonCopyKey.BackColor = [System.Drawing.Color]::LightBlue
-            $buttonCopyKey.Enabled = $false
-            $script:CopyTimer = New-Object System.Windows.Forms.Timer
-            $script:CopyTimer.Interval = 2000
-            $script:CopyTimer.Add_Tick({
-                try {
-                    if ($buttonCopyKey -and -not $buttonCopyKey.IsDisposed) {
-                        $buttonCopyKey.Text = 'Copy to Clipboard'
-                        $buttonCopyKey.BackColor = [System.Drawing.Color]::LightGreen
-                        $buttonCopyKey.Enabled = $true
-                    }
-                    if ($script:CopyTimer -and -not $script:CopyTimer.Disposed) {
-                        $script:CopyTimer.Stop(); $script:CopyTimer.Dispose(); $script:CopyTimer = $null
-                    }
-                } catch {
-                    if ($script:CopyTimer) { try { $script:CopyTimer.Dispose() } catch { }; $script:CopyTimer = $null }
-                }
-            })
-            $script:CopyTimer.Start()
-        } catch {
-            [System.Windows.Forms.MessageBox]::Show('Failed to copy to clipboard. Please select all text and copy manually using Ctrl+C.', 'Copy Failed', 'OK', 'Warning') | Out-Null
-        }
-    })
-
-    $buttonCloseKey = New-Object System.Windows.Forms.Button -Property @{
-        Text = 'Close'
-        Location = New-Object System.Drawing.Point(670,412)
-        Size = New-Object System.Drawing.Size(120,36)
-        DialogResult = [System.Windows.Forms.DialogResult]::OK
-    }
-    Style-Button -Button $buttonCloseKey -Variant 'secondary'
-    $formKeyDisplay.Controls.Add($buttonCloseKey)
-    $buttonCloseKey.Add_Click({ $formKeyDisplay.DialogResult = [System.Windows.Forms.DialogResult]::OK; $formKeyDisplay.Close() })
-    $formKeyDisplay.AcceptButton = $buttonCloseKey
-    $formKeyDisplay.CancelButton = $buttonCloseKey
-    $null = $formKeyDisplay.ShowDialog()
-
-    Write-Host "Public Key (copy this to GitHub):"
-    Write-Host "----------------------------------------"
-    Write-Host $publicKey
-    Write-Host "----------------------------------------"
-
-    # Ensure ssh-agent is running and key is loaded
-    Ensure-SshAgentRunning -SshKeyPath $sshKeyPath
-
-    return $true
-}
-
-# 3. Location selection (local vs remote)
-function Select-Location {
-    param([pscustomobject]$State)
-    Write-Log 'Opening container location selection dialog.' 'Info'
-
-    $formConnection = New-Object System.Windows.Forms.Form -Property @{
-        Text = 'Container Location - IMPACT NCD Germany'
-        Size = New-Object System.Drawing.Size(480,260)
-        Location = New-Object System.Drawing.Point(400,300)
-        FormBorderStyle = 'FixedDialog'
-        MaximizeBox = $false
-    }
-    Set-FormCenterOnCurrentScreen -Form $formConnection
-    Apply-ThemeToForm -Form $formConnection
-
-    $rtbConnectionInstruction = New-Object System.Windows.Forms.RichTextBox -Property @{
-        Location = New-Object System.Drawing.Point(20,12)
-        Size = New-Object System.Drawing.Size(430,58)
-        Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Regular)
-        ReadOnly = $true
-        BorderStyle = 'None'
-        BackColor = $formConnection.BackColor
-        ScrollBars = 'None'
-    }
-    $rtbConnectionInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 9, [System.Drawing.FontStyle]::Bold)
-    $rtbConnectionInstruction.AppendText('Please choose whether you want to work locally')
-    $rtbConnectionInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 9, [System.Drawing.FontStyle]::Regular)
-    $rtbConnectionInstruction.AppendText(' (e.g. for testing) ')
-    $rtbConnectionInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 9, [System.Drawing.FontStyle]::Bold)
-    $rtbConnectionInstruction.AppendText('or remotely on the workstation')
-    $rtbConnectionInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 9, [System.Drawing.FontStyle]::Regular)
-    $rtbConnectionInstruction.AppendText(' (e.g. running simulations for output)!')
-    Style-InfoBox -Box $rtbConnectionInstruction
-    $formConnection.Controls.Add($rtbConnectionInstruction)
-
-    $buttonLocal = New-Object System.Windows.Forms.Button -Property @{
-        Text = 'Local Container'
-        Location = New-Object System.Drawing.Point(20,72)
-        Size = New-Object System.Drawing.Size(150,42)
-    }
-    Style-Button -Button $buttonLocal -Variant 'primary'
-    $formConnection.Controls.Add($buttonLocal)
-
-    $buttonRemote = New-Object System.Windows.Forms.Button -Property @{
-        Text = 'Remote Container'
-        Location = New-Object System.Drawing.Point(20,122)
-        Size = New-Object System.Drawing.Size(150,42)
-    }
-    Style-Button -Button $buttonRemote -Variant 'secondary'
-    $formConnection.Controls.Add($buttonRemote)
-
-    $labelRemoteIP = New-Object System.Windows.Forms.Label -Property @{
-        Text = 'Remote IP Address'
-        Location = New-Object System.Drawing.Point(190,126)
-        Size = New-Object System.Drawing.Size(140,22)
-    }
-    Style-Label -Label $labelRemoteIP
-    $formConnection.Controls.Add($labelRemoteIP)
-
-    # Load default IP from .env file (WORKSTATION_IP=...) if present
-    $defaultIP = ''
-    $envPaths = @(
-        (Join-Path $PSScriptRoot '.env'),
-        (Join-Path (Split-Path $PSScriptRoot -Parent) '.env')
-    )
-    foreach ($ep in $envPaths) {
-        if ($ep -and (Test-Path $ep)) {
-            $envLine = (Get-Content $ep -ErrorAction SilentlyContinue) | Where-Object { $_ -match '^\s*WORKSTATION_IP\s*=' } | Select-Object -First 1
-            if ($envLine) {
-                $defaultIP = ($envLine -split '=',2)[1].Trim().Trim('"').Trim("'")
-                Write-Log "Loaded WORKSTATION_IP from $ep" 'Debug'
-                break
-            }
-        }
-    }
-
-    $textRemoteIP = New-Object System.Windows.Forms.TextBox -Property @{
-        Location = New-Object System.Drawing.Point(330,124)
-        Size = New-Object System.Drawing.Size(120,24)
-        Text = $defaultIP
-    }
-    Style-TextBox -TextBox $textRemoteIP
-    $formConnection.Controls.Add($textRemoteIP)
-
-    $checkBoxDebug = New-Object System.Windows.Forms.CheckBox -Property @{
-        Text = 'Enable Debug Mode (show detailed progress messages)'
-        Location = New-Object System.Drawing.Point(20,180)
-        Size = New-Object System.Drawing.Size(380,22)
-        Checked = $false
-    }
-    Style-CheckBox -CheckBox $checkBoxDebug
-    $formConnection.Controls.Add($checkBoxDebug)
-
-    $State.ContainerLocation = $null
-
-    $buttonLocal.Add_Click({
-        $State.Flags.Debug = $checkBoxDebug.Checked
-        $script:GlobalDebugFlag = $State.Flags.Debug
-        $State.ContainerLocation = 'LOCAL'
-        $State.RemoteHost = $null
-        $State.RemoteHostIp = $null
-        $State.RemoteRepoBase = "/home/$($State.RemoteUser)/Schreibtisch/Repositories"
-        Write-Log 'User selected LOCAL container location.' 'Info'
-        $formConnection.DialogResult = [System.Windows.Forms.DialogResult]::Yes
-        $formConnection.Close()
-    })
-
-    $buttonRemote.Add_Click({
-        $State.Flags.Debug = $checkBoxDebug.Checked
-        $script:GlobalDebugFlag = $State.Flags.Debug
-        $userProvidedIP = $textRemoteIP.Text.Trim()
-        if ([string]::IsNullOrWhiteSpace($userProvidedIP)) {
-            [System.Windows.Forms.MessageBox]::Show('Please enter a valid IP address for the remote host.', 'Invalid IP Address', 'OK', 'Error') | Out-Null
-            return
-        }
-        if ($userProvidedIP -notmatch '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
-            [System.Windows.Forms.MessageBox]::Show('Please enter a valid IP address format (e.g., 192.168.1.100).', 'Invalid IP Format', 'OK', 'Error') | Out-Null
-            return
-        }
-        $State.RemoteHostIp = $userProvidedIP
-        $State.RemoteHost = "$($State.RemoteUser)@$userProvidedIP"
-        $State.RemoteRepoBase = "/home/$($State.RemoteUser)/Schreibtisch/Repositories"
-        $State.ContainerLocation = "REMOTE@$userProvidedIP"
-        Write-Log "User selected REMOTE container location at IP=$userProvidedIP." 'Info'
-        $formConnection.DialogResult = [System.Windows.Forms.DialogResult]::No
-        $formConnection.Close()
-    })
-
-    $result = $formConnection.ShowDialog()
-    if ($result -eq [System.Windows.Forms.DialogResult]::Yes -or $result -eq [System.Windows.Forms.DialogResult]::No) {
-        return $true
-    }
-
-    Write-Log 'No container location selected.' 'Warn'
-    return $false
+# Import the companion module (same directory as script/EXE)
+$modulePath = Join-Path $script:ScriptDir 'IMPACT_Docker_GUI.psm1'
+if (Test-Path $modulePath) {
+    Import-Module $modulePath -Force -DisableNameChecking
+} else {
+    Write-Host "ERROR: Module not found at $modulePath" -ForegroundColor Red
+    Write-Host "The file 'IMPACT_Docker_GUI.psm1' must be in the same folder as this script/EXE." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Press any key to exit..." -ForegroundColor Yellow
+    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    exit 1
 }
 
 # 4a. Remote prep: ensure SSH user, authorized_keys, repo list, docker context
@@ -1623,8 +102,14 @@ echo "{2}" > "$KEY_TARGET_PUB"
 chown {0}:{0} "$KEY_TARGET_PUB"
 chmod 644 "$KEY_TARGET_PUB"
 
+# Clean up stale pub files left by previous bug (extra underscore before .pub)
+STALE_PUB="$USER_SSH_DIR/id_ed25519_{1}_.pub"
+[ -f "$STALE_PUB" ] && rm -f "$STALE_PUB"
+
 # Remove any previous keys for this IMPACT user (comment marker: IMPACT_{1})
 sed -i '/IMPACT_{1}/d' "$AUTH_KEYS" 2>/dev/null || true
+# Also remove stale markers with trailing underscore from old bug
+sed -i '/IMPACT_{1}_/d' "$AUTH_KEYS" 2>/dev/null || true
 
 if ! grep -qxF "{2}" "$AUTH_KEYS"; then
     echo "{2}" >> "$AUTH_KEYS"
@@ -1725,8 +210,8 @@ ACTUAL_USER="$(whoami)"
 HOME_DIR="$(eval echo ~${ACTUAL_USER})"
 USER_SSH_DIR="$HOME_DIR/.ssh"
 AUTH_KEYS="$USER_SSH_DIR/authorized_keys"
-KEY_TARGET_PUB="$USER_SSH_DIR/id_ed25519___USERNAME___.pub"
-REMOTE_TEMP="__REMOTE_TEMP__"
+KEY_TARGET_PUB="$USER_SSH_DIR/id_ed25519_%%USERNAME%%.pub"
+REMOTE_TEMP="%%REMOTE_TEMP%%"
 
 mkdir -p "$HOME_DIR" && chmod 755 "$HOME_DIR"
 mkdir -p "$USER_SSH_DIR" && chmod 700 "$USER_SSH_DIR"
@@ -1743,8 +228,8 @@ chmod 644 "$KEY_TARGET_PUB"
 
 NEW_KEY=$(cat "$KEY_TARGET_PUB")
 
-# Remove any previous keys for this IMPACT user (comment marker: IMPACT___USERNAME__)
-sed -i '/IMPACT___USERNAME__/d' "$AUTH_KEYS" 2>/dev/null || true
+# Remove any previous keys for this IMPACT user (comment marker: IMPACT_%%USERNAME%%)
+sed -i '/IMPACT_%%USERNAME%%/d' "$AUTH_KEYS" 2>/dev/null || true
 
 if ! grep -qxF "$NEW_KEY" "$AUTH_KEYS"; then
     echo "$NEW_KEY" >> "$AUTH_KEYS"
@@ -1760,10 +245,14 @@ chmod 644 "$KEY_TARGET_PUB"
 chown ${ACTUAL_USER}:${ACTUAL_USER} "$HOME_DIR"
 chown -R ${ACTUAL_USER}:${ACTUAL_USER} "$USER_SSH_DIR"
 
+# Clean up stale pub files left by previous bug (extra underscore before .pub)
+STALE_PUB="$USER_SSH_DIR/id_ed25519_%%USERNAME%%_.pub"
+[ -f "$STALE_PUB" ] && rm -f "$STALE_PUB"
+
 rm -f "$REMOTE_TEMP"
 echo SSH_KEY_COPIED
 '@
-                                $remoteInstallScript = $remoteInstallScript.Replace('__USERNAME__', $State.UserName).Replace('__REMOTE_TEMP__', $remoteTemp)
+                                $remoteInstallScript = $remoteInstallScript.Replace('%%USERNAME%%', $State.UserName).Replace('%%REMOTE_TEMP%%', $remoteTemp)
                                 $remoteInstallScript = $remoteInstallScript -replace "`r`n","`n" -replace "`r","`n"
                 $cmdResult = Invoke-SSHCommand -SessionId $sshSession.SessionId -Command $remoteInstallScript -TimeOut 60 -ErrorAction Stop
                 Write-Log "Posh-SSH install exit=$($cmdResult.ExitStatus); output length=$($cmdResult.Output.Length)" 'Debug'
@@ -1815,7 +304,7 @@ echo SSH_KEY_COPIED
     if (Test-Path $sshKeyPath) {
         $pkContent = Get-Content $sshKeyPath -Raw
         $pkB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($pkContent))
-        $copyPrivateCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && rm -f ~/.ssh/id_ed25519_$($State.UserName) && echo '$pkB64' | base64 -d > ~/.ssh/id_ed25519_$($State.UserName) && chmod 600 ~/.ssh/id_ed25519_$($State.UserName) && chown ${remoteUser}:${remoteUser} ~/.ssh/id_ed25519_$($State.UserName) && echo PRIVATE_KEY_COPIED"
+        $copyPrivateCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && rm -f ~/.ssh/id_ed25519_$($State.UserName) && echo '$pkB64' | base64 -d | tr -d '\r' > ~/.ssh/id_ed25519_$($State.UserName) && chmod 600 ~/.ssh/id_ed25519_$($State.UserName) && chown ${remoteUser}:${remoteUser} ~/.ssh/id_ed25519_$($State.UserName) && echo PRIVATE_KEY_COPIED"
         $pkOut = & ssh @sshArgs $copyPrivateCmd 2>&1
         if ($pkOut -notmatch 'PRIVATE_KEY_COPIED') { Write-Log "Remote private key copy may have failed: $pkOut" 'Warn' }
     } else {
@@ -1826,7 +315,7 @@ echo SSH_KEY_COPIED
     if (Test-Path $knownHostsPath) {
         $khContent = Get-Content $knownHostsPath -Raw
         $khB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($khContent))
-        $copyKhCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && rm -f ~/.ssh/known_hosts && echo '$khB64' | base64 -d > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts && chown ${remoteUser}:${remoteUser} ~/.ssh/known_hosts && echo KNOWN_HOSTS_COPIED"
+        $copyKhCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && rm -f ~/.ssh/known_hosts && echo '$khB64' | base64 -d | tr -d '\r' > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts && chown ${remoteUser}:${remoteUser} ~/.ssh/known_hosts && echo KNOWN_HOSTS_COPIED"
         $khOut = & ssh @sshArgs $copyKhCmd 2>&1
         if ($khOut -notmatch 'KNOWN_HOSTS_COPIED') { Write-Log "Remote known_hosts copy may have failed: $khOut" 'Warn' }
     } else {
@@ -1876,8 +365,9 @@ echo SSH_KEY_COPIED
         SelectionMode = 'One'
         BorderStyle = 'FixedSingle'
     }
-    $listBox.BackColor = $script:ThemePalette.Panel
-    $listBox.ForeColor = $script:ThemePalette.Text
+    $palette = Get-ThemePalette
+    $listBox.BackColor = $palette.Panel
+    $listBox.ForeColor = $palette.Text
     $listBox.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Regular)
     $listBox.Items.AddRange($repoList)
     $formRepo.Controls.Add($listBox)
@@ -2431,8 +921,9 @@ function Show-ContainerManager {
     Style-TextBox -TextBox $txtParams
     $form.Controls.Add($lblParams); $form.Controls.Add($txtParams)
 
+    $defaultYaml = if ($isLocal) { '.\inputs\sim_design_local.yaml' } else { '.\inputs\sim_design.yaml' }
     $lblYaml = New-Object System.Windows.Forms.Label -Property @{ Text='sim_design.yaml'; Location=New-Object System.Drawing.Point(20,336); Size=New-Object System.Drawing.Size(130,22) }
-    $txtYaml = New-Object System.Windows.Forms.TextBox -Property @{ Location=New-Object System.Drawing.Point(152,334); Size=New-Object System.Drawing.Size(352,24); Text='.\inputs\sim_design.yaml' }
+    $txtYaml = New-Object System.Windows.Forms.TextBox -Property @{ Location=New-Object System.Drawing.Point(152,334); Size=New-Object System.Drawing.Size(352,24); Text=$defaultYaml }
     Style-Label -Label $lblYaml
     Style-TextBox -TextBox $txtYaml
     $form.Controls.Add($lblYaml); $form.Controls.Add($txtYaml)
@@ -2677,16 +1168,41 @@ function Show-ContainerManager {
 
         $repoMountSource = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $projectRoot } else { $projectRoot }
 
-        # Use a writable path for the SSH key inside the container so permissions can be fixed for the rstudio user (uid 1000)
+        # Resolve the actual uid/gid of the host user so the container's rstudio
+        # user matches.  This prevents the container from changing ownership of
+        # bind-mounted files (especially .git) to a different uid.  The Rocker
+        # image remaps rstudio to the USERID/GROUPID we pass.  On Windows/local
+        # Docker Desktop, 1000:1000 is fine (Linux VM layer).  On a remote Linux
+        # workstation we query the real ids of the SSH user.
+        $containerUid = '1000'
+        $containerGid = '1000'
+        if ($State.ContainerLocation -like 'REMOTE@*') {
+            try {
+                $remoteHost = Get-RemoteHostString -State $State
+                $sshKey = $State.Paths.SshPrivate
+                $idSshArgs = @('-i', $sshKey, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', $remoteHost)
+                $uidOut = (& ssh @idSshArgs 'id -u' 2>$null)
+                $gidOut = (& ssh @idSshArgs 'id -g' 2>$null)
+                if ($LASTEXITCODE -eq 0 -and $uidOut -match '^\d+$') {
+                    $containerUid = $uidOut.Trim()
+                    $containerGid = $gidOut.Trim()
+                    Write-Log "Remote host user uid=$containerUid gid=$containerGid" 'Info'
+                }
+            } catch {
+                Write-Log "Could not detect remote uid/gid, defaulting to 1000:1000: $($_.Exception.Message)" 'Warn'
+            }
+        }
+
+        # Use a writable path for the SSH key inside the container so permissions can be fixed for the rstudio user
         $containerKeyPath = "/home/rstudio/.ssh/id_ed25519_$($State.UserName)"
         $dockerArgs = @('run','-d','--rm','--name',$State.ContainerName,
             '-e',"PASSWORD=$($State.Password)",
             '-e','DISABLE_AUTH=false',
-            '-e','USERID=1000','-e','GROUPID=1000',
+            '-e',"USERID=$containerUid",'-e',"GROUPID=$containerGid",
+            '-e',"CONTAINER_REPO_NAME=$($State.SelectedRepo)",
+            '-e','SYNC_ENABLED=false',
             '-e',"GIT_SSH_COMMAND=ssh -i $containerKeyPath -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/ssh/ssh_known_hosts -o StrictHostKeyChecking=yes",
-            '--mount',"type=bind,source=$repoMountSource,target=/host-repo",
             '--mount',"type=bind,source=$repoMountSource,target=/home/rstudio/$($State.SelectedRepo)",
-            '-e','REPO_SYNC_PATH=/host-repo','-e','SYNC_ENABLED=true',
             '-p',($(if($portOverride){$portOverride}else{'8787'}) + ':8787')
         )
 
@@ -2730,16 +1246,16 @@ function Show-ContainerManager {
             & docker @ctxPrefix @('volume','create',$volSyn) | Out-Null
 
             # Fix ownership
-            Write-Log 'Setting volume ownership (chown 1000:1000).' 'Debug'
-            & docker @ctxPrefix @('run','--rm','-v',"${volOut}:/volume",'alpine','sh','-c',"chown 1000:1000 /volume") 2>$null
-            & docker @ctxPrefix @('run','--rm','-v',"${volSyn}:/volume",'alpine','sh','-c',"chown 1000:1000 /volume") 2>$null
+            Write-Log "Setting volume ownership (chown ${containerUid}:${containerGid})." 'Debug'
+            & docker @ctxPrefix @('run','--rm','-v',"${volOut}:/volume",'alpine','sh','-c',"chown ${containerUid}:${containerGid} /volume") 2>$null
+            & docker @ctxPrefix @('run','--rm','-v',"${volSyn}:/volume",'alpine','sh','-c',"chown ${containerUid}:${containerGid} /volume") 2>$null
 
             # Pre-populate volumes from host dirs
             Write-Log 'Pre-populating volumes from host directories.' 'Debug'
             $dockerOutputSource = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $outputDir } else { $outputDir }
             $dockerSynthSource  = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $synthDir } else { $synthDir }
-            & docker @ctxPrefix @('run','--rm','--user','1000:1000','-v',"${dockerOutputSource}:/source",'-v',"${volOut}:/volume",'alpine','sh','-c','cp -r /source/. /volume/ 2>/dev/null || cp -a /source/. /volume/ 2>/dev/null || true') 2>$null
-            & docker @ctxPrefix @('run','--rm','--user','1000:1000','-v',"${dockerSynthSource}:/source",'-v',"${volSyn}:/volume",'alpine','sh','-c','cp -r /source/. /volume/ 2>/dev/null || cp -a /source/. /volume/ 2>/dev/null || true') 2>$null
+            & docker @ctxPrefix @('run','--rm','--user',"${containerUid}:${containerGid}",'-v',"${dockerOutputSource}:/source",'-v',"${volOut}:/volume",'alpine','sh','-c','cp -r /source/. /volume/ 2>/dev/null || cp -a /source/. /volume/ 2>/dev/null || true') 2>$null
+            & docker @ctxPrefix @('run','--rm','--user',"${containerUid}:${containerGid}",'-v',"${dockerSynthSource}:/source",'-v',"${volSyn}:/volume",'alpine','sh','-c','cp -r /source/. /volume/ 2>/dev/null || cp -a /source/. /volume/ 2>/dev/null || true') 2>$null
 
             $dockerArgs += @('-v',"$($volOut):/home/rstudio/$($State.SelectedRepo)/outputs",
                              '-v',"$($volSyn):/home/rstudio/$($State.SelectedRepo)/inputs/synthpop")
@@ -2771,8 +1287,8 @@ function Show-ContainerManager {
 
         # Copy the SSH key from the readonly bind mount to a writable location with correct ownership.
         # The bind mount preserves host-side ownership (e.g. php-workstation), but inside the container
-        # the rstudio user (uid 1000) needs to own the private key for SSH to accept it.
-        $fixKeyCmd = "mkdir -p /home/rstudio/.ssh && cp /keys/id_ed25519_$($State.UserName) $containerKeyPath && chmod 600 $containerKeyPath && chown 1000:1000 $containerKeyPath && cp /etc/ssh/ssh_known_hosts /home/rstudio/.ssh/known_hosts 2>/dev/null; chmod 644 /home/rstudio/.ssh/known_hosts 2>/dev/null; chown 1000:1000 /home/rstudio/.ssh/known_hosts 2>/dev/null; echo KEY_FIXED"
+        # the rstudio user needs to own the private key for SSH to accept it.
+        $fixKeyCmd = "mkdir -p /home/rstudio/.ssh && cp /keys/id_ed25519_$($State.UserName) $containerKeyPath && chmod 600 $containerKeyPath && chown ${containerUid}:${containerGid} $containerKeyPath && cp /etc/ssh/ssh_known_hosts /home/rstudio/.ssh/known_hosts 2>/dev/null; chmod 644 /home/rstudio/.ssh/known_hosts 2>/dev/null; chown ${containerUid}:${containerGid} /home/rstudio/.ssh/known_hosts 2>/dev/null; echo KEY_FIXED"
         $fixCtx = (Get-DockerContextArgs -State $State) + @('exec', $State.ContainerName, 'sh', '-c', $fixKeyCmd)
         try {
             $fixOut = & docker $fixCtx 2>&1
@@ -2783,6 +1299,24 @@ function Show-ContainerManager {
             }
         } catch {
             Write-Log "SSH key permission fix failed: $($_.Exception.Message)" 'Warn'
+        }
+
+        # Configure git inside the container for the rstudio user.
+        # The Docker image's system gitconfig ships pull.ff=only which aborts when
+        # fast-forward isn't possible. We override at global level so git pull
+        # works like GitKraken / vanilla-git (merge when not fast-forwardable).
+        # safe.directory='*' is a safety net for any remaining ownership edge cases.
+        $gitCfgCmd = "git config --global pull.ff true && git config --global pull.rebase false && git config --global --add safe.directory '*' && echo GIT_CONFIGURED"
+        $gitCfgCtx = (Get-DockerContextArgs -State $State) + @('exec', '--user', 'rstudio', $State.ContainerName, 'sh', '-c', $gitCfgCmd)
+        try {
+            $gitCfgOut = & docker $gitCfgCtx 2>&1
+            if ($gitCfgOut -match 'GIT_CONFIGURED') {
+                Write-Log 'Git pull strategy (merge) configured inside container.' 'Info'
+            } else {
+                Write-Log "Git config inside container may have failed: $gitCfgOut" 'Warn'
+            }
+        } catch {
+            Write-Log "Git config inside container failed: $($_.Exception.Message)" 'Warn'
         }
 
         if ($State.ContainerLocation -like 'REMOTE@*') {
