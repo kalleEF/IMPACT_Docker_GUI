@@ -5,3 +5,7 @@ IMPACT.exe
 
 # Environment variables
 .env
+
+# VSCode settings
+.vscode/*
+.vscode/settings.json
