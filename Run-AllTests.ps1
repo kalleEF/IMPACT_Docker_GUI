@@ -222,12 +222,23 @@ foreach ($name in $suitesToRun) {
         if ($ctxList -notcontains $localCtx) { $localCtx = 'default' }
         $env:DOCKER_CONTEXT = $localCtx
 
-        # Ensure SSH key exists
+        # Ensure SSH key exists (regenerate if missing or invalid/encrypted)
         $sshDir  = Join-Path $env:TEMP 'impact_test_ssh'
         New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
         $wsKeyPath = Join-Path $sshDir 'id_ws_test'
-        if (-not (Test-Path $wsKeyPath)) {
-            ssh-keygen -t ed25519 -f $wsKeyPath -N '""' -q 2>$null
+        $keyOk = $false
+        if (Test-Path $wsKeyPath) {
+            # Use ssh-keygen -y to confirm the private key is usable (not encrypted/corrupt)
+            $pubOut = & ssh-keygen -y -f $wsKeyPath 2>$null
+            if ($LASTEXITCODE -eq 0 -and $pubOut) { $keyOk = $true } else { $keyOk = $false }
+        }
+        if (-not $keyOk) {
+            Remove-Item -Force "$wsKeyPath" , "$($wsKeyPath).pub" -ErrorAction SilentlyContinue
+            ssh-keygen -t ed25519 -f $wsKeyPath -N "" -q 2>$null
+
+            # double-check generated key is usable
+            $pubOut = & ssh-keygen -y -f $wsKeyPath 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not $pubOut) { throw "Failed to generate usable SSH key at $wsKeyPath" }
         }
 
         $wsContainerRunning = docker ps --filter "name=workstation-test" --format "{{.Names}}" 2>$null

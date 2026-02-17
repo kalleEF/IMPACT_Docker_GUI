@@ -103,6 +103,15 @@ Describe 'Write-RemoteContainerMetadata via SSH' -Tag 'DockerSsh' {
     }
 
     AfterAll {
+        # Save artifacts for DockerSsh tests
+        try {
+            $localPaths = @()
+            $localPaths += $script:metaDir
+            Save-TestArtifacts -Suite 'docker-ssh' -Paths $localPaths -ExtraFiles @('./tests/TestResults-DockerSsh.xml') -ContainerNames @()
+        } catch {
+            Write-Warning "Failed to save docker-ssh artifacts: $($_.Exception.Message)"
+        }
+
         if (-not $script:SkipSshTests) {
             Invoke-SshCommand "rm -rf $($script:metaDir)" | Out-Null
         }
