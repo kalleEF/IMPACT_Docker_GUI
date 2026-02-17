@@ -81,7 +81,10 @@ BeforeAll {
             $Command
         )
         $result = & ssh @sshArgs 2>&1
-        return $result
+        # Filter known host-addition warnings (they appear on first connect and
+        # pollute stdout/stderr, causing the tests' regex matches to fail).
+        $filtered = $result | Where-Object { $_ -notmatch 'Permanently added .* to the list of known hosts' }
+        return $filtered
     }
 }
 
@@ -167,6 +170,17 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
                 Write-Host "[RemoteE2E] Trying prerequisite build ..." -ForegroundColor Yellow
                 $prereqCmd = "cd $($script:REMOTE_REPO_DIR)/docker_setup && docker build -f Dockerfile.prerequisite.IMPACTncdGER -t $($script:INNER_IMAGE)-prerequisite --progress=plain . 2>&1"
                 Invoke-WsSshCommand $prereqCmd | Out-Null
+
+                # Tag the locally-built prerequisite image using the name referenced by
+                # Dockerfile.IMPACTncdGER so the subsequent main build finds it locally
+                $prereqLocalTag = "$($script:INNER_IMAGE)-prerequisite"
+                $expectedPrereqName = 'kalleef/prerequisite.impactncdger:latest'
+                try {
+                    Invoke-WsSshCommand "docker tag $prereqLocalTag $expectedPrereqName" | Out-Null
+                } catch {
+                    Write-Host "[RemoteE2E] Warning: failed to tag local prerequisite image: $($_ -join ' ')" -ForegroundColor Yellow
+                }
+
                 Invoke-WsSshCommand $buildCmd | Out-Null
                 $imgCheck2 = Invoke-WsSshCommand "docker image inspect $($script:INNER_IMAGE) --format '{{.Id}}' 2>/dev/null"
                 if (-not $imgCheck2) {
