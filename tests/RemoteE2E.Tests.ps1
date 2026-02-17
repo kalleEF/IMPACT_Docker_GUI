@@ -164,13 +164,15 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
         Invoke-WsSshCommand "docker stop $($script:INNER_CONTAINER) 2>/dev/null; docker rm $($script:INNER_CONTAINER) 2>/dev/null" | Out-Null
 
         $containerKeyTarget = "/home/rstudio/.ssh/id_ed25519_e2e"
+
         $runCmd = @(
             "docker run -d --name $($script:INNER_CONTAINER)",
             "-e PASSWORD=$($script:TEST_PASSWORD)",
             "-e DISABLE_AUTH=false",
             "-e USERID=1000 -e GROUPID=1000",
+            "-e CONTAINER_REPO_NAME=$($script:REPO_NAME)",
+            "-e SYNC_ENABLED=false",
             "-e `"GIT_SSH_COMMAND=ssh -i $containerKeyTarget -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/ssh/ssh_known_hosts -o StrictHostKeyChecking=yes`"",
-            "-v $($script:REMOTE_REPO_DIR):/host-repo",
             "-v $($script:REMOTE_REPO_DIR):/home/rstudio/$($script:REPO_NAME)",
             "-p $($script:INNER_PORT):8787",
             "-v $($script:REMOTE_REPO_DIR)/outputs:/home/rstudio/$($script:REPO_NAME)/outputs",

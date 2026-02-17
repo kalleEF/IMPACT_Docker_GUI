@@ -102,8 +102,14 @@ echo "{2}" > "$KEY_TARGET_PUB"
 chown {0}:{0} "$KEY_TARGET_PUB"
 chmod 644 "$KEY_TARGET_PUB"
 
+# Clean up stale pub files left by previous bug (extra underscore before .pub)
+STALE_PUB="$USER_SSH_DIR/id_ed25519_{1}_.pub"
+[ -f "$STALE_PUB" ] && rm -f "$STALE_PUB"
+
 # Remove any previous keys for this IMPACT user (comment marker: IMPACT_{1})
 sed -i '/IMPACT_{1}/d' "$AUTH_KEYS" 2>/dev/null || true
+# Also remove stale markers with trailing underscore from old bug
+sed -i '/IMPACT_{1}_/d' "$AUTH_KEYS" 2>/dev/null || true
 
 if ! grep -qxF "{2}" "$AUTH_KEYS"; then
     echo "{2}" >> "$AUTH_KEYS"
@@ -204,8 +210,8 @@ ACTUAL_USER="$(whoami)"
 HOME_DIR="$(eval echo ~${ACTUAL_USER})"
 USER_SSH_DIR="$HOME_DIR/.ssh"
 AUTH_KEYS="$USER_SSH_DIR/authorized_keys"
-KEY_TARGET_PUB="$USER_SSH_DIR/id_ed25519___USERNAME___.pub"
-REMOTE_TEMP="__REMOTE_TEMP__"
+KEY_TARGET_PUB="$USER_SSH_DIR/id_ed25519_%%USERNAME%%.pub"
+REMOTE_TEMP="%%REMOTE_TEMP%%"
 
 mkdir -p "$HOME_DIR" && chmod 755 "$HOME_DIR"
 mkdir -p "$USER_SSH_DIR" && chmod 700 "$USER_SSH_DIR"
@@ -222,8 +228,8 @@ chmod 644 "$KEY_TARGET_PUB"
 
 NEW_KEY=$(cat "$KEY_TARGET_PUB")
 
-# Remove any previous keys for this IMPACT user (comment marker: IMPACT___USERNAME__)
-sed -i '/IMPACT___USERNAME__/d' "$AUTH_KEYS" 2>/dev/null || true
+# Remove any previous keys for this IMPACT user (comment marker: IMPACT_%%USERNAME%%)
+sed -i '/IMPACT_%%USERNAME%%/d' "$AUTH_KEYS" 2>/dev/null || true
 
 if ! grep -qxF "$NEW_KEY" "$AUTH_KEYS"; then
     echo "$NEW_KEY" >> "$AUTH_KEYS"
@@ -239,10 +245,14 @@ chmod 644 "$KEY_TARGET_PUB"
 chown ${ACTUAL_USER}:${ACTUAL_USER} "$HOME_DIR"
 chown -R ${ACTUAL_USER}:${ACTUAL_USER} "$USER_SSH_DIR"
 
+# Clean up stale pub files left by previous bug (extra underscore before .pub)
+STALE_PUB="$USER_SSH_DIR/id_ed25519_%%USERNAME%%_.pub"
+[ -f "$STALE_PUB" ] && rm -f "$STALE_PUB"
+
 rm -f "$REMOTE_TEMP"
 echo SSH_KEY_COPIED
 '@
-                                $remoteInstallScript = $remoteInstallScript.Replace('__USERNAME__', $State.UserName).Replace('__REMOTE_TEMP__', $remoteTemp)
+                                $remoteInstallScript = $remoteInstallScript.Replace('%%USERNAME%%', $State.UserName).Replace('%%REMOTE_TEMP%%', $remoteTemp)
                                 $remoteInstallScript = $remoteInstallScript -replace "`r`n","`n" -replace "`r","`n"
                 $cmdResult = Invoke-SSHCommand -SessionId $sshSession.SessionId -Command $remoteInstallScript -TimeOut 60 -ErrorAction Stop
                 Write-Log "Posh-SSH install exit=$($cmdResult.ExitStatus); output length=$($cmdResult.Output.Length)" 'Debug'
@@ -294,7 +304,7 @@ echo SSH_KEY_COPIED
     if (Test-Path $sshKeyPath) {
         $pkContent = Get-Content $sshKeyPath -Raw
         $pkB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($pkContent))
-        $copyPrivateCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && rm -f ~/.ssh/id_ed25519_$($State.UserName) && echo '$pkB64' | base64 -d > ~/.ssh/id_ed25519_$($State.UserName) && chmod 600 ~/.ssh/id_ed25519_$($State.UserName) && chown ${remoteUser}:${remoteUser} ~/.ssh/id_ed25519_$($State.UserName) && echo PRIVATE_KEY_COPIED"
+        $copyPrivateCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && rm -f ~/.ssh/id_ed25519_$($State.UserName) && echo '$pkB64' | base64 -d | tr -d '\r' > ~/.ssh/id_ed25519_$($State.UserName) && chmod 600 ~/.ssh/id_ed25519_$($State.UserName) && chown ${remoteUser}:${remoteUser} ~/.ssh/id_ed25519_$($State.UserName) && echo PRIVATE_KEY_COPIED"
         $pkOut = & ssh @sshArgs $copyPrivateCmd 2>&1
         if ($pkOut -notmatch 'PRIVATE_KEY_COPIED') { Write-Log "Remote private key copy may have failed: $pkOut" 'Warn' }
     } else {
@@ -305,7 +315,7 @@ echo SSH_KEY_COPIED
     if (Test-Path $knownHostsPath) {
         $khContent = Get-Content $knownHostsPath -Raw
         $khB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($khContent))
-        $copyKhCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && rm -f ~/.ssh/known_hosts && echo '$khB64' | base64 -d > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts && chown ${remoteUser}:${remoteUser} ~/.ssh/known_hosts && echo KNOWN_HOSTS_COPIED"
+        $copyKhCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && rm -f ~/.ssh/known_hosts && echo '$khB64' | base64 -d | tr -d '\r' > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts && chown ${remoteUser}:${remoteUser} ~/.ssh/known_hosts && echo KNOWN_HOSTS_COPIED"
         $khOut = & ssh @sshArgs $copyKhCmd 2>&1
         if ($khOut -notmatch 'KNOWN_HOSTS_COPIED') { Write-Log "Remote known_hosts copy may have failed: $khOut" 'Warn' }
     } else {
@@ -1158,16 +1168,41 @@ function Show-ContainerManager {
 
         $repoMountSource = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $projectRoot } else { $projectRoot }
 
-        # Use a writable path for the SSH key inside the container so permissions can be fixed for the rstudio user (uid 1000)
+        # Resolve the actual uid/gid of the host user so the container's rstudio
+        # user matches.  This prevents the container from changing ownership of
+        # bind-mounted files (especially .git) to a different uid.  The Rocker
+        # image remaps rstudio to the USERID/GROUPID we pass.  On Windows/local
+        # Docker Desktop, 1000:1000 is fine (Linux VM layer).  On a remote Linux
+        # workstation we query the real ids of the SSH user.
+        $containerUid = '1000'
+        $containerGid = '1000'
+        if ($State.ContainerLocation -like 'REMOTE@*') {
+            try {
+                $remoteHost = Get-RemoteHostString -State $State
+                $sshKey = $State.Paths.SshPrivate
+                $idSshArgs = @('-i', $sshKey, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', $remoteHost)
+                $uidOut = (& ssh @idSshArgs 'id -u' 2>$null)
+                $gidOut = (& ssh @idSshArgs 'id -g' 2>$null)
+                if ($LASTEXITCODE -eq 0 -and $uidOut -match '^\d+$') {
+                    $containerUid = $uidOut.Trim()
+                    $containerGid = $gidOut.Trim()
+                    Write-Log "Remote host user uid=$containerUid gid=$containerGid" 'Info'
+                }
+            } catch {
+                Write-Log "Could not detect remote uid/gid, defaulting to 1000:1000: $($_.Exception.Message)" 'Warn'
+            }
+        }
+
+        # Use a writable path for the SSH key inside the container so permissions can be fixed for the rstudio user
         $containerKeyPath = "/home/rstudio/.ssh/id_ed25519_$($State.UserName)"
         $dockerArgs = @('run','-d','--rm','--name',$State.ContainerName,
             '-e',"PASSWORD=$($State.Password)",
             '-e','DISABLE_AUTH=false',
-            '-e','USERID=1000','-e','GROUPID=1000',
+            '-e',"USERID=$containerUid",'-e',"GROUPID=$containerGid",
+            '-e',"CONTAINER_REPO_NAME=$($State.SelectedRepo)",
+            '-e','SYNC_ENABLED=false',
             '-e',"GIT_SSH_COMMAND=ssh -i $containerKeyPath -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/ssh/ssh_known_hosts -o StrictHostKeyChecking=yes",
-            '--mount',"type=bind,source=$repoMountSource,target=/host-repo",
             '--mount',"type=bind,source=$repoMountSource,target=/home/rstudio/$($State.SelectedRepo)",
-            '-e','REPO_SYNC_PATH=/host-repo','-e','SYNC_ENABLED=true',
             '-p',($(if($portOverride){$portOverride}else{'8787'}) + ':8787')
         )
 
@@ -1211,16 +1246,16 @@ function Show-ContainerManager {
             & docker @ctxPrefix @('volume','create',$volSyn) | Out-Null
 
             # Fix ownership
-            Write-Log 'Setting volume ownership (chown 1000:1000).' 'Debug'
-            & docker @ctxPrefix @('run','--rm','-v',"${volOut}:/volume",'alpine','sh','-c',"chown 1000:1000 /volume") 2>$null
-            & docker @ctxPrefix @('run','--rm','-v',"${volSyn}:/volume",'alpine','sh','-c',"chown 1000:1000 /volume") 2>$null
+            Write-Log "Setting volume ownership (chown ${containerUid}:${containerGid})." 'Debug'
+            & docker @ctxPrefix @('run','--rm','-v',"${volOut}:/volume",'alpine','sh','-c',"chown ${containerUid}:${containerGid} /volume") 2>$null
+            & docker @ctxPrefix @('run','--rm','-v',"${volSyn}:/volume",'alpine','sh','-c',"chown ${containerUid}:${containerGid} /volume") 2>$null
 
             # Pre-populate volumes from host dirs
             Write-Log 'Pre-populating volumes from host directories.' 'Debug'
             $dockerOutputSource = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $outputDir } else { $outputDir }
             $dockerSynthSource  = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $synthDir } else { $synthDir }
-            & docker @ctxPrefix @('run','--rm','--user','1000:1000','-v',"${dockerOutputSource}:/source",'-v',"${volOut}:/volume",'alpine','sh','-c','cp -r /source/. /volume/ 2>/dev/null || cp -a /source/. /volume/ 2>/dev/null || true') 2>$null
-            & docker @ctxPrefix @('run','--rm','--user','1000:1000','-v',"${dockerSynthSource}:/source",'-v',"${volSyn}:/volume",'alpine','sh','-c','cp -r /source/. /volume/ 2>/dev/null || cp -a /source/. /volume/ 2>/dev/null || true') 2>$null
+            & docker @ctxPrefix @('run','--rm','--user',"${containerUid}:${containerGid}",'-v',"${dockerOutputSource}:/source",'-v',"${volOut}:/volume",'alpine','sh','-c','cp -r /source/. /volume/ 2>/dev/null || cp -a /source/. /volume/ 2>/dev/null || true') 2>$null
+            & docker @ctxPrefix @('run','--rm','--user',"${containerUid}:${containerGid}",'-v',"${dockerSynthSource}:/source",'-v',"${volSyn}:/volume",'alpine','sh','-c','cp -r /source/. /volume/ 2>/dev/null || cp -a /source/. /volume/ 2>/dev/null || true') 2>$null
 
             $dockerArgs += @('-v',"$($volOut):/home/rstudio/$($State.SelectedRepo)/outputs",
                              '-v',"$($volSyn):/home/rstudio/$($State.SelectedRepo)/inputs/synthpop")
@@ -1252,8 +1287,8 @@ function Show-ContainerManager {
 
         # Copy the SSH key from the readonly bind mount to a writable location with correct ownership.
         # The bind mount preserves host-side ownership (e.g. php-workstation), but inside the container
-        # the rstudio user (uid 1000) needs to own the private key for SSH to accept it.
-        $fixKeyCmd = "mkdir -p /home/rstudio/.ssh && cp /keys/id_ed25519_$($State.UserName) $containerKeyPath && chmod 600 $containerKeyPath && chown 1000:1000 $containerKeyPath && cp /etc/ssh/ssh_known_hosts /home/rstudio/.ssh/known_hosts 2>/dev/null; chmod 644 /home/rstudio/.ssh/known_hosts 2>/dev/null; chown 1000:1000 /home/rstudio/.ssh/known_hosts 2>/dev/null; echo KEY_FIXED"
+        # the rstudio user needs to own the private key for SSH to accept it.
+        $fixKeyCmd = "mkdir -p /home/rstudio/.ssh && cp /keys/id_ed25519_$($State.UserName) $containerKeyPath && chmod 600 $containerKeyPath && chown ${containerUid}:${containerGid} $containerKeyPath && cp /etc/ssh/ssh_known_hosts /home/rstudio/.ssh/known_hosts 2>/dev/null; chmod 644 /home/rstudio/.ssh/known_hosts 2>/dev/null; chown ${containerUid}:${containerGid} /home/rstudio/.ssh/known_hosts 2>/dev/null; echo KEY_FIXED"
         $fixCtx = (Get-DockerContextArgs -State $State) + @('exec', $State.ContainerName, 'sh', '-c', $fixKeyCmd)
         try {
             $fixOut = & docker $fixCtx 2>&1
@@ -1267,11 +1302,11 @@ function Show-ContainerManager {
         }
 
         # Configure git inside the container for the rstudio user.
-        # - pull.rebase=false  → use merge strategy (same as GitKraken default), avoids
-        #   the "divergent branches" error on git pull with newer git (2.27+).
-        # - safe.directory='*' → allows rstudio to operate on bind-mounted repos
-        #   even if the directory ownership doesn't match.
-        $gitCfgCmd = "git config --global pull.rebase false && git config --global --add safe.directory '*' && echo GIT_CONFIGURED"
+        # The Docker image's system gitconfig ships pull.ff=only which aborts when
+        # fast-forward isn't possible. We override at global level so git pull
+        # works like GitKraken / vanilla-git (merge when not fast-forwardable).
+        # safe.directory='*' is a safety net for any remaining ownership edge cases.
+        $gitCfgCmd = "git config --global pull.ff true && git config --global pull.rebase false && git config --global --add safe.directory '*' && echo GIT_CONFIGURED"
         $gitCfgCtx = (Get-DockerContextArgs -State $State) + @('exec', '--user', 'rstudio', $State.ContainerName, 'sh', '-c', $gitCfgCmd)
         try {
             $gitCfgOut = & docker $gitCfgCtx 2>&1
