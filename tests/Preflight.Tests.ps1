@@ -31,6 +31,19 @@ Describe 'Preflight: environment checks' -Tag Preflight {
         (Get-Command ssh-keygen -ErrorAction SilentlyContinue) | Should -Not -BeNullOrEmpty -Because 'ssh-keygen required for test key generation'
     }
 
+    It 'Existing test SSH private keys (if present) are usable (not passphrase-protected)' {
+        $sshDir = Join-Path (if ($env:TEMP) { $env:TEMP } elseif ($env:TMPDIR) { $env:TMPDIR } else { '/tmp' }) 'impact_test_ssh'
+        if (-not (Test-Path $sshDir)) { Skip 'No test SSH keys present' }
+
+        $candidates = @('id_test','id_ws_test') | ForEach-Object { Join-Path $sshDir $_ } | Where-Object { Test-Path $_ }
+        if (-not $candidates) { Skip 'No test SSH private keys present' }
+
+        foreach ($k in $candidates) {
+            $pubOut = & ssh-keygen -y -f $k 2>$null
+            $LASTEXITCODE | Should -Be 0 -Because "Private key $k is unusable or passphrase-protected"
+        }
+    }
+
     It 'Temporary filesystem is writable' {
         $tmpBase = if ($env:TEMP) { $env:TEMP } elseif ($env:TMPDIR) { $env:TMPDIR } else { '/tmp' }
         $testDir = Join-Path $tmpBase "preflight_test_$([guid]::NewGuid().ToString('N').Substring(0,6))"

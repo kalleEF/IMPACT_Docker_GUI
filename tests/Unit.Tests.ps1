@@ -731,4 +731,26 @@ Describe 'New-TestSessionState (helper)' -Tag Unit {
         $state = New-TestSessionState
         $state.Paths.SshPrivate | Should -Match 'impact_test_ssh'
     }
+
+    It 'New-DummySshKeyPair creates a usable (unencrypted) ed25519 keypair' {
+        $kp = New-DummySshKeyPair -Label 'unit'
+        Test-Path $kp.Private | Should -BeTrue
+        Test-Path $kp.Public  | Should -BeTrue
+
+        $pubOut = & ssh-keygen -y -f $kp.Private 2>$null
+        $LASTEXITCODE | Should -Be 0 -Because 'New-DummySshKeyPair must create an unencrypted usable key'
+        $pubOut | Should -Not -BeNullOrEmpty
+
+        Remove-Item -Recurse -Force $kp.Dir -ErrorAction SilentlyContinue
+    }
+}
+
+# Save Unit test artifacts (TestResults XML)
+AfterAll {
+    try {
+        if (-not (Get-Command -Name Save-TestArtifacts -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'Helpers' 'TestSessionState.ps1') }
+        Save-TestArtifacts -Suite 'unit' -ExtraFiles @('./tests/TestResults-Unit.xml')
+    } catch {
+        Write-Warning "Failed to save unit test artifacts: $($_.Exception.Message)"
+    }
 }
