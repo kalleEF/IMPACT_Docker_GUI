@@ -9,3 +9,7 @@ IMPACT.exe
 # VSCode settings
 .vscode/*
 .vscode/settings.json
+
+# Local test artifacts (do NOT commit)
+/tests/artifacts/
+tests/artifacts/
