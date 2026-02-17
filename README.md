@@ -30,14 +30,32 @@ A Windows GUI tool for building, launching, and managing **IMPACT NCD Germany** 
 
 | Directory | Contents |
 |---|---|
-| `current_major_version/` | Active release — main script (`IMPACT_Docker_GUI_v2.ps1`), compile scripts (`Compile-IMPACT-v2.ps1`, `.bat`), quick-compile batch, and application icon |
-| `documentation/` | User Guide and Technical Documentation (Markdown) |
-| `_old/` | Previous version (v1) of the tool, legacy compile scripts, flow diagrams, and helper utilities — kept for reference |
+| `current_version/` | Active release — module (`IMPACT_Docker_GUI.psm1`), launcher script (`IMPACT_Docker_GUI_v2.ps1`), compile scripts, and application icon |
+| `tests/` | Pester 5 test suites (Unit, Integration, DockerSsh), test helpers, SSHD container Dockerfile |
+| `documentation/` | User Guide, Technical Documentation, and Testing Guide |
+| `.github/workflows/` | GitHub Actions CI workflow |
+| `_old/` | Previous version (v1) — kept for reference |
 
 ## Documentation
 
 - **[User Guide](documentation/IMPACT_Docker_GUI_v2_User.md)** — step-by-step instructions, options reference, troubleshooting, and glossary
 - **[Technical Documentation](documentation/IMPACT_Docker_GUI_v2_Tech.md)** — architecture, data model, function reference, workflow internals, and extension points
+- **[Testing Guide](documentation/TESTING.md)** — test architecture, running tests locally, CI setup, and writing new tests
+
+## Testing
+
+```powershell
+# Run all unit + integration tests
+pwsh tests/Invoke-Tests.ps1
+
+# Unit tests only
+pwsh tests/Invoke-Tests.ps1 -Tag Unit
+
+# Integration tests only
+pwsh tests/Invoke-Tests.ps1 -Tag Integration
+```
+
+See **[Testing Guide](documentation/TESTING.md)** for Docker SSH tests, CI details, and writing new tests.
 
 ## Building the EXE
 
