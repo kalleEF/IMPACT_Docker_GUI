@@ -27,10 +27,12 @@ if (Test-Path $modulePath) {
     Write-Host "ERROR: Module not found at $modulePath" -ForegroundColor Red
     Write-Host "The file 'IMPACT_Docker_GUI.psm1' must be in the same folder as this script/EXE." -ForegroundColor Red
     Write-Host ""
+    # Also show a GUI dialog so double-clicking the EXE makes the error visible
+    try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue; [System.Windows.Forms.MessageBox]::Show("IMPACT cannot start because 'IMPACT_Docker_GUI.psm1' is missing from the application folder.\nPlease place the module next to the EXE and retry.", 'IMPACT - Module missing', 'OK', 'Error') | Out-Null } catch {}
     Write-Host "Press any key to exit..." -ForegroundColor Yellow
     $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     exit 1
-}
+} 
 
 # 4a. Remote prep: ensure SSH user, authorized_keys, repo list, docker context
 function Ensure-RemotePreparation {
@@ -1452,4 +1454,18 @@ function Invoke-ImpactGui {
     Show-ContainerManager -State $state
 }
 
-Invoke-ImpactGui
+try {
+    Invoke-ImpactGui
+} catch {
+    # Top-level catch to prevent the EXE from closing immediately and to surface diagnostics.
+    $ex = $_.Exception
+    Write-Log ("Unhandled exception: {0}`n{1}" -f $ex.Message, $ex.StackTrace) 'Error'
+    Write-Host "A fatal error occurred: $($ex.Message)" -ForegroundColor Red
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+        [System.Windows.Forms.MessageBox]::Show("IMPACT encountered a fatal error:\n$($ex.Message)\nSee the log (~/.impact_gui/logs/impact.log) for details.", 'IMPACT - Fatal error', 'OK', 'Error') | Out-Null
+    } catch { }
+    Write-Host "`nPress Enter to exit..." -ForegroundColor Yellow
+    Read-Host | Out-Null
+    exit 1
+}
