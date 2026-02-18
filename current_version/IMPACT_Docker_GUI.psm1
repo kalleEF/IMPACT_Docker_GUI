@@ -412,7 +412,7 @@ function Get-DockerCredentialsFromDotEnv {
         @{ user = 'DOCKERHUB_USERNAME'; pass = 'DOCKERHUB_TOKEN'; registry = 'docker.io' },
         @{ user = 'DOCKER_USERNAME';     pass = 'DOCKER_PASSWORD';  registry = 'docker.io' },
         @{ user = 'DOCKER_USER';         pass = 'DOCKER_PASS';      registry = 'docker.io' },
-        @{ user = 'REGISTRY_USERNAME';   pass = 'REGISTRY_TOKEN';   registry = ( $map.ContainsKey('REGISTRY_HOST') -and $map['REGISTRY_HOST'] ) ? $map['REGISTRY_HOST'] : 'docker.io' },
+        @{ user = 'REGISTRY_USERNAME';   pass = 'REGISTRY_TOKEN';   registry = (if ($map.ContainsKey('REGISTRY_HOST') -and $map['REGISTRY_HOST']) { $map['REGISTRY_HOST'] } else { 'docker.io' }) },
         @{ user = 'GHCR_USERNAME';       pass = 'GHCR_TOKEN';       registry = 'ghcr.io' }
     )
 
