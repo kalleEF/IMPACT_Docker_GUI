@@ -380,6 +380,97 @@ function Read-RemoteContainerMetadata {
     return $null
 }
 
+# -----------------------------------------------------------------------------
+# Docker credentials and remote-login helpers
+# -----------------------------------------------------------------------------
+function Get-DockerCredentialsFromDotEnv {
+    param(
+        [string]$EnvPath,
+        [string]$EnvContent
+    )
+
+    if (-not $EnvContent) {
+        if ($EnvPath -and (Test-Path $EnvPath)) {
+            try { $EnvContent = Get-Content -Path $EnvPath -Raw -ErrorAction Stop } catch { return $null }
+        } else { return $null }
+    }
+
+    $map = @{}
+    foreach ($line in ($EnvContent -split "`n")) {
+        $l = $line.Trim()
+        if (-not $l -or $l.StartsWith('#')) { continue }
+        if ($l -notmatch '=') { continue }
+        $parts = $l -split '=',2
+        $k = $parts[0].Trim()
+        $v = $parts[1].Trim()
+        if (($v.StartsWith("'") -and $v.EndsWith("'")) -or ($v.StartsWith('"') -and $v.EndsWith('"'))) { $v = $v.Substring(1,$v.Length-2) }
+        $map[$k] = $v
+    }
+
+    # Common key pairs (priority order)
+    $candidates = @(
+        @{ user = 'DOCKERHUB_USERNAME'; pass = 'DOCKERHUB_TOKEN'; registry = 'docker.io' },
+        @{ user = 'DOCKER_USERNAME';     pass = 'DOCKER_PASSWORD';  registry = 'docker.io' },
+        @{ user = 'DOCKER_USER';         pass = 'DOCKER_PASS';      registry = 'docker.io' },
+        @{ user = 'REGISTRY_USERNAME';   pass = 'REGISTRY_TOKEN';   registry = ( $map.ContainsKey('REGISTRY_HOST') -and $map['REGISTRY_HOST'] ) ? $map['REGISTRY_HOST'] : 'docker.io' },
+        @{ user = 'GHCR_USERNAME';       pass = 'GHCR_TOKEN';       registry = 'ghcr.io' }
+    )
+
+    foreach ($cand in $candidates) {
+        $uKey = $cand.user; $pKey = $cand.pass
+        if ($map.ContainsKey($uKey) -and $map.ContainsKey($pKey) -and $map[$uKey] -and $map[$pKey]) {
+            return [pscustomobject]@{ Username = $map[$uKey]; Password = $map[$pKey]; Registry = $cand.registry; Source = 'dotenv' }
+        }
+    }
+
+    return $null
+}
+
+function Ensure-RemoteDockerLogin {
+    param(
+        [pscustomobject]$State,
+        [string]$ProjectRoot
+    )
+
+    if ($State.ContainerLocation -notlike 'REMOTE@*') { return $false }
+    $remoteHost = Get-RemoteHostString -State $State
+    $keyPath = $State.Paths.SshPrivate
+
+    $envPathRemote = if ($ProjectRoot) { "$ProjectRoot/docker_setup/.env" } else { 'docker_setup/.env' }
+    Write-Log "Attempting to read repo .env at $envPathRemote on $remoteHost" 'Debug'
+
+    $envContent = $null
+    try {
+        $envContent = & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cat '$envPathRemote' 2>/dev/null || true"
+    } catch {
+        Write-Log "Failed to read remote .env: $($_.Exception.Message)" 'Debug'
+        return $false
+    }
+    if (-not $envContent) { Write-Log 'No .env content found on remote.' 'Debug'; return $false }
+
+    $creds = Get-DockerCredentialsFromDotEnv -EnvContent $envContent
+    if (-not $creds) { Write-Log 'No Docker credentials found in repo .env.' 'Debug'; return $false }
+
+    if (-not $creds.Username -or -not $creds.Password) { Write-Log 'Incomplete credentials in .env; cannot login.' 'Debug'; return $false }
+
+    $user = $creds.Username; $pw = $creds.Password; $registry = $creds.Registry
+    Write-Log ("Attempting remote docker login using .env (user={0} registry={1})" -f $user, $registry) 'Info'
+
+    try {
+        $pwB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($pw))
+        $cmd = "echo $pwB64 | base64 -d | docker login -u '$user' --password-stdin 2>&1 || true"
+        $sshArgs = @('-o','ConnectTimeout=15','-o','BatchMode=yes','-o','IdentitiesOnly=yes','-i',"$keyPath",$remoteHost,$cmd)
+        $out = & ssh @sshArgs
+        $outText = if ($out -is [System.Array]) { ($out -join "`n") } else { [string]$out }
+        if ($outText -match 'Login Succeeded') { Write-Log 'Remote docker login succeeded (masked).' 'Info'; return $true }
+        Write-Log ("Remote docker login output (masked): {0}" -f ($outText -replace [regex]::Escape($pw),'***')) 'Debug'
+    } catch {
+        Write-Log "Remote docker login attempt failed: $($_.Exception.Message)" 'Warn'
+    }
+
+    return $false
+}
+
 function Get-ContainerRuntimeInfo {
     param([pscustomobject]$State)
     $info = @{ Password = $null; Port = $null }
@@ -1711,6 +1802,7 @@ Export-ModuleMember -Function @(
     'Get-RemoteHostString'
     'Set-DockerSSHEnvironment'
     'Get-DockerContextArgs'
+    'Get-DockerCredentialsFromDotEnv'
     'Convert-PathToDockerFormat'
     # Remote SSH
     'Test-RemoteSSHKeyFiles'
