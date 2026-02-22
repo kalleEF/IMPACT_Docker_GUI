@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
-    Test helper: creates a pre-populated session state for headless testing.
-    Import this from any Pester test file.
+    Test helpers for IMPACT Docker GUI Pester tests.
+    Import this from any Pester test file:
+        . (Join-Path $PSScriptRoot 'Helpers' 'TestSessionState.ps1')
 #>
 
 function New-TestSessionState {
@@ -178,4 +179,118 @@ function Remove-TestArtifacts {
             Remove-Item -Recurse -Force -Path $p -ErrorAction SilentlyContinue
         }
     }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  E2E / ImageValidation helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function Assert-PreflightPassed {
+    <#
+    .SYNOPSIS  Guard for It blocks in E2E tests.  When $script:PreflightFailed
+               is $true (set during BeforeAll), marks the current test as
+               Skipped with the collected diagnostic messages.
+    .DESCRIPTION
+               Call at the very top of each It block:
+                   if (-not (Assert-PreflightPassed)) { return }
+               Returns $true when setup succeeded, $false (and skips) otherwise.
+    #>
+    if ($script:PreflightFailed) {
+        $reason = if ($script:PreflightMessages -and $script:PreflightMessages.Count -gt 0) {
+            $script:PreflightMessages -join '; '
+        } else {
+            'Setup failed (see BeforeAll output)'
+        }
+        Set-ItResult -Skipped -Because $reason
+        return $false
+    }
+    return $true
+}
+
+function Wait-ForRStudioReady {
+    <#
+    .SYNOPSIS  Polls an HTTP endpoint until RStudio Server responds.
+    .PARAMETER Url
+        The URL to poll (e.g. http://localhost:18787).
+    .PARAMETER TimeoutSeconds
+        Total seconds to wait before giving up. Default 120.
+    .PARAMETER IntervalSeconds
+        Seconds between polling attempts. Default 2.
+    .OUTPUTS   [bool] $true if RStudio is ready, $false on timeout.
+    #>
+    param(
+        [string]$Url,
+        [int]$TimeoutSeconds = 120,
+        [int]$IntervalSeconds = 2
+    )
+
+    $maxAttempts = [math]::Ceiling($TimeoutSeconds / $IntervalSeconds)
+    for ($i = 0; $i -lt $maxAttempts; $i++) {
+        Start-Sleep -Seconds $IntervalSeconds
+        try {
+            $resp = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            if ($resp.StatusCode -in @(200, 302)) { return $true }
+        } catch [System.Net.WebException] {
+            # Extract HTTP status code from the response if available
+            $webResp = $_.Exception.Response
+            if ($webResp) {
+                try {
+                    $httpCode = [int]$webResp.StatusCode
+                    # 401/403 means the server IS running (auth required)
+                    if ($httpCode -in @(200, 302, 401, 403)) { return $true }
+                } catch {}
+            }
+            # Connection refused / timeout — keep waiting
+        } catch {
+            # Non-HTTP error (DNS, socket) — keep waiting
+        }
+    }
+    return $false
+}
+
+function Invoke-DockerExecSafe {
+    <#
+    .SYNOPSIS  Runs 'docker exec' with array splatting and reliable exit-code capture.
+    .PARAMETER ContainerName
+        Name of the running container.
+    .PARAMETER Command
+        Array of command tokens (e.g. @('ls', '/home/rstudio')).
+    .PARAMETER User
+        Optional --user argument (e.g. 'rstudio').
+    .PARAMETER WorkDir
+        Optional --workdir argument.
+    .OUTPUTS   Hashtable @{ Output = [string[]]; ExitCode = [int] }
+    #>
+    param(
+        [string]$ContainerName,
+        [string[]]$Command,
+        [string]$User = $null,
+        [string]$WorkDir = $null
+    )
+
+    $args_ = @('exec')
+    if ($User)    { $args_ += '--user';    $args_ += $User }
+    if ($WorkDir) { $args_ += '--workdir'; $args_ += $WorkDir }
+    $args_ += $ContainerName
+    $args_ += $Command
+
+    $output = docker @args_ 2>&1
+    $exitCode = $LASTEXITCODE
+
+    return @{
+        Output   = $output
+        ExitCode = $exitCode
+    }
+}
+
+function ConvertTo-Base64Script {
+    <#
+    .SYNOPSIS  Base64-encodes a script string for safe transport through
+               multiple shell layers (PowerShell -> SSH -> bash -> docker exec).
+    .PARAMETER Script
+        The script content to encode.
+    .OUTPUTS   [string] Base64-encoded representation.
+    #>
+    param([string]$Script)
+    return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Script))
 }
