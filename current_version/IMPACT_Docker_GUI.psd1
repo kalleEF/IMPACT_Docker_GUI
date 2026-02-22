@@ -22,6 +22,8 @@
         'Write-RemoteContainerMetadata'
         'Remove-RemoteContainerMetadata'
         'Read-RemoteContainerMetadata'
+        'Get-DockerCredentialsFromDotEnv'
+        'Ensure-RemoteDockerLogin'
         'Get-ContainerRuntimeInfo'
         'Get-YamlPathValue'
         'Test-AndCreateDirectory'

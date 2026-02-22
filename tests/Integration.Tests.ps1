@@ -493,3 +493,13 @@ Describe 'Write-Log' -Tag Integration {
         { Write-Log 'Test debug message' 'Debug' } | Should -Not -Throw
     }
 }
+
+# Save Integration test artifacts (TestResults XML)
+AfterAll {
+    try {
+        if (-not (Get-Command -Name Save-TestArtifacts -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'Helpers' 'TestSessionState.ps1') }
+        Save-TestArtifacts -Suite 'integration' -ExtraFiles @('./tests/TestResults-Integration.xml')
+    } catch {
+        Write-Warning "Failed to save integration test artifacts: $($_.Exception.Message)"
+    }
+}

@@ -81,7 +81,10 @@ BeforeAll {
             $Command
         )
         $result = & ssh @sshArgs 2>&1
-        return $result
+        # Filter known host-addition warnings (they appear on first connect and
+        # pollute stdout/stderr, causing the tests' regex matches to fail).
+        $filtered = $result | Where-Object { $_ -notmatch 'Permanently added .* to the list of known hosts' }
+        return $filtered
     }
 }
 
@@ -167,6 +170,17 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
                 Write-Host "[RemoteE2E] Trying prerequisite build ..." -ForegroundColor Yellow
                 $prereqCmd = "cd $($script:REMOTE_REPO_DIR)/docker_setup && docker build -f Dockerfile.prerequisite.IMPACTncdGER -t $($script:INNER_IMAGE)-prerequisite --progress=plain . 2>&1"
                 Invoke-WsSshCommand $prereqCmd | Out-Null
+
+                # Tag the locally-built prerequisite image using the name referenced by
+                # Dockerfile.IMPACTncdGER so the subsequent main build finds it locally
+                $prereqLocalTag = "$($script:INNER_IMAGE)-prerequisite"
+                $expectedPrereqName = 'kalleef/prerequisite.impactncdger:latest'
+                try {
+                    Invoke-WsSshCommand "docker tag $prereqLocalTag $expectedPrereqName" | Out-Null
+                } catch {
+                    Write-Host "[RemoteE2E] Warning: failed to tag local prerequisite image: $($_ -join ' ')" -ForegroundColor Yellow
+                }
+
                 Invoke-WsSshCommand $buildCmd | Out-Null
                 $imgCheck2 = Invoke-WsSshCommand "docker image inspect $($script:INNER_IMAGE) --format '{{.Id}}' 2>/dev/null"
                 if (-not $imgCheck2) {
@@ -228,6 +242,16 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
 
     AfterAll {
         if ($script:SkipTests) { return }
+
+        # Save artifacts (try to capture local-side items and test result XML)
+        try {
+            $localPaths = @()
+            if ($env:IMPACT_REMOTE_E2E_SSH_KEY -and (Test-Path $env:IMPACT_REMOTE_E2E_SSH_KEY)) { $localPaths += $env:IMPACT_REMOTE_E2E_SSH_KEY }
+
+            Save-TestArtifacts -Suite 'remote-e2e' -Paths $localPaths -ExtraFiles @('./tests/TestResults-RemoteE2E.xml') -ContainerNames @('impact_remote_e2e_inner','workstation-test')
+        } catch {
+            Write-Warning "Failed to save remote-e2e artifacts: $($_.Exception.Message)"
+        }
 
         Write-Host "[RemoteE2E] Cleaning up ..." -ForegroundColor Cyan
         Invoke-WsSshCommand "docker stop $($script:INNER_CONTAINER) 2>/dev/null; docker rm $($script:INNER_CONTAINER) 2>/dev/null" | Out-Null
@@ -298,7 +322,10 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
     }
 
     It 'global.R can be sourced inside the IMPACT container' -Skip:$script:SkipTests {
-        $cmd = "docker exec --user rstudio $($script:INNER_CONTAINER) Rscript -e `"setwd('/home/rstudio/$($script:REPO_NAME)'); tryCatch({ source('global.R'); cat('GLOBAL_OK') }, error = function(e) cat(paste('GLOBAL_ERROR:', e\`\$message)))`""
+        # Build the R one-liner in a single-quoted PowerShell string so `$message` is not expanded
+        $rScript = 'setwd(''/home/rstudio/' + $script:REPO_NAME + '''); tryCatch({ source(''global.R''); cat(''GLOBAL_OK'') }, error = function(e) cat(paste(''GLOBAL_ERROR:'', e$message)))'
+        $cmd = "docker exec --user rstudio $($script:INNER_CONTAINER) Rscript -e `"$rScript`""
+
         $out = Invoke-WsSshCommand $cmd
         $joined = $out -join "`n"
         $joined | Should -Match 'GLOBAL_OK'
@@ -315,6 +342,9 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
     }
 
     It 'Can execute git pull from inside the IMPACT container' -Skip:($script:SkipTests -or -not $env:IMPACT_E2E_GITHUB_TOKEN) {
+        # Mark the bind-mounted repo as safe to avoid 'dubious ownership' git errors inside the container
+        Invoke-WsSshCommand "docker exec --user rstudio $($script:INNER_CONTAINER) git config --global --add safe.directory /home/rstudio/$($script:REPO_NAME)" | Out-Null
+
         $cmd = "docker exec --user rstudio --workdir /home/rstudio/$($script:REPO_NAME) $($script:INNER_CONTAINER) git pull 2>&1"
         $out = Invoke-WsSshCommand $cmd
         ($out -join "`n") | Should -Match 'Already up to date|Updating|Fast-forward|Merge made'

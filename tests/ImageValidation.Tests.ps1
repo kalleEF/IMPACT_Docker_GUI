@@ -86,7 +86,7 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
         $script:sshDir = Join-Path $tmpBase "impact_imgval_ssh_$([guid]::NewGuid().ToString('N').Substring(0,8))"
         New-Item -ItemType Directory -Path $script:sshDir -Force | Out-Null
         $script:sshKeyPath = Join-Path $script:sshDir "id_ed25519_$($script:TEST_USER)"
-        ssh-keygen -t ed25519 -C "imgval_test" -f $script:sshKeyPath -N '""' -q 2>$null
+        ssh-keygen -t ed25519 -C "imgval_test" -f $script:sshKeyPath -N "" -q 2>$null
         $script:knownHostsPath = Join-Path $script:sshDir 'known_hosts'
         ssh-keyscan -t ed25519 github.com 2>$null | Set-Content $script:knownHostsPath
 
@@ -188,6 +188,18 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
     }
 
     AfterAll {
+        # Save artifacts for debugging / CI uploads
+        try {
+            if (-not (Get-Command -Name Save-TestArtifacts -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'Helpers' 'TestSessionState.ps1') }
+            $localPaths = @()
+            if ($script:cloneRoot -and (Test-Path $script:cloneRoot)) { $localPaths += $script:cloneRoot }
+            if ($script:sshDir   -and (Test-Path $script:sshDir))    { $localPaths += $script:sshDir }
+
+            Save-TestArtifacts -Suite 'image-validation' -Paths $localPaths -ExtraFiles @('./tests/TestResults-ImageValidation.xml') -ContainerNames @($script:CONTAINER_NAME)
+        } catch {
+            Write-Warning "Failed to save image-validation artifacts: $($_.Exception.Message)"
+        }
+
         Write-Host "[ImageVal] Cleaning up ..." -ForegroundColor Cyan
 
         docker stop $script:CONTAINER_NAME 2>$null | Out-Null
