@@ -73,6 +73,13 @@ jobs:
           name: test-results-unit
           path: tests/TestResults-Unit.xml
 
+      - name: Upload test artifacts (unit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-artifacts
+          path: tests/artifacts/unit/**
+
   # ─────────────────────────────────────────────────────────────────────────
   #  Integration tests - Windows (needs WinForms, mocked Docker/SSH)
   # ─────────────────────────────────────────────────────────────────────────
@@ -114,6 +121,13 @@ jobs:
         with:
           name: test-results-integration
           path: tests/TestResults-Integration.xml
+
+      - name: Upload test artifacts (integration)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-artifacts
+          path: tests/artifacts/integration/**
 
   # ─────────────────────────────────────────────────────────────────────────
   #  Docker SSH tests - Ubuntu (needs Linux containers for SSHD)
@@ -188,6 +202,13 @@ jobs:
           name: test-results-docker-ssh
           path: tests/TestResults-DockerSsh.xml
 
+      - name: Upload test artifacts (docker-ssh)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-ssh-artifacts
+          path: tests/artifacts/docker-ssh/**
+
   # ─────────────────────────────────────────────────────────────────────────
   #  Image validation - Ubuntu (builds real IMPACT image, validates container)
   #  Only on manual dispatch (with run_e2e=true) or weekly schedule.
@@ -248,6 +269,13 @@ jobs:
           name: test-results-image-validation
           path: tests/TestResults-ImageValidation.xml
 
+      - name: Upload test artifacts (image-validation)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-validation-artifacts
+          path: tests/artifacts/image-validation/**
+
       - name: Collect diagnostic artifacts (image-validation)
         if: failure()
         run: |
@@ -304,6 +332,9 @@ jobs:
         run: |
           mkdir -p /tmp/remote_e2e_ssh
           ssh-keygen -t ed25519 -C "remote-e2e-ci" -f /tmp/remote_e2e_ssh/id_test -N "" -q
+
+          # Validate the generated private key is usable (not passphrase-protected)
+          ssh-keygen -y -f /tmp/remote_e2e_ssh/id_test >/dev/null || (echo "Generated SSH key unusable" && exit 1)
 
           # Start with Docker socket mounted (Docker-out-of-Docker)
           docker run -d -p 2222:22 \

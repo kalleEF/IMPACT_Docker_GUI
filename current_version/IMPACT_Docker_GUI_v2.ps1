@@ -27,10 +27,12 @@ if (Test-Path $modulePath) {
     Write-Host "ERROR: Module not found at $modulePath" -ForegroundColor Red
     Write-Host "The file 'IMPACT_Docker_GUI.psm1' must be in the same folder as this script/EXE." -ForegroundColor Red
     Write-Host ""
+    # Also show a GUI dialog so double-clicking the EXE makes the error visible
+    try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue; [System.Windows.Forms.MessageBox]::Show("IMPACT cannot start because 'IMPACT_Docker_GUI.psm1' is missing from the application folder.\nPlease place the module next to the EXE and retry.", 'IMPACT - Module missing', 'OK', 'Error') | Out-Null } catch {}
     Write-Host "Press any key to exit..." -ForegroundColor Yellow
     $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     exit 1
-}
+} 
 
 # 4a. Remote prep: ensure SSH user, authorized_keys, repo list, docker context
 function Ensure-RemotePreparation {
@@ -1079,6 +1081,26 @@ function Show-ContainerManager {
             }
 
             if (-not $buildSucceeded) {
+                # If this was a REMOTE build, attempt automatic docker login using the repo .env and retry once
+                if ($State.ContainerLocation -like 'REMOTE@*' -and -not $State.Metadata.RemoteLoginAttempted) {
+                    Write-Log 'Remote build failed — attempting automatic remote docker login from repo .env and retrying build.' 'Info'
+                    $State.Metadata.RemoteLoginAttempted = $true
+                    try {
+                        if (Ensure-RemoteDockerLogin -State $State -ProjectRoot $projectRoot) {
+                            Write-Log 'Remote docker login from .env succeeded — retrying build.' 'Info'
+                            $remoteHost = Get-RemoteHostString -State $State
+                            $sshKey = $State.Paths.SshPrivate
+                            $cmdRetry = "cd '$dockerContext' && docker build --build-arg REPO_NAME=$($State.SelectedRepo) -f '$dockerfileMain' -t '$imageName' --no-cache ."
+                            $sshArgsRetry = @('-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',"$sshKey",$remoteHost,$cmdRetry)
+                            $pRetry = Start-Process -FilePath 'ssh' -ArgumentList $sshArgsRetry -Wait -NoNewWindow -PassThru
+                            $buildSucceeded = ($pRetry.ExitCode -eq 0)
+                            if ($buildSucceeded) { Write-Log 'Remote build succeeded after login; continuing.' 'Info' }
+                        } else {
+                            Write-Log 'Automatic remote docker login from .env did not provide credentials or failed.' 'Debug'
+                        }
+                    } catch { Write-Log "Remote login attempt failed: $($_.Exception.Message)" 'Warn' }
+                }
+
                 Write-Log 'Main image build failed; attempting prerequisite build fallback.' 'Warn'
                 $prereqDockerfile = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup 'Dockerfile.prerequisite.IMPACTncdGER' } else { "$dockerSetup/Dockerfile.prerequisite.IMPACTncdGER" }
                 $prereqContext = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup '.' } else { "$dockerSetup" }
@@ -1432,4 +1454,18 @@ function Invoke-ImpactGui {
     Show-ContainerManager -State $state
 }
 
-Invoke-ImpactGui
+try {
+    Invoke-ImpactGui
+} catch {
+    # Top-level catch to prevent the EXE from closing immediately and to surface diagnostics.
+    $ex = $_.Exception
+    Write-Log ("Unhandled exception: {0}`n{1}" -f $ex.Message, $ex.StackTrace) 'Error'
+    Write-Host "A fatal error occurred: $($ex.Message)" -ForegroundColor Red
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+        [System.Windows.Forms.MessageBox]::Show("IMPACT encountered a fatal error:\n$($ex.Message)\nSee the log (~/.impact_gui/logs/impact.log) for details.", 'IMPACT - Fatal error', 'OK', 'Error') | Out-Null
+    } catch { }
+    Write-Host "`nPress Enter to exit..." -ForegroundColor Yellow
+    Read-Host | Out-Null
+    exit 1
+}
