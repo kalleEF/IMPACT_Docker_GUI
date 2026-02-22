@@ -1,0 +1,94 @@
+﻿<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<test-results xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="nunit_schema_2.5.xsd" name="Pester" total="25" errors="0" failures="0" not-run="0" inconclusive="0" ignored="0" skipped="0" invalid="0" date="2026-02-22" time="12:01:07">
+  <environment clr-version="9.0.10" machine-name="TUSPL10-N009-W" os-version="10.0.22631" user="ge28bak" nunit-version="2.5.8.0" user-domain="ADS" cwd="C:\Users\ge28bak\OneDrive - TUM\TUM_Personal\1_Research\Repos\IMPACT_Docker_GUI\.claude\worktrees\nervous-faraday" platform="Microsoft Windows 11 Education|C:\WINDOWS|\Device\Harddisk0\Partition4" />
+  <culture-info current-culture="de-DE" current-uiculture="de-DE" />
+  <test-suite type="TestFixture" name="Pester" executed="True" result="Success" success="True" time="5.7105" asserts="0" description="Pester">
+    <results>
+      <test-suite type="TestFixture" name="C:\Users\ge28bak\OneDrive - TUM\TUM_Personal\1_Research\Repos\IMPACT_Docker_GUI\.claude\worktrees\nervous-faraday\tests\Integration.Tests.ps1" executed="True" result="Success" success="True" time="5.7105" asserts="0" description="C:\Users\ge28bak\OneDrive - TUM\TUM_Personal\1_Research\Repos\IMPACT_Docker_GUI\.claude\worktrees\nervous-faraday\tests\Integration.Tests.ps1">
+        <results>
+          <test-suite type="TestFixture" name="Show-CredentialDialog in NonInteractive mode" executed="True" result="Success" success="True" time="0.2223" asserts="0" description="Show-CredentialDialog in NonInteractive mode">
+            <results>
+              <test-case description="Reads credentials from pre-set state values" name="Show-CredentialDialog in NonInteractive mode.Reads credentials from pre-set state values" time="0.1271" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Fails if UserName is empty" name="Show-CredentialDialog in NonInteractive mode.Fails if UserName is empty" time="0.0842" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="Select-Location in NonInteractive mode" executed="True" result="Success" success="True" time="0.429" asserts="0" description="Select-Location in NonInteractive mode">
+            <results>
+              <test-case description="Reads LOCAL location from pre-set state" name="Select-Location in NonInteractive mode.Reads LOCAL location from pre-set state" time="0.0935" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Reads REMOTE location from pre-set state" name="Select-Location in NonInteractive mode.Reads REMOTE location from pre-set state" time="0.0993" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="Test-StartupPrerequisites in NonInteractive mode" executed="True" result="Success" success="True" time="0.5792" asserts="0" description="Test-StartupPrerequisites in NonInteractive mode">
+            <results>
+              <test-case description="Returns true when docker and ssh are available" name="Test-StartupPrerequisites in NonInteractive mode.Returns true when docker and ssh are available" time="0.1379" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="Ensure-GitKeySetup in NonInteractive mode" executed="True" result="Success" success="True" time="1.0676" asserts="0" description="Ensure-GitKeySetup in NonInteractive mode">
+            <results>
+              <test-case description="Succeeds when SSH key pair already exists" name="Ensure-GitKeySetup in NonInteractive mode.Succeeds when SSH key pair already exists" time="0.4741" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="Test-DockerDaemonReady" executed="True" result="Success" success="True" time="2.9663" asserts="0" description="Test-DockerDaemonReady">
+            <results>
+              <test-case description="Returns true when docker info succeeds" name="Test-DockerDaemonReady.Returns true when docker info succeeds" time="1.8889" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="Get-ContainerRuntimeInfo with mock" executed="True" result="Success" success="True" time="3.1686" asserts="0" description="Get-ContainerRuntimeInfo with mock">
+            <results>
+              <test-case description="Extracts password and port from docker inspect output" name="Get-ContainerRuntimeInfo with mock.Extracts password and port from docker inspect output" time="0.1908" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="Ensure-SshAgentRunning" executed="True" result="Success" success="True" time="3.3415" asserts="0" description="Ensure-SshAgentRunning">
+            <results>
+              <test-case description="Does not throw when called with a dummy key path" name="Ensure-SshAgentRunning.Does not throw when called with a dummy key path" time="0.1652" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="Remote container flow with faked workstation paths" executed="True" result="Success" success="True" time="3.8019" asserts="0" description="Remote container flow with faked workstation paths">
+            <results>
+              <test-case description="Resolves remote YAML paths correctly from sim_design.yaml" name="Remote container flow with faked workstation paths.Resolves remote YAML paths correctly from sim_design.yaml" time="0.2098" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Test-AndCreateDirectory accepts remote absolute mount paths (mocked SSH)" name="Remote container flow with faked workstation paths.Test-AndCreateDirectory accepts remote absolute mount paths (mocked SSH)" time="0.1685" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Builds a complete docker run command for the remote workstation" name="Remote container flow with faked workstation paths.Builds a complete docker run command for the remote workstation" time="0.0538" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="Local container flow with sim_design_local.yaml" executed="True" result="Success" success="True" time="4.5719" asserts="0" description="Local container flow with sim_design_local.yaml">
+            <results>
+              <test-case description="Resolves local YAML paths without producing POSIX-style results" name="Local container flow with sim_design_local.yaml.Resolves local YAML paths without producing POSIX-style results" time="0.2047" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Test-AndCreateDirectory accepts the resolved local paths" name="Local container flow with sim_design_local.yaml.Test-AndCreateDirectory accepts the resolved local paths" time="0.3142" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Builds a complete docker run command for LOCAL mode" name="Local container flow with sim_design_local.yaml.Builds a complete docker run command for LOCAL mode" time="0.219" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="Build-DockerRunCommand end-to-end" executed="True" result="Success" success="True" time="4.7119" asserts="0" description="Build-DockerRunCommand end-to-end">
+            <results>
+              <test-case description="Produces a valid docker run command string for LOCAL with volumes" name="Build-DockerRunCommand end-to-end.Produces a valid docker run command string for LOCAL with volumes" time="0.0852" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Produces a valid docker run command for REMOTE with bind mounts and high compute" name="Build-DockerRunCommand end-to-end.Produces a valid docker run command for REMOTE with bind mounts and high compute" time="0.0489" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="GitHub SSH Key API helpers" executed="True" result="Success" success="True" time="5.057" asserts="0" description="GitHub SSH Key API helpers">
+            <results>
+              <test-case description="Add-GitHubSshKey calls the correct API endpoint" name="GitHub SSH Key API helpers.Add-GitHubSshKey calls the correct API endpoint" time="0.276" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Remove-GitHubSshKey calls DELETE with correct key ID" name="GitHub SSH Key API helpers.Remove-GitHubSshKey calls DELETE with correct key ID" time="0.0629" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="Show-GitCommitDialog in NonInteractive mode" executed="True" result="Success" success="True" time="5.1048" asserts="0" description="Show-GitCommitDialog in NonInteractive mode">
+            <results>
+              <test-case description="Returns null (skips dialog) in NonInteractive mode" name="Show-GitCommitDialog in NonInteractive mode.Returns null (skips dialog) in NonInteractive mode" time="0.0406" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="Ensure-Prerequisites in NonInteractive mode" executed="True" result="Success" success="True" time="5.3252" asserts="0" description="Ensure-Prerequisites in NonInteractive mode">
+            <results>
+              <test-case description="Loads WinForms without showing dialogs" name="Ensure-Prerequisites in NonInteractive mode.Loads WinForms without showing dialogs" time="0.2148" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="Write-Log" executed="True" result="Success" success="True" time="5.4807" asserts="0" description="Write-Log">
+            <results>
+              <test-case description="Writes Info level without error" name="Write-Log.Writes Info level without error" time="0.049" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Writes Warn level without error" name="Write-Log.Writes Warn level without error" time="0.033" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Writes Error level without error" name="Write-Log.Writes Error level without error" time="0.0325" asserts="0" success="True" result="Success" executed="True" />
+              <test-case description="Writes Debug level without error (suppressed when debug off)" name="Write-Log.Writes Debug level without error (suppressed when debug off)" time="0.0326" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+        </results>
+      </test-suite>
+    </results>
+  </test-suite>
+</test-results>

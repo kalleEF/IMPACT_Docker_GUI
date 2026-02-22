@@ -31,7 +31,7 @@ A Windows GUI tool for building, launching, and managing **IMPACT NCD Germany** 
 | Directory | Contents |
 |---|---|
 | `current_version/` | Active release — module (`IMPACT_Docker_GUI.psm1`), launcher script (`IMPACT_Docker_GUI_v2.ps1`), compile scripts, and application icon |
-| `tests/` | Pester 5 test suites (Unit, Integration, DockerSsh), test helpers, SSHD container Dockerfile |
+| `tests/` | Pester 5 test suites (Unit, Integration, DockerSsh, ImageValidation, RemoteE2E), test helpers, container Dockerfiles |
 | `documentation/` | User Guide, Technical Documentation, and Testing Guide |
 | `.github/workflows/` | GitHub Actions CI workflow |
 | `_old/` | Previous version (v1) — kept for reference |
@@ -45,14 +45,19 @@ A Windows GUI tool for building, launching, and managing **IMPACT NCD Germany** 
 ## Testing
 
 ```powershell
-# Run all unit + integration tests
+# Run all unit + integration tests (default)
 pwsh tests/Invoke-Tests.ps1
 
-# Unit tests only
+# Single suite
 pwsh tests/Invoke-Tests.ps1 -Tag Unit
-
-# Integration tests only
 pwsh tests/Invoke-Tests.ps1 -Tag Integration
+pwsh tests/Invoke-Tests.ps1 -Tag DockerSsh
+pwsh tests/Invoke-Tests.ps1 -Tag ImageValidation
+pwsh tests/Invoke-Tests.ps1 -Tag RemoteE2E
+
+# Cumulative (Unit -> Integration -> ... -> target level)
+pwsh tests/Invoke-Tests.ps1 -Level All
+pwsh tests/Invoke-Tests.ps1 -Level RemoteE2E -GitHubToken ghp_xxx
 ```
 
 See **[Testing Guide](documentation/TESTING.md)** for Docker SSH tests, CI details, and writing new tests.
