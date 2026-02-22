@@ -282,11 +282,9 @@ To enable SSH authentication + `git pull` tests in CI:
 |---|---|
 | `tests/Helpers/TestSessionState.ps1` | `New-TestSessionState` — creates a pre-populated `$State` hashtable for testing (supports `-Location 'LOCAL'` and `-Location 'REMOTE@<ip>'`); `New-DummySshKeyPair` — generates a throwaway ed25519 key pair; `Remove-TestArtifacts` — cleans up temp files |
 | `tests/Helpers/SshdContainer.Dockerfile` | Ubuntu 22.04 SSHD image with `testuser` and a fake `IMPACTncd_Germany` git repo (directory layout mirrors the real remote workstation). Used by DockerSsh tests. |
-| `tests/Helpers/WorkstationContainer.Dockerfile` | Extends SSHD container with Docker CE CLI (no daemon). Supports DooD via socket mount. Used by RemoteE2E tests. |
-| `tests/Helpers/workstation-entrypoint.sh` | Entrypoint script for WorkstationContainer — detects mounted Docker socket GID, adjusts `docker` group to match, starts SSHD. |
+| `tests/Helpers/WorkstationContainer.Dockerfile` | Extends SSHD container with Docker CE CLI (no daemon). Supports DooD via socket mount. Entrypoint is inlined (detects mounted Docker socket GID, adjusts `docker` group to match, starts SSHD). Used by RemoteE2E tests. |
 | `tests/.pesterconfig.psd1` | Default Pester 5 configuration |
-| `tests/Invoke-Tests.ps1` | Convenience test runner with `-Tag`, `-ExcludeTag`, `-CodeCoverage` switches |
-| `Run-AllTests.ps1` | Unified runner — handles container lifecycle, SSH keys, env vars, cumulative suite execution, cleanup, and summary |
+| `tests/Invoke-Tests.ps1` | Unified test runner — handles container lifecycle, SSH keys, env vars, `-Tag`/`-Level` modes, cumulative suite execution, cleanup, and summary |
 
 ---
 

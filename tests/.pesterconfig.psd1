@@ -17,11 +17,11 @@
     TestResult = @{
         Enabled      = $true
         OutputFormat  = 'NUnitXml'
-        OutputPath    = './tests/TestResults.xml'
+        OutputPath    = './artifacts/TestResults.xml'
     }
     CodeCoverage = @{
         Enabled    = $false
         Path       = './current_version/IMPACT_Docker_GUI.psm1'
-        OutputPath = './tests/Coverage.xml'
+        OutputPath = './artifacts/Coverage.xml'
     }
 }

@@ -32,11 +32,12 @@ Describe 'Preflight: environment checks' -Tag Preflight {
     }
 
     It 'Existing test SSH private keys (if present) are usable (not passphrase-protected)' {
-        $sshDir = Join-Path (if ($env:TEMP) { $env:TEMP } elseif ($env:TMPDIR) { $env:TMPDIR } else { '/tmp' }) 'impact_test_ssh'
-        if (-not (Test-Path $sshDir)) { Skip 'No test SSH keys present' }
+        $tmpBase = if ($env:TEMP) { $env:TEMP } elseif ($env:TMPDIR) { $env:TMPDIR } else { '/tmp' }
+        $sshDir = Join-Path $tmpBase 'impact_test_ssh'
+        if (-not (Test-Path $sshDir)) { Set-ItResult -Skipped -Because 'No test SSH keys present'; return }
 
         $candidates = @('id_test','id_ws_test') | ForEach-Object { Join-Path $sshDir $_ } | Where-Object { Test-Path $_ }
-        if (-not $candidates) { Skip 'No test SSH private keys present' }
+        if (-not $candidates) { Set-ItResult -Skipped -Because 'No test SSH private keys present'; return }
 
         foreach ($k in $candidates) {
             $pubOut = & ssh-keygen -y -f $k 2>$null

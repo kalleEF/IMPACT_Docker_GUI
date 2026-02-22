@@ -53,12 +53,23 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
         $script:PreflightFailed = $false
         $script:PreflightMessages = @()
 
-        # ── 0. Docker check ─────────────────────────────────────────────────
+        # ── 0. Switch to local Docker context ──────────────────────────────
+        #   ImageValidation needs to bind-mount local host paths into the
+        #   container.  This only works when Docker runs locally (Desktop or
+        #   default context), not on a remote SSH context.
+        $script:SavedDockerContext = $env:DOCKER_CONTEXT
+        $ctxList = docker context ls --format "{{.Name}}" 2>$null
+        $localCtx = 'desktop-linux'
+        if ($ctxList -notcontains $localCtx) { $localCtx = 'default' }
+        $env:DOCKER_CONTEXT = $localCtx
+        Write-Host "[ImageVal] Using Docker context: $localCtx" -ForegroundColor DarkGray
+
+        # ── 0b. Docker check ────────────────────────────────────────────────
         $dockerOk = $false
         try { docker info 2>$null | Out-Null; $dockerOk = ($LASTEXITCODE -eq 0) } catch {}
         if (-not $dockerOk) {
             $script:PreflightFailed = $true
-            $script:PreflightMessages += 'Docker is not running.'
+            $script:PreflightMessages += 'Docker is not running (local context).'
             Write-Host '[ImageVal][Preflight] Docker check failed.' -ForegroundColor Red
             return
         }
@@ -236,6 +247,9 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
             Remove-Item -Recurse -Force -Path $script:cloneRoot -ErrorAction SilentlyContinue
             Remove-Item -Recurse -Force -Path $script:sshDir    -ErrorAction SilentlyContinue
         }
+
+        # Restore original Docker context
+        $env:DOCKER_CONTEXT = $script:SavedDockerContext
     }
 
     # ═════════════════════════════════════════════════════════════════════════
@@ -394,6 +408,10 @@ tryCatch({
 
     It 'Can execute git pull from inside the container' -Skip:(-not $env:IMPACT_E2E_GITHUB_TOKEN) {
         if (-not (Assert-PreflightPassed)) { return }
+        # Bind-mounted repos have different host/container ownership — mark as safe
+        Invoke-DockerExecSafe -ContainerName $script:CONTAINER_NAME -User 'rstudio' `
+            -Command @('git', 'config', '--global', '--add', 'safe.directory',
+                        "/home/rstudio/$($script:REPO_NAME)") | Out-Null
         $r = Invoke-DockerExecSafe -ContainerName $script:CONTAINER_NAME -User 'rstudio' `
             -WorkDir "/home/rstudio/$($script:REPO_NAME)" `
             -Command @('git', 'pull')
