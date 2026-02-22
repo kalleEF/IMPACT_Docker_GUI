@@ -99,8 +99,8 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
         New-Item -ItemType Directory -Path $script:sshDir -Force | Out-Null
         $script:sshKeyPath = Join-Path $script:sshDir "id_ed25519_$($script:TEST_USER)"
         ssh-keygen -t ed25519 -C "imgval_test" -f $script:sshKeyPath -N "" -q 2>$null
-        $script:knownHostsPath = Join-Path $script:sshDir 'known_hosts'
-        ssh-keyscan -t ed25519 github.com 2>$null | Set-Content $script:knownHostsPath
+        # known_hosts is generated INSIDE the container after start (step 7)
+        # to avoid Windows encoding issues (CRLF/BOM from PowerShell Set-Content)
 
         # ── 4. Build Docker image ───────────────────────────────────────────
         $script:skipBuild = ($env:IMPACT_E2E_SKIP_BUILD -eq '1')
@@ -181,7 +181,6 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
             '-v', "$($script:outputDir):/home/rstudio/$($script:REPO_NAME)/outputs",
             '-v', "$($script:synthpopDir):/home/rstudio/$($script:REPO_NAME)/inputs/synthpop",
             '-v', "$($script:sshKeyPath):/keys/id_ed25519_$($script:TEST_USER):ro",
-            '-v', "$($script:knownHostsPath):/etc/ssh/ssh_known_hosts:ro",
             '--workdir', "/home/rstudio/$($script:REPO_NAME)",
             $script:IMAGE_NAME
         )
@@ -195,9 +194,11 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
             return
         }
 
-        # ── 7. Fix SSH key permissions inside container ─────────────────────
+        # ── 7. Fix SSH key + generate known_hosts inside container ─────────
+        #   Generate known_hosts INSIDE the container to avoid Windows
+        #   encoding issues (CRLF, BOM) from host-side ssh-keyscan.
         Start-Sleep -Seconds 2
-        $fixCmd = "mkdir -p /home/rstudio/.ssh && cp /keys/id_ed25519_$($script:TEST_USER) $containerKeyPath && chmod 600 $containerKeyPath && chown 1000:1000 $containerKeyPath && cp /etc/ssh/ssh_known_hosts /home/rstudio/.ssh/known_hosts 2>/dev/null; chmod 644 /home/rstudio/.ssh/known_hosts 2>/dev/null; chown 1000:1000 /home/rstudio/.ssh/known_hosts 2>/dev/null; echo KEY_FIXED"
+        $fixCmd = "mkdir -p /home/rstudio/.ssh && cp /keys/id_ed25519_$($script:TEST_USER) $containerKeyPath && chmod 600 $containerKeyPath && chown 1000:1000 $containerKeyPath && ssh-keyscan -t ed25519 github.com > /etc/ssh/ssh_known_hosts 2>/dev/null && cp /etc/ssh/ssh_known_hosts /home/rstudio/.ssh/known_hosts 2>/dev/null; chmod 644 /home/rstudio/.ssh/known_hosts 2>/dev/null; chown 1000:1000 /home/rstudio/.ssh/known_hosts 2>/dev/null; echo KEY_FIXED"
         $fixArgs = @('exec', $script:CONTAINER_NAME, 'sh', '-c', $fixCmd)
         $fixOut = docker @fixArgs 2>&1
         if (($fixOut -join '') -notmatch 'KEY_FIXED') {
