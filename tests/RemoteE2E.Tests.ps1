@@ -158,7 +158,7 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
             Write-Host '[RemoteE2E] Building Docker image on workstation (this takes 10-30 min) ...' -ForegroundColor Cyan
 
             $dockerfilePath = "$($script:REMOTE_REPO_DIR)/docker_setup/Dockerfile.IMPACTncdGER"
-            $buildCmd = "cd $($script:REMOTE_REPO_DIR) && docker build --build-arg REPO_NAME=$($script:REPO_NAME) -f $dockerfilePath -t $($script:INNER_IMAGE) --progress=plain . 2>&1"
+            $buildCmd = "cd $($script:REMOTE_REPO_DIR) && docker build --build-arg REPO_NAME=$($script:REPO_NAME) -f $dockerfilePath -t $($script:INNER_IMAGE) . 2>&1"
             $buildOut = Invoke-WsSshCommand $buildCmd
             Write-Host "[RemoteE2E] Build output (last 5 lines): $(($buildOut | Select-Object -Last 5) -join "`n")" -ForegroundColor DarkGray
 
@@ -167,7 +167,7 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
             if ($script:LastSshExitCode -ne 0 -or -not $imgCheck) {
                 # Try prerequisite + retry
                 Write-Host '[RemoteE2E] Trying prerequisite build ...' -ForegroundColor Yellow
-                $prereqCmd = "cd $($script:REMOTE_REPO_DIR)/docker_setup && docker build -f Dockerfile.prerequisite.IMPACTncdGER -t $($script:INNER_IMAGE)-prerequisite --progress=plain . 2>&1"
+                $prereqCmd = "cd $($script:REMOTE_REPO_DIR)/docker_setup && docker build -f Dockerfile.prerequisite.IMPACTncdGER -t $($script:INNER_IMAGE)-prerequisite . 2>&1"
                 Invoke-WsSshCommand $prereqCmd | Out-Null
 
                 # Tag the locally-built prerequisite image
@@ -192,14 +192,25 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
         }
 
         # ── 8. Start IMPACT container on workstation ────────────────────────
+        #
+        # DooD (Docker-out-of-Docker) constraint:
+        #   Volume mounts (-v) reference the Docker HOST filesystem, not the
+        #   workstation container's filesystem.  Since our repo and SSH keys
+        #   live inside the workstation container, we CANNOT use -v bind mounts.
+        #
+        # Strategy:
+        #   a) Start the inner container WITHOUT bind-mounts.
+        #   b) Use 'docker cp' (which reads from the CLI client's filesystem,
+        #      i.e. the workstation container) to copy the repo + SSH key in.
+        #   c) Fix ownership/permissions inside the running container.
+        #
         Write-Host '[RemoteE2E] Starting IMPACT container on workstation ...' -ForegroundColor Cyan
         Invoke-WsSshCommand "docker stop $($script:INNER_CONTAINER) 2>/dev/null; docker rm $($script:INNER_CONTAINER) 2>/dev/null" | Out-Null
 
         $containerKeyTarget = '/home/rstudio/.ssh/id_ed25519_e2e'
         $gitSshCmd = "ssh -i $containerKeyTarget -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/ssh/ssh_known_hosts -o StrictHostKeyChecking=yes"
 
-        # Build docker run command — use single quotes for GIT_SSH_COMMAND so
-        # bash on the remote side preserves it as a literal string.
+        # Start container WITHOUT -v mounts (DooD: host paths ≠ workstation paths)
         $runCmd = @(
             "docker run -d --name $($script:INNER_CONTAINER)",
             "-e PASSWORD=$($script:TEST_PASSWORD)",
@@ -208,11 +219,7 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
             "-e CONTAINER_REPO_NAME=$($script:REPO_NAME)",
             "-e SYNC_ENABLED=false",
             "-e 'GIT_SSH_COMMAND=$gitSshCmd'",
-            "-v $($script:REMOTE_REPO_DIR):/home/rstudio/$($script:REPO_NAME)",
             "-p $($script:INNER_PORT):8787",
-            "-v $($script:REMOTE_REPO_DIR)/outputs:/home/rstudio/$($script:REPO_NAME)/outputs",
-            "-v $($script:REMOTE_REPO_DIR)/inputs/synthpop:/home/rstudio/$($script:REPO_NAME)/inputs/synthpop",
-            "-v $($script:remoteKeyPath):/keys/id_ed25519_e2e:ro",
             "--workdir /home/rstudio/$($script:REPO_NAME)",
             $script:INNER_IMAGE
         ) -join ' '
@@ -220,24 +227,84 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
         $runOut = Invoke-WsSshCommand $runCmd
         Write-Host "[RemoteE2E] Container started: $($runOut | Select-Object -First 1)" -ForegroundColor DarkGray
 
-        # Fix SSH key inside inner container
-        $fixCmd = "docker exec $($script:INNER_CONTAINER) sh -c 'mkdir -p /home/rstudio/.ssh && cp /keys/id_ed25519_e2e $containerKeyTarget && chmod 600 $containerKeyTarget && chown 1000:1000 $containerKeyTarget && ssh-keyscan -t ed25519 github.com > /etc/ssh/ssh_known_hosts 2>/dev/null && cp /etc/ssh/ssh_known_hosts /home/rstudio/.ssh/known_hosts 2>/dev/null; chown 1000:1000 /home/rstudio/.ssh/known_hosts 2>/dev/null; echo KEY_FIXED'"
+        # Verify container is running before proceeding with docker cp
+        $stateCheck = Invoke-WsSshCommand "docker inspect $($script:INNER_CONTAINER) --format '{{.State.Running}}' 2>/dev/null"
+        if (($stateCheck -join '') -notmatch 'true') {
+            $earlyLogs = Invoke-WsSshCommand "docker logs $($script:INNER_CONTAINER) 2>&1 | tail -10"
+            Write-Host "[RemoteE2E] Container not running. Logs:`n$($earlyLogs -join "`n")" -ForegroundColor Red
+            $script:PreflightFailed = $true
+            $script:PreflightMessages += "Inner container failed to start: $($earlyLogs -join ' ')"
+            return
+        }
+
+        # ── 8b. Copy repo into container using docker cp ──────────────────
+        #    docker cp reads from the CLI client's filesystem (workstation container)
+        Write-Host '[RemoteE2E] Copying repository into inner container via docker cp ...' -ForegroundColor Cyan
+        $cpRepoCmd = "docker cp $($script:REMOTE_REPO_DIR)/. $($script:INNER_CONTAINER):/home/rstudio/$($script:REPO_NAME)/"
+        $cpRepoOut = Invoke-WsSshCommand $cpRepoCmd
+        if ($script:LastSshExitCode -ne 0) {
+            Write-Host "[RemoteE2E][Diag] docker cp repo failed (exit $($script:LastSshExitCode)): $($cpRepoOut -join ' ')" -ForegroundColor Red
+            $script:PreflightFailed = $true
+            $script:PreflightMessages += 'Failed to copy repo into inner container'
+            return
+        }
+
+        # Ensure output/synthpop dirs exist inside the container
+        Invoke-WsSshCommand "docker exec $($script:INNER_CONTAINER) mkdir -p /home/rstudio/$($script:REPO_NAME)/outputs /home/rstudio/$($script:REPO_NAME)/inputs/synthpop" | Out-Null
+
+        # ── 8c. Copy SSH key into container ───────────────────────────────
+        Write-Host '[RemoteE2E] Copying SSH key into inner container ...' -ForegroundColor Cyan
+        # First create the target directory, then copy the key file
+        Invoke-WsSshCommand "docker exec $($script:INNER_CONTAINER) mkdir -p /home/rstudio/.ssh" | Out-Null
+        $cpKeyCmd = "docker cp $($script:remoteKeyPath) $($script:INNER_CONTAINER):$containerKeyTarget"
+        $cpKeyOut = Invoke-WsSshCommand $cpKeyCmd
+        if ($script:LastSshExitCode -ne 0) {
+            Write-Host "[RemoteE2E][Diag] docker cp key failed (exit $($script:LastSshExitCode)): $($cpKeyOut -join ' ')" -ForegroundColor Red
+        }
+
+        # ── 8d. Fix ownership + set up SSH known hosts ────────────────────
+        $fixCmd = @(
+            "docker exec $($script:INNER_CONTAINER) sh -c '",
+            "chown -R 1000:1000 /home/rstudio/$($script:REPO_NAME) &&",
+            "chmod 600 $containerKeyTarget &&",
+            "chown 1000:1000 $containerKeyTarget &&",
+            "ssh-keyscan -t ed25519 github.com > /etc/ssh/ssh_known_hosts 2>/dev/null;",
+            "cp /etc/ssh/ssh_known_hosts /home/rstudio/.ssh/known_hosts 2>/dev/null;",
+            "chown -R 1000:1000 /home/rstudio/.ssh;",
+            "echo KEY_FIXED'"
+        ) -join ' '
         $fixOut = Invoke-WsSshCommand $fixCmd
         if (($fixOut -join '') -notmatch 'KEY_FIXED') {
-            Write-Host "[RemoteE2E][Diag] SSH key fix may have failed: $($fixOut -join ' ')" -ForegroundColor Yellow
+            Write-Host "[RemoteE2E][Diag] SSH key/ownership fix may have failed: $($fixOut -join ' ')" -ForegroundColor Yellow
+        } else {
+            Write-Host '[RemoteE2E] Repo + SSH key copied and permissions fixed.' -ForegroundColor DarkGray
         }
 
         # ── 9. Wait for RStudio Server ──────────────────────────────────────
-        Write-Host "[RemoteE2E] Waiting for RStudio Server on port $($script:INNER_PORT) ..." -ForegroundColor Cyan
+        #   DooD constraint: -p maps ports on the Docker HOST, not on the
+        #   workstation container.  We need the inner container's IP to
+        #   reach RStudio from inside the workstation.
+        $innerIp = (Invoke-WsSshCommand "docker inspect $($script:INNER_CONTAINER) --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null") -join ''
+        $innerIp = $innerIp.Trim()
+        if (-not $innerIp) {
+            Write-Host '[RemoteE2E][Diag] Could not determine inner container IP' -ForegroundColor Yellow
+            $innerIp = 'localhost'    # fallback, may not work in DooD
+        }
+        $script:INNER_URL = "http://${innerIp}:8787"
+        Write-Host "[RemoteE2E] Waiting for RStudio Server at $($script:INNER_URL) ..." -ForegroundColor Cyan
+
         $ready = $false
         for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 2
-            $curlOut = Invoke-WsSshCommand "curl -s -o /dev/null -w '%{http_code}' http://localhost:$($script:INNER_PORT) 2>/dev/null"
-            if ($curlOut -match '200|302') { $ready = $true; break }
+            $curlOut = Invoke-WsSshCommand "curl -s -o /dev/null -w '%{http_code}' $($script:INNER_URL) 2>/dev/null"
+            if ($curlOut -match '200|302|401|403') { $ready = $true; break }
         }
         if (-not $ready) {
             $logs = Invoke-WsSshCommand "docker logs $($script:INNER_CONTAINER) 2>&1 | tail -20"
             Write-Host "[RemoteE2E] Container logs:`n$($logs -join "`n")" -ForegroundColor Red
+            # Also check if container is even running
+            $runState = Invoke-WsSshCommand "docker inspect $($script:INNER_CONTAINER) --format '{{.State.Status}}' 2>/dev/null"
+            Write-Host "[RemoteE2E] Container state: $($runState -join '')" -ForegroundColor Red
             $script:PreflightFailed = $true
             $script:PreflightMessages += 'RStudio Server did not start within 120s on workstation.'
             Write-Host '[RemoteE2E][Preflight] RStudio not ready within 120s.' -ForegroundColor Red
@@ -323,7 +390,8 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
     # ═════════════════════════════════════════════════════════════════════════
     It 'RStudio Server is accessible from workstation' -Skip:$script:SkipTests {
         if (-not (Assert-PreflightPassed)) { return }
-        $out = Invoke-WsSshCommand "curl -s -o /dev/null -w '%{http_code}' http://localhost:$($script:INNER_PORT)"
+        # Use container IP directly (DooD: port maps land on Docker host, not workstation)
+        $out = Invoke-WsSshCommand "curl -s -o /dev/null -w '%{http_code}' $($script:INNER_URL)"
         if ($script:LastSshExitCode -ne 0) {
             Write-Host "[RemoteE2E][Diag] curl failed (exit $($script:LastSshExitCode)): $($out -join ' ')" -ForegroundColor Yellow
         }
@@ -383,7 +451,7 @@ tryCatch({
 
     It 'Can execute git pull from inside the IMPACT container' -Skip:($script:SkipTests -or -not $env:IMPACT_E2E_GITHUB_TOKEN) {
         if (-not (Assert-PreflightPassed)) { return }
-        # Mark the bind-mounted repo as safe
+        # Mark the copied repo as safe (ownership differs from rstudio user)
         Invoke-WsSshCommand "docker exec --user rstudio $($script:INNER_CONTAINER) git config --global --add safe.directory /home/rstudio/$($script:REPO_NAME)" | Out-Null
 
         $cmd = "docker exec --user rstudio --workdir /home/rstudio/$($script:REPO_NAME) $($script:INNER_CONTAINER) git pull 2>&1"

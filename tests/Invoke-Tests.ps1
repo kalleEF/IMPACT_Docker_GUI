@@ -336,10 +336,15 @@ foreach ($name in $suitesToRun) {
     }
 
     if ($name -eq 'ImageValidation') {
+        # ImageValidation needs local Docker (bind-mounts from host paths)
+        $savedCtx = $env:DOCKER_CONTEXT
+        $localCtx = Get-LocalDockerContext
+        $env:DOCKER_CONTEXT = $localCtx
         $dockerOk = $false
         try { docker info 2>$null | Out-Null; $dockerOk = ($LASTEXITCODE -eq 0) } catch {}
+        $env:DOCKER_CONTEXT = $savedCtx
         if (-not $dockerOk) {
-            Write-Host '  SKIP ImageValidation - Docker not running' -ForegroundColor Yellow
+            Write-Host '  SKIP ImageValidation - local Docker not running' -ForegroundColor Yellow
             continue
         }
     }

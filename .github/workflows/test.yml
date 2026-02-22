@@ -216,7 +216,9 @@ jobs:
   image-validation:
     name: Image Validation (Ubuntu)
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_e2e == 'true'
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_e2e == 'true')
+      || github.event_name == 'schedule'
     needs: [docker-ssh-tests]
     timeout-minutes: 45
     steps:
@@ -313,7 +315,9 @@ jobs:
   remote-e2e:
     name: Remote E2E (Ubuntu + DooD)
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_e2e == 'true'
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_e2e == 'true')
+      || github.event_name == 'schedule'
     needs: [docker-ssh-tests]
     timeout-minutes: 60
     steps:

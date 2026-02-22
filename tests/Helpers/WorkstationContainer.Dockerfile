@@ -82,8 +82,25 @@ RUN sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/s
 # ── Entrypoint: fix docker socket permissions, then start sshd ──────────────
 #    When the host socket is mounted, its GID may differ from 999.
 #    We detect the actual GID and adjust the docker group to match.
-COPY tests/Helpers/workstation-entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+#    NOTE: Inlined instead of COPY to avoid Docker build context path issues
+#    on Windows (paths with spaces / OneDrive paths cause empty context).
+RUN printf '#!/bin/bash\n\
+DOCKER_SOCK=/var/run/docker.sock\n\
+if [ -S "$DOCKER_SOCK" ]; then\n\
+    SOCK_GID=$(stat -c "%%g" "$DOCKER_SOCK")\n\
+    DOCKER_GID=$(getent group docker | cut -d: -f3)\n\
+    if [ "$SOCK_GID" != "$DOCKER_GID" ]; then\n\
+        if [ "$SOCK_GID" = "0" ]; then\n\
+            chgrp docker "$DOCKER_SOCK" 2>/dev/null || true\n\
+        else\n\
+            groupmod -g "$SOCK_GID" docker 2>/dev/null || true\n\
+        fi\n\
+    fi\n\
+    chmod g+rw "$DOCKER_SOCK" 2>/dev/null || true\n\
+    usermod -aG docker testuser 2>/dev/null || true\n\
+fi\n\
+exec /usr/sbin/sshd -D -e\n' > /entrypoint.sh && \
+    chmod +x /entrypoint.sh
 
 EXPOSE 22
 
