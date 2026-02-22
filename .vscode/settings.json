@@ -8,7 +8,7 @@
             "approve": true,
             "matchCommandLine": true
         },
-        "/^pwsh -File Run-AllTests\\.ps1 -Level Unit 2>&1 \\| Select-String -Pattern \"\\(Passed\\|Failed\\|Skipped\\|Tests\\|Result\\|FAIL\\|error\\)\"$/": {
+        "/^pwsh -File tests/Invoke-Tests\\.ps1 -Tag Unit 2>&1 \\| Select-String -Pattern \"\\(Passed\\|Failed\\|Skipped\\|Tests\\|Result\\|FAIL\\|error\\)\"$/": {
             "approve": true,
             "matchCommandLine": true
         }
