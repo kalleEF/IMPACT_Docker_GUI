@@ -13,3 +13,6 @@ IMPACT.exe
 # Local test artifacts (do NOT commit)
 /tests/artifacts/
 tests/artifacts/
+
+# Claude files
+.claude/
