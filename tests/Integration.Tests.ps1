@@ -494,6 +494,343 @@ Describe 'Write-Log' -Tag Integration {
     }
 }
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Get-GitRepositoryState — local mode (mocked git)
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Get-GitRepositoryState (local, mocked)' -Tag Integration {
+    It 'Returns HasChanges=$true when git status reports changes' {
+        Mock git {
+            $allArgs = $args
+            $flatArgs = @()
+            foreach ($a in $allArgs) {
+                if ($a -is [array]) { $flatArgs += $a } else { $flatArgs += $a }
+            }
+            $joined = $flatArgs -join ' '
+            if ($joined -match 'status --porcelain') {
+                return @(' M src/app.R', '?? new_file.R')
+            }
+            if ($joined -match 'rev-parse --abbrev-ref') {
+                return 'main'
+            }
+            if ($joined -match 'remote get-url') {
+                return 'git@github.com:user/repo.git'
+            }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Get-GitRepositoryState -State $state -RepoPath $env:TEMP -IsRemote $false
+
+        $result | Should -Not -BeNullOrEmpty
+        $result.HasChanges | Should -BeTrue
+        $result.StatusText | Should -Match 'app\.R'
+        $result.Branch | Should -Be 'main'
+        $result.Remote | Should -Match 'github\.com'
+    }
+
+    It 'Returns HasChanges=$false when working tree is clean' {
+        Mock git {
+            $allArgs = $args
+            $flatArgs = @()
+            foreach ($a in $allArgs) {
+                if ($a -is [array]) { $flatArgs += $a } else { $flatArgs += $a }
+            }
+            $joined = $flatArgs -join ' '
+            if ($joined -match 'status --porcelain') {
+                return @()
+            }
+            if ($joined -match 'rev-parse --abbrev-ref') {
+                return 'develop'
+            }
+            if ($joined -match 'remote get-url') {
+                return 'git@github.com:user/repo.git'
+            }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Get-GitRepositoryState -State $state -RepoPath $env:TEMP -IsRemote $false
+
+        $result | Should -Not -BeNullOrEmpty
+        $result.HasChanges | Should -BeFalse
+        $result.Branch | Should -Be 'develop'
+    }
+
+    It 'Returns null when RepoPath is empty' {
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Get-GitRepositoryState -State $state -RepoPath '' -IsRemote $false
+        $result | Should -BeNullOrEmpty
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Get-GitRepositoryState — remote mode (mocked SSH)
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Get-GitRepositoryState (remote, mocked SSH)' -Tag Integration {
+    It 'Parses combined SSH output into status/branch/remote' {
+        Mock ssh {
+            # Simulated output: porcelain status lines, then branch, then remote URL
+            return @(
+                ' M inputs/sim_design.yaml'
+                'main'
+                'git@github.com:IMPACT/repo.git'
+            )
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.5'
+        $result = Get-GitRepositoryState -State $state -RepoPath '/home/user/repo' -IsRemote $true
+
+        $result | Should -Not -BeNullOrEmpty
+        $result.HasChanges | Should -BeTrue
+        $result.StatusText | Should -Match 'sim_design'
+        $result.Branch | Should -Be 'main'
+        $result.Remote | Should -Match 'github\.com'
+    }
+
+    It 'Returns HasChanges=$false for clean remote repo' {
+        Mock ssh {
+            # No porcelain lines — just branch and remote
+            return @(
+                'feature-branch'
+                'git@github.com:IMPACT/repo.git'
+            )
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.5'
+        $result = Get-GitRepositoryState -State $state -RepoPath '/home/user/repo' -IsRemote $true
+
+        $result | Should -Not -BeNullOrEmpty
+        $result.HasChanges | Should -BeFalse
+        $result.Branch | Should -Be 'feature-branch'
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Invoke-GitChangeDetection (mocked — NonInteractive, no dialog)
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Invoke-GitChangeDetection in NonInteractive mode' -Tag Integration {
+    BeforeEach {
+        Enable-NonInteractiveMode
+    }
+    AfterEach {
+        Disable-NonInteractiveMode
+    }
+
+    It 'Does nothing when there are no changes' {
+        Mock git {
+            $allArgs = $args
+            $flatArgs = @()
+            foreach ($a in $allArgs) {
+                if ($a -is [array]) { $flatArgs += $a } else { $flatArgs += $a }
+            }
+            $joined = $flatArgs -join ' '
+            if ($joined -match 'status --porcelain') { return @() }
+            if ($joined -match 'rev-parse --abbrev-ref') { return 'main' }
+            if ($joined -match 'remote get-url') { return 'git@github.com:u/r.git' }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'LOCAL'
+        # Should complete without error and without committing
+        { Invoke-GitChangeDetection -State $state -RepoPath $env:TEMP -IsRemote $false } | Should -Not -Throw
+    }
+
+    It 'Skips commit when dialog returns null (NonInteractive)' {
+        Mock git {
+            $allArgs = $args
+            $flatArgs = @()
+            foreach ($a in $allArgs) {
+                if ($a -is [array]) { $flatArgs += $a } else { $flatArgs += $a }
+            }
+            $joined = $flatArgs -join ' '
+            if ($joined -match 'status --porcelain') { return @(' M file.R') }
+            if ($joined -match 'rev-parse --abbrev-ref') { return 'main' }
+            if ($joined -match 'remote get-url') { return 'git@github.com:u/r.git' }
+            # If we get here, commit/push is being attempted — fail
+            throw "git commit/push should not be called in NonInteractive mode without dialog"
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'LOCAL'
+        # NonInteractive mode => Show-GitCommitDialog returns $null => no commit
+        { Invoke-GitChangeDetection -State $state -RepoPath $env:TEMP -IsRemote $false } | Should -Not -Throw
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Remote container metadata (Write / Read / Remove) — mocked SSH
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Remote container metadata lifecycle (mocked SSH)' -Tag Integration {
+    BeforeAll {
+        # Capture what SSH commands the functions send
+        $script:sshCommands = @()
+    }
+
+    It 'Write-RemoteContainerMetadata sends base64-encoded JSON via SSH' {
+        $script:sshCommands = @()
+        Mock ssh {
+            $script:sshCommands += ($args -join ' ')
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'metauser' -Password 'MetaPass!' -Location 'REMOTE@10.0.0.1'
+        $state.ContainerName = 'impact-metauser'
+        $state.SelectedRepo  = 'IMPACTncd_Germany'
+
+        Write-RemoteContainerMetadata -State $state -Password 'MetaPass!' -Port '8787' -UseVolumes $false
+
+        $script:sshCommands.Count | Should -BeGreaterThan 0
+        $lastCmd = $script:sshCommands[-1]
+        # Should contain mkdir and base64 decode
+        $lastCmd | Should -Match 'mkdir -p /tmp/impactncd'
+        $lastCmd | Should -Match 'base64 -d'
+        $lastCmd | Should -Match 'impact-metauser\.json'
+    }
+
+    It 'Write-RemoteContainerMetadata is a no-op for LOCAL mode' {
+        $script:sshCommands = @()
+        Mock ssh {
+            $script:sshCommands += ($args -join ' ')
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'LOCAL'
+        Write-RemoteContainerMetadata -State $state -Password 'x' -Port '8787' -UseVolumes $false
+
+        $script:sshCommands.Count | Should -Be 0
+    }
+
+    It 'Read-RemoteContainerMetadata deserialises JSON from SSH output' {
+        $jsonPayload = '{"container":"impact-metauser","repo":"IMPACTncd_Germany","user":"metauser","port":"8787"}'
+        Mock ssh {
+            return $jsonPayload
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'metauser' -Location 'REMOTE@10.0.0.1'
+        $state.ContainerName = 'impact-metauser'
+        $result = Read-RemoteContainerMetadata -State $state
+
+        $result | Should -Not -BeNullOrEmpty
+        $result.container | Should -Be 'impact-metauser'
+        $result.repo      | Should -Be 'IMPACTncd_Germany'
+        $result.user      | Should -Be 'metauser'
+        $result.port      | Should -Be '8787'
+    }
+
+    It 'Read-RemoteContainerMetadata returns null for LOCAL mode' {
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Read-RemoteContainerMetadata -State $state
+        $result | Should -BeNullOrEmpty
+    }
+
+    It 'Read-RemoteContainerMetadata returns null when SSH returns nothing' {
+        Mock ssh { return $null } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.1'
+        $state.ContainerName = 'impact-nobody'
+        $result = Read-RemoteContainerMetadata -State $state
+        $result | Should -BeNullOrEmpty
+    }
+
+    It 'Remove-RemoteContainerMetadata sends rm -f command via SSH' {
+        $script:sshCommands = @()
+        Mock ssh {
+            $script:sshCommands += ($args -join ' ')
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'metauser' -Location 'REMOTE@10.0.0.1'
+        $state.ContainerName = 'impact-metauser'
+        Remove-RemoteContainerMetadata -State $state
+
+        $script:sshCommands.Count | Should -BeGreaterThan 0
+        $script:sshCommands[-1] | Should -Match 'rm -f'
+        $script:sshCommands[-1] | Should -Match 'impact-metauser\.json'
+    }
+
+    It 'Remove-RemoteContainerMetadata is a no-op for LOCAL mode' {
+        $script:sshCommands = @()
+        Mock ssh {
+            $script:sshCommands += ($args -join ' ')
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'LOCAL'
+        Remove-RemoteContainerMetadata -State $state
+
+        $script:sshCommands.Count | Should -Be 0
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Test-RemoteSSHKeyFiles (mocked SSH)
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Test-RemoteSSHKeyFiles (mocked SSH)' -Tag Integration {
+    It 'Returns true for LOCAL mode (no remote check needed)' {
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Test-RemoteSSHKeyFiles -State $state
+        $result | Should -BeTrue
+    }
+
+    It 'Returns true when both key and known_hosts exist on remote' {
+        Mock ssh {
+            return 'OK'
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'sshuser' -Location 'REMOTE@10.0.0.5'
+        $result = Test-RemoteSSHKeyFiles -State $state
+        $result | Should -BeTrue
+    }
+
+    It 'Returns false when remote key check fails' {
+        $script:callCount = 0
+        Mock ssh {
+            $script:callCount++
+            if ($script:callCount -eq 1) { return '' }   # key missing
+            if ($script:callCount -eq 2) { return 'OK' }  # known_hosts present
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'sshuser' -Location 'REMOTE@10.0.0.5'
+        $result = Test-RemoteSSHKeyFiles -State $state
+        $result | Should -BeFalse
+    }
+
+    It 'Returns false when SSH connection itself fails' {
+        Mock ssh {
+            throw 'Connection refused'
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'sshuser' -Location 'REMOTE@10.0.0.5'
+        $result = Test-RemoteSSHKeyFiles -State $state
+        $result | Should -BeFalse
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Start-DockerDesktopIfNeeded (mocked)
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Start-DockerDesktopIfNeeded (mocked)' -Tag Integration {
+    It 'Returns true immediately when Docker daemon is already running' {
+        Mock docker {
+            # Simulate "docker info" succeeding
+            $global:LASTEXITCODE = 0
+            return 'Server: Docker Engine'
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $result = Start-DockerDesktopIfNeeded -TimeoutSeconds 2
+        $result | Should -BeTrue
+    }
+
+    It 'Returns false when Docker is unavailable and Docker Desktop not found' {
+        Mock docker {
+            $global:LASTEXITCODE = 1
+            throw 'Cannot connect to the Docker daemon'
+        } -ModuleName 'IMPACT_Docker_GUI'
+        Mock Test-Path { return $false } -ModuleName 'IMPACT_Docker_GUI'
+        Mock Start-Service {} -ModuleName 'IMPACT_Docker_GUI'
+        Mock Start-Sleep {} -ModuleName 'IMPACT_Docker_GUI'
+
+        $result = Start-DockerDesktopIfNeeded -TimeoutSeconds 1
+        $result | Should -BeFalse
+    }
+}
+
 # Save Integration test artifacts (TestResults XML)
 AfterAll {
     try {

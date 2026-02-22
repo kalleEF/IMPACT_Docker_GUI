@@ -745,6 +745,201 @@ Describe 'New-TestSessionState (helper)' -Tag Unit {
     }
 }
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Get-DockerCredentialsFromDotEnv — pure .env parser
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Get-DockerCredentialsFromDotEnv' -Tag Unit {
+    It 'Parses DOCKERHUB_USERNAME / DOCKERHUB_TOKEN pair' {
+        $env = @"
+DOCKERHUB_USERNAME=myuser
+DOCKERHUB_TOKEN=mytoken123
+"@
+        $result = Get-DockerCredentialsFromDotEnv -EnvContent $env
+        $result | Should -Not -BeNullOrEmpty
+        $result.Username | Should -Be 'myuser'
+        $result.Password | Should -Be 'mytoken123'
+        $result.Registry | Should -Be 'docker.io'
+        $result.Source   | Should -Be 'dotenv'
+    }
+
+    It 'Parses DOCKER_USERNAME / DOCKER_PASSWORD pair' {
+        $env = @"
+DOCKER_USERNAME=dockuser
+DOCKER_PASSWORD=dockpass
+"@
+        $result = Get-DockerCredentialsFromDotEnv -EnvContent $env
+        $result.Username | Should -Be 'dockuser'
+        $result.Password | Should -Be 'dockpass'
+        $result.Registry | Should -Be 'docker.io'
+    }
+
+    It 'Parses GHCR_USERNAME / GHCR_TOKEN pair with ghcr.io registry' {
+        $env = @"
+GHCR_USERNAME=ghuser
+GHCR_TOKEN=ghp_abc123
+"@
+        $result = Get-DockerCredentialsFromDotEnv -EnvContent $env
+        $result.Username | Should -Be 'ghuser'
+        $result.Password | Should -Be 'ghp_abc123'
+        $result.Registry | Should -Be 'ghcr.io'
+    }
+
+    It 'Prioritises DOCKERHUB over DOCKER_USERNAME' {
+        $env = @"
+DOCKERHUB_USERNAME=hubuser
+DOCKERHUB_TOKEN=hubtoken
+DOCKER_USERNAME=fallbackuser
+DOCKER_PASSWORD=fallbackpass
+"@
+        $result = Get-DockerCredentialsFromDotEnv -EnvContent $env
+        $result.Username | Should -Be 'hubuser'
+    }
+
+    It 'Strips single-quoted values' {
+        $env = "DOCKERHUB_USERNAME='quoteduser'`nDOCKERHUB_TOKEN='quotedtoken'"
+        $result = Get-DockerCredentialsFromDotEnv -EnvContent $env
+        $result.Username | Should -Be 'quoteduser'
+        $result.Password | Should -Be 'quotedtoken'
+    }
+
+    It 'Strips double-quoted values' {
+        $env = "DOCKERHUB_USERNAME=`"dquser`"`nDOCKERHUB_TOKEN=`"dqtoken`""
+        $result = Get-DockerCredentialsFromDotEnv -EnvContent $env
+        $result.Username | Should -Be 'dquser'
+        $result.Password | Should -Be 'dqtoken'
+    }
+
+    It 'Skips comment lines and blank lines' {
+        $env = @"
+# This is a comment
+DOCKERHUB_USERNAME=myuser
+
+# Another comment
+DOCKERHUB_TOKEN=mytoken
+"@
+        $result = Get-DockerCredentialsFromDotEnv -EnvContent $env
+        $result.Username | Should -Be 'myuser'
+        $result.Password | Should -Be 'mytoken'
+    }
+
+    It 'Returns null when no matching credential pair exists' {
+        $env = "SOME_OTHER_KEY=value"
+        $result = Get-DockerCredentialsFromDotEnv -EnvContent $env
+        $result | Should -BeNullOrEmpty
+    }
+
+    It 'Returns null for empty content' {
+        $result = Get-DockerCredentialsFromDotEnv -EnvContent ''
+        $result | Should -BeNullOrEmpty
+    }
+
+    It 'Returns null when EnvPath does not exist and no content given' {
+        $result = Get-DockerCredentialsFromDotEnv -EnvPath (Join-Path $env:TEMP 'nonexistent.env')
+        $result | Should -BeNullOrEmpty
+    }
+
+    It 'Reads from file when EnvPath is provided' {
+        $testFile = Join-Path $env:TEMP "impact_test_env_$([guid]::NewGuid().ToString('N').Substring(0,6)).env"
+        try {
+            Set-Content -Path $testFile -Value "DOCKERHUB_USERNAME=fileuser`nDOCKERHUB_TOKEN=filetoken"
+            $result = Get-DockerCredentialsFromDotEnv -EnvPath $testFile
+            $result.Username | Should -Be 'fileuser'
+            $result.Password | Should -Be 'filetoken'
+        } finally {
+            Remove-Item -Path $testFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Returns null when only username is present (no password key)' {
+        $env = "DOCKERHUB_USERNAME=orphanuser"
+        $result = Get-DockerCredentialsFromDotEnv -EnvContent $env
+        $result | Should -BeNullOrEmpty
+    }
+
+    It 'Handles values containing equals signs' {
+        $env = "DOCKERHUB_USERNAME=user`nDOCKERHUB_TOKEN=tok=en=with=equals"
+        $result = Get-DockerCredentialsFromDotEnv -EnvContent $env
+        $result.Password | Should -Be 'tok=en=with=equals'
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Initialize-Logging — log directory creation & rotation
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Initialize-Logging' -Tag Unit {
+    BeforeEach {
+        # Reset the module's internal LogInit flag so each test starts fresh.
+        # We re-import the module to reset module-scoped state.
+        $modulePath = Join-Path $PSScriptRoot '..' 'current_version' 'IMPACT_Docker_GUI.psm1'
+        Import-Module $modulePath -Force -DisableNameChecking
+
+        $script:testLogDir = Join-Path $env:TEMP "impact_log_test_$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        $script:testLogFile = Join-Path $script:testLogDir 'impact.log'
+    }
+
+    AfterEach {
+        # Clean environment override
+        $env:IMPACT_LOG_FILE = $null
+        $env:IMPACT_LOG_DISABLE = $null
+        Remove-Item -Recurse -Force $script:testLogDir -ErrorAction SilentlyContinue
+    }
+
+    It 'Creates log directory and log file when they do not exist' {
+        $env:IMPACT_LOG_FILE = $script:testLogFile
+        Initialize-Logging
+        Test-Path $script:testLogDir | Should -BeTrue
+        Test-Path $script:testLogFile | Should -BeTrue
+    }
+
+    It 'Log file contains a header line with INFO and log start' {
+        $env:IMPACT_LOG_FILE = $script:testLogFile
+        Initialize-Logging
+        $content = Get-Content $script:testLogFile -Raw
+        $content | Should -Match '\[INFO\].*log start'
+    }
+
+    It 'Rotates log file when it exceeds 512KB' {
+        $env:IMPACT_LOG_FILE = $script:testLogFile
+        # Pre-create a log file larger than 512KB
+        New-Item -ItemType Directory -Path $script:testLogDir -Force | Out-Null
+        $bigContent = 'X' * (513 * 1024)
+        Set-Content -Path $script:testLogFile -Value $bigContent
+
+        Initialize-Logging
+
+        # The old file should be rotated to .log.1
+        Test-Path "$($script:testLogFile).1" | Should -BeTrue
+    }
+
+    It 'Does nothing when IMPACT_LOG_DISABLE is set' {
+        $env:IMPACT_LOG_FILE = $script:testLogFile
+        $env:IMPACT_LOG_DISABLE = '1'
+        Initialize-Logging
+        # Log file should NOT be created when logging is disabled
+        Test-Path $script:testLogFile | Should -BeFalse
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Ensure-PowerShell7 — guard logic
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Ensure-PowerShell7' -Tag Unit {
+    It 'Returns without error when running under PowerShell 7+' {
+        # This test only runs in PS7+ (which our test runner always uses)
+        if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7) {
+            Set-ItResult -Skipped -Because 'Test requires PowerShell 7+'
+        }
+        { Ensure-PowerShell7 } | Should -Not -Throw
+    }
+
+    It 'Accepts the PS7RequestedFlag parameter without error' {
+        if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7) {
+            Set-ItResult -Skipped -Because 'Test requires PowerShell 7+'
+        }
+        { Ensure-PowerShell7 -PS7RequestedFlag $true } | Should -Not -Throw
+    }
+}
+
 # Save Unit test artifacts (TestResults XML)
 AfterAll {
     try {
