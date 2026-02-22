@@ -194,11 +194,14 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
             return
         }
 
-        # ── 7. Fix SSH key + generate known_hosts inside container ─────────
-        #   Generate known_hosts INSIDE the container to avoid Windows
+        # ── 7. Fix ownership, SSH key, and known_hosts inside container ────
+        #   On CI (Ubuntu), the repo is cloned by the runner user (UID 1001)
+        #   but the container runs as rstudio (UID 1000).  Bind-mounted dirs
+        #   keep the host UID, so rstudio can't write to them.  Fix with chown.
+        #   Also generate known_hosts INSIDE the container to avoid Windows
         #   encoding issues (CRLF, BOM) from host-side ssh-keyscan.
         Start-Sleep -Seconds 2
-        $fixCmd = "mkdir -p /home/rstudio/.ssh && cp /keys/id_ed25519_$($script:TEST_USER) $containerKeyPath && chmod 600 $containerKeyPath && chown 1000:1000 $containerKeyPath && ssh-keyscan -t ed25519 github.com > /etc/ssh/ssh_known_hosts 2>/dev/null && cp /etc/ssh/ssh_known_hosts /home/rstudio/.ssh/known_hosts 2>/dev/null; chmod 644 /home/rstudio/.ssh/known_hosts 2>/dev/null; chown 1000:1000 /home/rstudio/.ssh/known_hosts 2>/dev/null; echo KEY_FIXED"
+        $fixCmd = "chown -R 1000:1000 /home/rstudio/$($script:REPO_NAME) && mkdir -p /home/rstudio/.ssh && cp /keys/id_ed25519_$($script:TEST_USER) $containerKeyPath && chmod 600 $containerKeyPath && chown 1000:1000 $containerKeyPath && ssh-keyscan -t ed25519 github.com > /etc/ssh/ssh_known_hosts 2>/dev/null && cp /etc/ssh/ssh_known_hosts /home/rstudio/.ssh/known_hosts 2>/dev/null; chmod 644 /home/rstudio/.ssh/known_hosts 2>/dev/null; chown 1000:1000 /home/rstudio/.ssh/known_hosts 2>/dev/null; echo KEY_FIXED"
         $fixArgs = @('exec', $script:CONTAINER_NAME, 'sh', '-c', $fixCmd)
         $fixOut = docker @fixArgs 2>&1
         if (($fixOut -join '') -notmatch 'KEY_FIXED') {
