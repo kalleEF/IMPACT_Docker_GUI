@@ -34,7 +34,7 @@ Describe 'Show-CredentialDialog in NonInteractive mode' -Tag Integration {
         $state = New-TestSessionState -UserName 'ciuser' -Password 'CIpass99!'
         # In NonInteractive mode, Show-CredentialDialog should read from pre-set state
         $result = Show-CredentialDialog -State $state
-        $result | Should -BeTrue
+        $result | Should -Be 'next'
         $state.UserName | Should -Be 'ciuser'
         $state.Password | Should -Be 'CIpass99!'
     }
@@ -43,7 +43,7 @@ Describe 'Show-CredentialDialog in NonInteractive mode' -Tag Integration {
         $state = New-TestSessionState -UserName '' -Password 'CIpass99!'
         $state.UserName = ''
         $result = Show-CredentialDialog -State $state
-        $result | Should -BeFalse
+        $result | Should -Be 'cancel'
     }
 }
 
@@ -61,14 +61,14 @@ Describe 'Select-Location in NonInteractive mode' -Tag Integration {
     It 'Reads LOCAL location from pre-set state' {
         $state = New-TestSessionState -Location 'LOCAL'
         $result = Select-Location -State $state
-        $result | Should -BeTrue
+        $result | Should -Be 'next'
         $state.ContainerLocation | Should -Be 'LOCAL'
     }
 
     It 'Reads REMOTE location from pre-set state' {
         $state = New-TestSessionState -Location 'REMOTE@10.0.0.5'
         $result = Select-Location -State $state
-        $result | Should -BeTrue
+        $result | Should -Be 'next'
         $state.ContainerLocation | Should -Be 'REMOTE@10.0.0.5'
     }
 }
@@ -853,7 +853,7 @@ Describe 'Show-CredentialDialog NonInteractive with GitHub validation' -Tag Inte
 
         $state = New-TestSessionState -UserName 'testuser' -Password 'pass123'
         $result = Show-CredentialDialog -State $state
-        $result | Should -BeTrue
+        $result | Should -Be 'next'
         $state.UserName | Should -Be 'testuser'
     }
 
@@ -869,13 +869,13 @@ Describe 'Show-CredentialDialog NonInteractive with GitHub validation' -Tag Inte
 
         $state = New-TestSessionState -UserName 'bogus-nonexistent-xyz' -Password 'pass123'
         $result = Show-CredentialDialog -State $state
-        $result | Should -BeFalse
+        $result | Should -Be 'cancel'
     }
 
     It 'Fails when UserName is not pre-set' {
         $state = New-TestSessionState -UserName '' -Password 'pass123'
         $result = Show-CredentialDialog -State $state
-        $result | Should -BeFalse
+        $result | Should -Be 'cancel'
     }
 
     It 'Normalizes username to lowercase before validation' {
@@ -885,7 +885,7 @@ Describe 'Show-CredentialDialog NonInteractive with GitHub validation' -Tag Inte
 
         $state = New-TestSessionState -UserName 'MixedCase' -Password 'pass123'
         $result = Show-CredentialDialog -State $state
-        $result | Should -BeTrue
+        $result | Should -Be 'next'
         $state.UserName | Should -Be 'mixedcase'
 
         Should -Invoke Invoke-RestMethod -ModuleName 'IMPACT_Docker_GUI' -Times 1 -ParameterFilter {

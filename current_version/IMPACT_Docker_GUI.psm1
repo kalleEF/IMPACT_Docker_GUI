@@ -1004,14 +1004,14 @@ function Show-CredentialDialog {
         Write-Log 'NonInteractive: using pre-set credentials from State.' 'Info'
         if (-not $State.UserName -or -not $State.Password) {
             Write-Log 'NonInteractive: UserName/Password not pre-set on state.' 'Error'
-            return $false
+            return 'cancel'
         }
         $State.UserName = ($State.UserName -replace '\s+', '').ToLower()
         if (-not (Test-GitHubUsername -UserName $State.UserName)) {
             Write-Log "NonInteractive: '$($State.UserName)' is not a valid GitHub username." 'Error'
-            return $false
+            return 'cancel'
         }
-        return $true
+        return 'next'
     }
 
     Write-Log 'Collecting credentials - opening dialog.' 'Info'
@@ -1095,7 +1095,7 @@ function Show-CredentialDialog {
     Write-Log "Credential dialog result: $result" 'Debug'
     if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
         Write-Log 'User cancelled the credential dialog.' 'Warn'
-        return $false
+        return 'cancel'
     }
 
     $originalUsername = $textUser.Text.Trim()
@@ -1103,7 +1103,7 @@ function Show-CredentialDialog {
     if ([string]::IsNullOrWhiteSpace($normalizedUsername)) {
         [System.Windows.Forms.MessageBox]::Show('Username cannot be empty after removing spaces.', 'Invalid Username', 'OK', 'Error') | Out-Null
         Write-Log 'Username empty after normalization; aborting.' 'Error'
-        return $false
+        return 'cancel'
     }
 
     # Validate that the username is a real GitHub account
@@ -1113,14 +1113,14 @@ function Show-CredentialDialog {
             "The username '$normalizedUsername' was not found on GitHub.`n`nPlease enter your GitHub username (the one you log in to github.com with).",
             'Invalid GitHub Username', 'OK', 'Warning') | Out-Null
         Write-Log "GitHub username validation failed for '$normalizedUsername'; aborting." 'Warn'
-        return $false
+        return 'cancel'
     }
 
     $State.UserName = $normalizedUsername
     $State.Password = $textPass.Text
 
     Write-Log "Credentials collected for user $($State.UserName)" 'Info'
-    return $true
+    return 'next'
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1508,26 +1508,26 @@ function Select-Location {
         Write-Log 'NonInteractive: using pre-set ContainerLocation from State.' 'Info'
         if (-not $State.ContainerLocation) {
             Write-Log 'NonInteractive: ContainerLocation not pre-set on state.' 'Error'
-            return $false
+            return 'cancel'
         }
         if ($State.ContainerLocation -like 'REMOTE@*') {
             if (-not $State.RemoteHostIp) {
                 Write-Log 'NonInteractive: RemoteHostIp not pre-set for remote mode.' 'Error'
-                return $false
+                return 'cancel'
             }
             $State.RemoteHost = "$($State.RemoteUser)@$($State.RemoteHostIp)"
             $State.RemoteRepoBase = if ($State.RemoteRepoBase) { $State.RemoteRepoBase } else { "/home/$($State.RemoteUser)/Schreibtisch/Repositories" }
         } else {
             $State.RemoteRepoBase = "/home/$($State.RemoteUser)/Schreibtisch/Repositories"
         }
-        return $true
+        return 'next'
     }
 
     Write-Log 'Opening container location selection dialog.' 'Info'
 
     $formConnection = New-Object System.Windows.Forms.Form -Property @{
         Text = 'Container Location - IMPACT NCD Germany'
-        Size = New-Object System.Drawing.Size(480,260)
+        Size = New-Object System.Drawing.Size(480,300)
         Location = New-Object System.Drawing.Point(400,300)
         FormBorderStyle = 'FixedDialog'
         MaximizeBox = $false
@@ -1591,6 +1591,16 @@ function Select-Location {
     Style-CheckBox -CheckBox $checkBoxDebug
     $formConnection.Controls.Add($checkBoxDebug)
 
+    $buttonBack = New-Object System.Windows.Forms.Button -Property @{ Text = [char]0x2190 + ' Back'; Location = New-Object System.Drawing.Point(20,218); Size = New-Object System.Drawing.Size(100,32) }
+    Style-Button -Button $buttonBack -Variant 'secondary'
+    $formConnection.Controls.Add($buttonBack)
+
+    $buttonBack.Add_Click({
+        $formConnection.Tag = 'back'
+        $formConnection.DialogResult = [System.Windows.Forms.DialogResult]::Abort
+        $formConnection.Close()
+    })
+
     $State.ContainerLocation = $null
 
     $buttonLocal.Add_Click({
@@ -1628,11 +1638,15 @@ function Select-Location {
 
     $result = $formConnection.ShowDialog()
     if ($result -eq [System.Windows.Forms.DialogResult]::Yes -or $result -eq [System.Windows.Forms.DialogResult]::No) {
-        return $true
+        return 'next'
+    }
+    if ($formConnection.Tag -eq 'back') {
+        Write-Log 'User navigated back from location dialog.' 'Info'
+        return 'back'
     }
 
     Write-Log 'No container location selected.' 'Warn'
-    return $false
+    return 'cancel'
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
