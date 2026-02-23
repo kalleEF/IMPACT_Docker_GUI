@@ -940,16 +940,30 @@ function Show-ContainerManager {
     Style-Label -Label $lblFooter -Muted:$true
     $form.Controls.Add($lblFooter)
 
+    $btnBack = New-Object System.Windows.Forms.Button -Property @{ Text=[char]0x2190 + ' Back'; Location=New-Object System.Drawing.Point(12,374); Size=New-Object System.Drawing.Size(100,34) }
+    Style-Button -Button $btnBack -Variant 'secondary'
+    $form.Controls.Add($btnBack)
+
     $btnClose = New-Object System.Windows.Forms.Button -Property @{ Text='Close'; Location=New-Object System.Drawing.Point(414,374); Size=New-Object System.Drawing.Size(90,34) }
     Style-Button -Button $btnClose -Variant 'secondary'
     $form.Controls.Add($btnClose)
-    $form.AcceptButton = $btnClose
     $form.CancelButton = $btnClose
+
+    $btnBack.Add_Click({
+        if ($State.Metadata.ContainerRunning) {
+            [System.Windows.Forms.MessageBox]::Show('Please stop the container before going back.','Container running','OK','Warning') | Out-Null
+            return
+        }
+        $form.Tag = 'back'
+        $form.Close()
+    })
 
     $form.Add_FormClosing({
         if ($State.Metadata.ContainerRunning) {
-            $answer = [System.Windows.Forms.MessageBox]::Show('A container is still running. Close without stopping?','Container running','YesNo','Warning')
-            if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { $_.Cancel = $true }
+            if ($form.Tag -ne 'back') {
+                $answer = [System.Windows.Forms.MessageBox]::Show('A container is still running. Close without stopping?','Container running','YesNo','Warning')
+                if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { $_.Cancel = $true }
+            }
         }
     })
 
@@ -1426,6 +1440,11 @@ function Show-ContainerManager {
     $btnClose.Add_Click({ $form.Close() })
 
     $null = $form.ShowDialog()
+    if ($form.Tag -eq 'back') {
+        Write-Log 'User navigated back from container manager.' 'Info'
+        return 'back'
+    }
+    return 'close'
 }
 
 # Coordinator: orchestrates all steps with clear sequencing and early validation.
@@ -1438,22 +1457,50 @@ function Invoke-ImpactGui {
     $bi = $state.Metadata.BuildInfo
     Write-Log ("Build info -> Version={0} Commit={1} Built={2}" -f $bi.Version, $bi.Commit, $bi.Built) 'Info'
 
-    if (-not (Ensure-Prerequisites -State $state)) { return }
-    if (-not (Show-CredentialDialog -State $state)) { return }
-    if (-not (Ensure-GitKeySetup -State $state)) { return }
-    if (-not (Select-Location -State $state)) { return }
-
-    if ($state.ContainerLocation -like 'REMOTE@*') {
-           if (-not (Ensure-RemotePreparation -State $state)) { return }
-    } elseif ($state.ContainerLocation -eq 'LOCAL') {
-        if (-not (Ensure-LocalPreparation -State $state)) { return }
-    } else {
-        Write-Log "No container location selected; exiting." 'Warn'
-        return
+    # Step-based wizard loop: allows Back navigation between dialogs
+    $step = 1
+    while ($step -le 6) {
+        switch ($step) {
+            1 { # Prerequisites (automated — no back)
+                if (-not (Ensure-Prerequisites -State $state)) { return }
+                $step++
+            }
+            2 { # Credentials dialog
+                $r = Show-CredentialDialog -State $state
+                if ($r -eq 'next') { $step++ }
+                else { return } # cancel or failure — exit
+            }
+            3 { # SSH key setup (automated — no back)
+                if (-not (Ensure-GitKeySetup -State $state)) { return }
+                $step++
+            }
+            4 { # Location selection dialog
+                $r = Select-Location -State $state
+                if ($r -eq 'next') { $step++ }
+                elseif ($r -eq 'back') { $step = 2 } # back to credentials
+                else { return } # cancel — exit
+            }
+            5 { # Preparation (local/remote)
+                $prepOk = $false
+                if ($state.ContainerLocation -like 'REMOTE@*') {
+                    $prepOk = Ensure-RemotePreparation -State $state
+                } elseif ($state.ContainerLocation -eq 'LOCAL') {
+                    $prepOk = Ensure-LocalPreparation -State $state
+                } else {
+                    Write-Log "No container location selected; exiting." 'Warn'
+                    return
+                }
+                if ($prepOk) { $step++ }
+                else { $step = 4 } # cancelled/failed — back to location
+            }
+            6 { # Container manager
+                Get-ContainerStatus -State $state
+                $mgr = Show-ContainerManager -State $state
+                if ($mgr -eq 'back') { $step = 4 } # back to location selection
+                else { $step++ } # close — exit loop
+            }
+        }
     }
-
-    Get-ContainerStatus -State $state
-    Show-ContainerManager -State $state
 }
 
 try {
