@@ -67,18 +67,11 @@ jobs:
           Invoke-Pester -Configuration $config
 
       - name: Upload Test Results
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-unit
           path: tests/TestResults-Unit.xml
-
-      - name: Upload test artifacts (unit)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: unit-artifacts
-          path: tests/artifacts/unit/**
 
   # ─────────────────────────────────────────────────────────────────────────
   #  Integration tests - Windows (needs WinForms, mocked Docker/SSH)
@@ -116,18 +109,11 @@ jobs:
           Invoke-Pester -Configuration $config
 
       - name: Upload Test Results
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-integration
           path: tests/TestResults-Integration.xml
-
-      - name: Upload test artifacts (integration)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: integration-artifacts
-          path: tests/artifacts/integration/**
 
   # ─────────────────────────────────────────────────────────────────────────
   #  Docker SSH tests - Ubuntu (needs Linux containers for SSHD)
@@ -196,18 +182,11 @@ jobs:
           rm -rf /tmp/test_ssh
 
       - name: Upload Test Results
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-docker-ssh
           path: tests/TestResults-DockerSsh.xml
-
-      - name: Upload test artifacts (docker-ssh)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-ssh-artifacts
-          path: tests/artifacts/docker-ssh/**
 
   # ─────────────────────────────────────────────────────────────────────────
   #  Image validation - Ubuntu (builds real IMPACT image, validates container)
@@ -265,18 +244,11 @@ jobs:
           Invoke-Pester -Configuration $config
 
       - name: Upload Test Results
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-image-validation
           path: tests/TestResults-ImageValidation.xml
-
-      - name: Upload test artifacts (image-validation)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: image-validation-artifacts
-          path: tests/artifacts/image-validation/**
 
       - name: Collect diagnostic artifacts (image-validation)
         if: failure()
@@ -437,7 +409,7 @@ jobs:
           rm -rf /tmp/remote_e2e_ssh
 
       - name: Upload Test Results
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-remote-e2e

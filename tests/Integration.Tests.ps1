@@ -27,6 +27,10 @@ Describe 'Show-CredentialDialog in NonInteractive mode' -Tag Integration {
     }
 
     It 'Reads credentials from pre-set state values' {
+        Mock Invoke-RestMethod {
+            return @{ login = 'ciuser'; id = 1 }
+        } -ModuleName 'IMPACT_Docker_GUI'
+
         $state = New-TestSessionState -UserName 'ciuser' -Password 'CIpass99!'
         # In NonInteractive mode, Show-CredentialDialog should read from pre-set state
         $result = Show-CredentialDialog -State $state
@@ -831,12 +835,63 @@ Describe 'Start-DockerDesktopIfNeeded (mocked)' -Tag Integration {
     }
 }
 
-# Save Integration test artifacts (TestResults XML)
-AfterAll {
-    try {
-        if (-not (Get-Command -Name Save-TestArtifacts -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'Helpers' 'TestSessionState.ps1') }
-        Save-TestArtifacts -Suite 'integration' -ExtraFiles @('./tests/TestResults-Integration.xml')
-    } catch {
-        Write-Warning "Failed to save integration test artifacts: $($_.Exception.Message)"
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Show-CredentialDialog — NonInteractive with GitHub username validation
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Show-CredentialDialog NonInteractive with GitHub validation' -Tag Integration {
+    BeforeEach {
+        Enable-NonInteractiveMode
+    }
+    AfterEach {
+        Disable-NonInteractiveMode
+    }
+
+    It 'Succeeds when GitHub username is valid' {
+        Mock Invoke-RestMethod {
+            return @{ login = 'testuser'; id = 42 }
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'testuser' -Password 'pass123'
+        $result = Show-CredentialDialog -State $state
+        $result | Should -BeTrue
+        $state.UserName | Should -Be 'testuser'
+    }
+
+    It 'Fails when GitHub username does not exist' {
+        Mock Invoke-RestMethod {
+            $resp = New-Object System.Net.Http.HttpResponseMessage
+            $resp.StatusCode = [System.Net.HttpStatusCode]::NotFound
+            $exception = [Microsoft.PowerShell.Commands.HttpResponseException]::new("404", $resp)
+            throw ([System.Management.Automation.ErrorRecord]::new(
+                $exception, 'WebCmdletWebResponseException',
+                [System.Management.Automation.ErrorCategory]::InvalidOperation, $null))
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'bogus-nonexistent-xyz' -Password 'pass123'
+        $result = Show-CredentialDialog -State $state
+        $result | Should -BeFalse
+    }
+
+    It 'Fails when UserName is not pre-set' {
+        $state = New-TestSessionState -UserName '' -Password 'pass123'
+        $result = Show-CredentialDialog -State $state
+        $result | Should -BeFalse
+    }
+
+    It 'Normalizes username to lowercase before validation' {
+        Mock Invoke-RestMethod {
+            return @{ login = 'mixedcase'; id = 99 }
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'MixedCase' -Password 'pass123'
+        $result = Show-CredentialDialog -State $state
+        $result | Should -BeTrue
+        $state.UserName | Should -Be 'mixedcase'
+
+        Should -Invoke Invoke-RestMethod -ModuleName 'IMPACT_Docker_GUI' -Times 1 -ParameterFilter {
+            $Uri -eq 'https://api.github.com/users/mixedcase'
+        }
     }
 }
+
+# Artifact persistence is handled by Invoke-Tests.ps1 (only on failure/skip).

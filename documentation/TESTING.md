@@ -48,8 +48,8 @@ There are five test suites arranged in cumulative levels:
 
 | Level | File | Tag | Tests | What it covers | CI Runner | External deps |
 |---|---|---|---|---|---|---|
-| 1 | `tests/Unit.Tests.ps1` | `Unit` | 65 | Pure-logic functions: path conversion, `New-SessionState`, `Get-RemoteHostString`, `Get-DockerContextArgs`, `Get-YamlPathValue`, `Build-DockerRunCommand`, SSH config, theme palette, NonInteractive mode | **Windows** | None |
-| 2 | `tests/Integration.Tests.ps1` | `Integration` | 25 | Mocked multi-function flows: credential dialogs, Docker daemon checks, SSH agent, logging, GitHub API key management, remote container flow (YAML → path → `docker run`) | **Windows** | None (all mocked) |
+| 1 | `tests/Unit.Tests.ps1` | `Unit` | 89 | Pure-logic functions: path conversion, `New-SessionState`, `Get-RemoteHostString`, `Get-DockerContextArgs`, `Get-YamlPathValue`, `Build-DockerRunCommand`, SSH config, theme palette, NonInteractive mode, `.env` credential parsing, logging init, PS7 guard, GitHub username validation | **Windows** | None |
+| 2 | `tests/Integration.Tests.ps1` | `Integration` | 49 | Mocked multi-function flows: credential dialogs with GitHub validation, Docker daemon checks, SSH agent, logging, GitHub API key management, remote container flow (YAML → path → `docker run`), git repository state, git change detection, remote container metadata, remote SSH key checks, Docker Desktop startup | **Windows** | None (all mocked) |
 | 3 | `tests/DockerSsh.Tests.ps1` | `DockerSsh` | 6 | Live SSH connectivity against SSHD container: remote command execution, metadata read/write, directory creation | **Ubuntu** | Docker, SSHD container |
 | 4 | `tests/ImageValidation.Tests.ps1` | `ImageValidation` | ~14 | Docker image validation: build IMPACT image, start container, check RStudio, R environment, `global.R`, Git/SSH config, GitHub SSH auth | **Ubuntu** | Docker, Internet |
 | 5 | `tests/RemoteE2E.Tests.ps1` | `RemoteE2E` | ~11 | Full SSH→Docker flow: SSH into workstation container → clone repo → build image → start IMPACT container → validate RStudio + `global.R` + `git pull` through SSH tunnel | **Ubuntu** | Docker, Internet, DooD socket |

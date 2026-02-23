@@ -316,19 +316,7 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
     AfterAll {
         if ($script:SkipTests) { return }
 
-        # Save artifacts
-        try {
-            $localPaths = @()
-            if ($env:IMPACT_REMOTE_E2E_SSH_KEY -and (Test-Path $env:IMPACT_REMOTE_E2E_SSH_KEY)) {
-                $localPaths += $env:IMPACT_REMOTE_E2E_SSH_KEY
-            }
-            Save-TestArtifacts -Suite 'remote-e2e' -Paths $localPaths `
-                -ExtraFiles @("$PSScriptRoot/TestResults-RemoteE2E.xml") `
-                -ContainerNames @('impact_remote_e2e_inner','workstation-test')
-        } catch {
-            Write-Warning "Failed to save remote-e2e artifacts: $($_.Exception.Message)"
-        }
-
+        # Artifact persistence is handled by Invoke-Tests.ps1 (only on failure/skip).
         Write-Host '[RemoteE2E] Cleaning up ...' -ForegroundColor Cyan
         Invoke-WsSshCommand "docker stop $($script:INNER_CONTAINER) 2>/dev/null; docker rm $($script:INNER_CONTAINER) 2>/dev/null" | Out-Null
 

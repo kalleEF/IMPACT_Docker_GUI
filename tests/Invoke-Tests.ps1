@@ -426,19 +426,52 @@ if ($script:cleanupWorkstation) {
     $env:DOCKER_CONTEXT = $savedCtx
 }
 
-# ── Persist test artifacts ────────────────────────────────────────────────────
-try {
-    $resultFiles = Get-ChildItem -Path "$PSScriptRoot/TestResults*.xml" -ErrorAction SilentlyContinue
-    foreach ($f in $resultFiles) {
-        if ($f.BaseName -match '^TestResults-(.+)$') {
-            $suiteName = $matches[1].ToLower()
-        } else {
-            $suiteName = 'general'
-        }
-        Save-TestArtifacts -Suite $suiteName -ExtraFiles @($f.FullName)
+# ── Persist test artifacts (only when failures/skips occurred) ────────────────
+# Map Pester suite names to consistent hyphenated artifact folder names.
+$suiteArtifactName = @{
+    'Unit'            = 'unit'
+    'Integration'     = 'integration'
+    'DockerSsh'       = 'docker-ssh'
+    'ImageValidation' = 'image-validation'
+    'RemoteE2E'       = 'remote-e2e'
+}
+# Container names to collect logs from for Docker-based suites.
+$suiteContainers = @{
+    'DockerSsh'       = @('sshd-test')
+    'ImageValidation' = @('impact_imgval_test_container')
+    'RemoteE2E'       = @('impact_remote_e2e_inner','workstation-test')
+}
+
+foreach ($res in $results) {
+    $artifactName = $suiteArtifactName[$res.Suite]
+    if (-not $artifactName) { $artifactName = $res.Suite.ToLower() }
+
+    $xmlPath = Join-Path $PSScriptRoot "TestResults-$($res.Suite).xml"
+    $extraFiles = @()
+    if (Test-Path $xmlPath) { $extraFiles += $xmlPath }
+
+    $containers = @()
+    if ($suiteContainers.ContainsKey($res.Suite)) { $containers = $suiteContainers[$res.Suite] }
+
+    try {
+        Save-TestArtifacts -Suite $artifactName `
+            -ExtraFiles $extraFiles `
+            -ContainerNames $containers `
+            -FailedCount $res.Failed `
+            -SkippedCount $res.Skipped
+    } catch {
+        Write-Warning "Failed to persist artifacts for $($res.Suite): $($_.Exception.Message)"
     }
-} catch {
-    Write-Warning "Failed to persist test results: $($_.Exception.Message)"
+}
+
+# ── Clean up XML result files from tests/ root ────────────────────────────────
+# These are transient build outputs — the artifacts folder preserves them on failure.
+$xmlFiles = Get-ChildItem -Path "$PSScriptRoot/TestResults-*.xml" -ErrorAction SilentlyContinue
+foreach ($f in $xmlFiles) {
+    Remove-Item -Path $f.FullName -Force -ErrorAction SilentlyContinue
+}
+if ($xmlFiles.Count -gt 0) {
+    Write-Host "  Cleaned up $($xmlFiles.Count) TestResults XML file(s) from tests/." -ForegroundColor DarkGray
 }
 
 # ── Summary ───────────────────────────────────────────────────────────────────

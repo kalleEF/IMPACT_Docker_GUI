@@ -103,6 +103,7 @@ function Test-IsSshKeyUsable {
 function Save-TestArtifacts {
     <#
     .SYNOPSIS  Save test-related artifacts to `tests/artifacts/<suite>/<timestamp>/`.
+               By default, only saves when tests failed or were skipped.
     .PARAMETER Suite
         Logical suite name (e.g. 'image-validation').
     .PARAMETER Paths
@@ -111,13 +112,26 @@ function Save-TestArtifacts {
         Additional files to copy (e.g. TestResults XML).
     .PARAMETER ContainerNames
         Docker container names to collect logs/inspect for (if docker available).
+    .PARAMETER FailedCount
+        Number of failed tests.  When both FailedCount and SkippedCount are 0,
+        artifacts are NOT saved (clean run).  Omit or set -1 to always save.
+    .PARAMETER SkippedCount
+        Number of skipped tests.  See FailedCount.
     #>
     param(
         [string]$Suite,
         [string[]]$Paths = @(),
         [string[]]$ExtraFiles = @(),
-        [string[]]$ContainerNames = @()
+        [string[]]$ContainerNames = @(),
+        [int]$FailedCount  = -1,
+        [int]$SkippedCount = -1
     )
+
+    # If explicit counts were provided and everything passed, skip saving.
+    if ($FailedCount -ge 0 -and $SkippedCount -ge 0 -and $FailedCount -eq 0 -and $SkippedCount -eq 0) {
+        Write-Host "  Artifacts skipped for '$Suite' (all tests passed)." -ForegroundColor DarkGray
+        return $null
+    }
 
     try {
         $artifactRoot = Join-Path $PSScriptRoot '..' 'artifacts'
@@ -158,11 +172,14 @@ function Save-TestArtifacts {
             Machine    = $env:COMPUTERNAME
             PWD        = (Get-Location).Path
             PowerShell = $PSVersionTable.PSVersion.ToString()
+            Failed     = if ($FailedCount -ge 0) { $FailedCount } else { 'n/a' }
+            Skipped    = if ($SkippedCount -ge 0) { $SkippedCount } else { 'n/a' }
         }
         $envInfoArray = $envInfo.GetEnumerator() | ForEach-Object { "{0} = {1}" -f $_.Key, $_.Value }
         $envInfoString = [string]::Join("`n", $envInfoArray)
         $envInfoString | Out-File -FilePath (Join-Path $runDir 'environment.txt') -Encoding utf8 -Force
 
+        Write-Host "  Artifacts saved for '$Suite' to $runDir" -ForegroundColor Yellow
         return $runDir
     } catch {
         Write-Warning "Save-TestArtifacts failed: $($_.Exception.Message)"

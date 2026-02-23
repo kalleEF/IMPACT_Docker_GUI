@@ -223,21 +223,7 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
     }
 
     AfterAll {
-        # Save artifacts
-        try {
-            if (-not (Get-Command -Name Save-TestArtifacts -ErrorAction SilentlyContinue)) {
-                . (Join-Path $PSScriptRoot 'Helpers' 'TestSessionState.ps1')
-            }
-            $localPaths = @()
-            if ($script:cloneRoot -and (Test-Path $script:cloneRoot)) { $localPaths += $script:cloneRoot }
-            if ($script:sshDir   -and (Test-Path $script:sshDir))    { $localPaths += $script:sshDir }
-            Save-TestArtifacts -Suite 'image-validation' -Paths $localPaths `
-                -ExtraFiles @("$PSScriptRoot/TestResults-ImageValidation.xml") `
-                -ContainerNames @($script:CONTAINER_NAME)
-        } catch {
-            Write-Warning "Failed to save image-validation artifacts: $($_.Exception.Message)"
-        }
-
+        # Artifact persistence is handled by Invoke-Tests.ps1 (only on failure/skip).
         Write-Host '[ImageVal] Cleaning up ...' -ForegroundColor Cyan
         docker stop $script:CONTAINER_NAME 2>$null | Out-Null
         docker rm   $script:CONTAINER_NAME 2>$null | Out-Null

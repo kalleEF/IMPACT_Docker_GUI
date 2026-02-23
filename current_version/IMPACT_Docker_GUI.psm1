@@ -1007,6 +1007,10 @@ function Show-CredentialDialog {
             return $false
         }
         $State.UserName = ($State.UserName -replace '\s+', '').ToLower()
+        if (-not (Test-GitHubUsername -UserName $State.UserName)) {
+            Write-Log "NonInteractive: '$($State.UserName)' is not a valid GitHub username." 'Error'
+            return $false
+        }
         return $true
     }
 
@@ -1032,17 +1036,17 @@ function Show-CredentialDialog {
         ScrollBars = 'None'
     }
     $rtbInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 9, [System.Drawing.FontStyle]::Bold)
-    $rtbInstruction.AppendText('Please enter a username and a password!')
+    $rtbInstruction.AppendText('Please enter your GitHub username and a password!')
     $rtbInstruction.AppendText("`n`n")
     $rtbInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 9, [System.Drawing.FontStyle]::Bold)
     $rtbInstruction.SelectionColor = [System.Drawing.Color]::DarkRed
     $rtbInstruction.AppendText('Important:')
     $rtbInstruction.SelectionColor = [System.Drawing.Color]::Black
     $rtbInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 9, [System.Drawing.FontStyle]::Regular)
-    $rtbInstruction.AppendText("`nThe username will be used for an SSH key and for container management.`nThe password will be used to login to your RStudio Server session.`n`n")
+    $rtbInstruction.AppendText("`nThe username must be your GitHub username. It is used for SSH key generation, git identity inside the container, and container management.`nThe password will be used to login to your RStudio Server session.`n`n")
     $rtbInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 8, [System.Drawing.FontStyle]::Regular)
     $rtbInstruction.SelectionColor = [System.Drawing.Color]::DarkGray
-    $rtbInstruction.AppendText('(Username will be normalized: spaces removed, lowercase)')
+    $rtbInstruction.AppendText('(Username will be validated against GitHub and normalized to lowercase)')
     Style-InfoBox -Box $rtbInstruction
     $form.Controls.Add($rtbInstruction)
 
@@ -1099,6 +1103,16 @@ function Show-CredentialDialog {
     if ([string]::IsNullOrWhiteSpace($normalizedUsername)) {
         [System.Windows.Forms.MessageBox]::Show('Username cannot be empty after removing spaces.', 'Invalid Username', 'OK', 'Error') | Out-Null
         Write-Log 'Username empty after normalization; aborting.' 'Error'
+        return $false
+    }
+
+    # Validate that the username is a real GitHub account
+    Write-Log "Validating GitHub username '$normalizedUsername'..." 'Info'
+    if (-not (Test-GitHubUsername -UserName $normalizedUsername)) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "The username '$normalizedUsername' was not found on GitHub.`n`nPlease enter your GitHub username (the one you log in to github.com with).",
+            'Invalid GitHub Username', 'OK', 'Warning') | Out-Null
+        Write-Log "GitHub username validation failed for '$normalizedUsername'; aborting." 'Warn'
         return $false
     }
 
@@ -1775,6 +1789,31 @@ function Remove-GitHubSshKey {
     Write-Log "GitHub SSH key id=$KeyId removed." 'Info'
 }
 
+<#
+.SYNOPSIS  Check whether a GitHub username exists via the public API.
+.PARAMETER UserName  The GitHub username to validate.
+.OUTPUTS   $true if the GitHub user exists, $false otherwise.
+#>
+function Test-GitHubUsername {
+    param([Parameter(Mandatory)][string]$UserName)
+    Write-Log "Validating GitHub username '$UserName'" 'Info'
+    try {
+        $headers = @{ Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+        $null = Invoke-RestMethod -Uri "https://api.github.com/users/$UserName" -Method Get -Headers $headers -ErrorAction Stop
+        Write-Log "GitHub username '$UserName' validated successfully." 'Info'
+        return $true
+    } catch {
+        $statusCode = $null
+        try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+        if ($statusCode -eq 404) {
+            Write-Log "GitHub username '$UserName' does not exist (404)." 'Warn'
+        } else {
+            Write-Log "GitHub username validation failed: $($_.Exception.Message)" 'Warn'
+        }
+        return $false
+    }
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Remaining orchestration functions (Ensure-RemotePreparation,
 #  Ensure-LocalPreparation, Get-ContainerStatus, Show-ContainerManager,
@@ -1846,4 +1885,6 @@ Export-ModuleMember -Function @(
     # GitHub SSH key API
     'Add-GitHubSshKey'
     'Remove-GitHubSshKey'
+    # GitHub username validation
+    'Test-GitHubUsername'
 )
