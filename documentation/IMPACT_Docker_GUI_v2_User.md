@@ -123,7 +123,7 @@ This ensures that all SSH connections to the workstation use the correct key aut
 
 For experienced users — the fastest way from zero to RStudio:
 
-1. ▶️ Run `IMPACT_Docker_GUI_v2.ps1` (or double-click `IMPACT.exe`)
+1. ▶️ Double-click `IMPACT.bat` (or run `IMPACT_Docker_GUI_v2.ps1` directly)
 2. 👤 Enter your **GitHub username** and a **password**
 3. 🔑 Let it create your SSH key; copy the public key to **GitHub → Settings → SSH and GPG keys** if needed
 4. 🌐 Choose **Local** or **Remote** (enter the workstation IP if remote)
@@ -142,8 +142,9 @@ You have two ways to start:
 
 | Method | How |
 |---|---|
+| **Batch launcher** | Double-click `IMPACT.bat` — auto-detects PowerShell 7 with a fallback to Windows PowerShell |
 | **PowerShell script** | Right-click `IMPACT_Docker_GUI_v2.ps1` → *Run with PowerShell*, or open a terminal and run `pwsh .\IMPACT_Docker_GUI_v2.ps1` |
-| **Compiled EXE** | Double-click `IMPACT.exe` (see [Building the EXE](#-building-the-exe)) |
+| **Desktop shortcut** | Double-click `Create-Shortcut.bat` once to create an `IMPACT` shortcut on your Desktop with the application icon |
 
 On launch, the tool:
 - Checks if PowerShell 7 is available and re-launches under `pwsh` if needed (you may see a brief console flash)
@@ -422,28 +423,17 @@ The tool is designed for multi-user remote workstations:
 
 ---
 
-## 📦 Building the EXE
+## 📦 Launcher & Desktop Shortcut
 
-The PowerShell script can be compiled into a standalone `IMPACT.exe` for easy distribution.
+### Starting the Tool
 
-### Prerequisites
-- **PowerShell 7** (the compiler enforces this)
-- **ps2exe module** (auto-installed if missing)
+Double-click `IMPACT.bat` in the `current_version/` folder. It auto-detects PowerShell 7 (`pwsh`) and falls back to Windows PowerShell if needed.
 
-### Methods
+### Desktop Shortcut
 
-| Method | Command / Action | Description |
-|---|---|---|
-| **Interactive** | Double-click `Compile-IMPACT-v2.bat` | Uses PowerShell 7, prompts before overwriting |
-| **Silent** | Double-click `Quick-Compile-v2.bat` | Forces overwrite, suppresses output |
-| **Manual** | `pwsh .\Compile-IMPACT-v2.ps1 -Force` | Full control with optional `-Verbose` flag |
+To create a desktop shortcut with the IMPACT icon, double-click `Create-Shortcut.bat` once. This creates an `IMPACT.lnk` on your Desktop that launches the tool directly.
 
-### Output
-- `IMPACT.exe` in the same folder
-- Includes the `IMPACT_icon.ico` icon if present
-- Console mode enabled (required for the PS7 relaunch flow)
-
-> 💡 After compiling, distribute `IMPACT.exe` together with the `docker_setup/` folder and `sim_design.yaml` in the project repository.
+> 💡 Distribute the `current_version/` folder (containing `IMPACT.bat`, `IMPACT_Docker_GUI_v2.ps1`, and `IMPACT_Docker_GUI.psm1`) together with the `docker_setup/` folder and `sim_design.yaml` in the project repository.
 
 ---
 
@@ -465,7 +455,7 @@ The PowerShell script can be compiled into a standalone `IMPACT.exe` for easy di
 | 🔄 **rsync** | A file synchronization tool used to copy data between Docker volumes and host folders efficiently. |
 | 🧰 **Posh-SSH** | A PowerShell module for SSH connections. Used as the primary method for first-time password-based key setup on the remote workstation. |
 | 🧰 **plink.exe** | A PuTTY command-line SSH tool. Used as a fallback for password-based key setup if Posh-SSH is unavailable. |
-| 🧰 **ps2exe** | A PowerShell module that compiles `.ps1` scripts into standalone `.exe` files. |
+| 📄 **IMPACT.bat** | Batch launcher — double-click to start the IMPACT GUI without needing to open PowerShell manually. |
 | 🖥️ **RStudio Server** | A web-based IDE for R that runs inside the Docker container. You access it through your browser. |
 | 🏷️ **Container Name** | Follows the pattern `<repo>_<username>`, e.g., `IMPACTncdGER_johndoe`. |
 | 🏷️ **Remote User** | The shared Linux account on the workstation (default: `php-workstation`). |

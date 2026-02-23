@@ -1,7 +1,5 @@
-# Executable files
-/*.exe
-*.exe
-IMPACT.exe
+# Generated shortcuts
+*.lnk
 
 # Environment variables
 .env

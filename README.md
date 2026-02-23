@@ -13,7 +13,7 @@ A Windows GUI tool for building, launching, and managing **IMPACT NCD Germany** 
 
 ## Quick Start
 
-1. Run `IMPACT_Docker_GUI_v2.ps1` (or the compiled `IMPACT.exe`)
+1. Double-click `IMPACT.bat` (or run `IMPACT_Docker_GUI_v2.ps1` directly)
 2. Enter your **GitHub username** and a password
 3. Add the generated SSH public key to GitHub if needed
 4. Choose **Local** or **Remote** and select your repository
@@ -30,7 +30,7 @@ A Windows GUI tool for building, launching, and managing **IMPACT NCD Germany** 
 
 | Directory | Contents |
 |---|---|
-| `current_version/` | Active release — module (`IMPACT_Docker_GUI.psm1`), launcher script (`IMPACT_Docker_GUI_v2.ps1`), compile scripts, and application icon |
+| `current_version/` | Active release — module (`IMPACT_Docker_GUI.psm1`), launcher script (`IMPACT_Docker_GUI_v2.ps1`), batch launcher, and application icon |
 | `tests/` | Pester 5 test suites (Unit, Integration, DockerSsh, ImageValidation, RemoteE2E), test helpers, container Dockerfiles |
 | `documentation/` | User Guide, Technical Documentation, and Testing Guide |
 | `.github/workflows/` | GitHub Actions CI workflow |
@@ -62,17 +62,11 @@ pwsh tests/Invoke-Tests.ps1 -Level RemoteE2E -GitHubToken ghp_xxx
 
 See **[Testing Guide](documentation/TESTING.md)** for Docker SSH tests, CI details, and writing new tests.
 
-## Building the EXE
+## Launcher & Desktop Shortcut
 
-```powershell
-# Interactive (prompts before overwriting)
-.\current_version\Compile-IMPACT-v2.bat
+Double-click `current_version\IMPACT.bat` to start the GUI. It auto-detects PowerShell 7 with a fallback to Windows PowerShell.
 
-# Or manually with PowerShell 7
-pwsh .\current_version\Compile-IMPACT-v2.ps1 -Force
-```
-
-Requires the `ps2exe` module (auto-installed if missing). Outputs `IMPACT.exe` in `current_version/`.
+To create a desktop shortcut with the IMPACT icon, double-click `current_version\Create-Shortcut.bat` once.
 
 ## License
 
