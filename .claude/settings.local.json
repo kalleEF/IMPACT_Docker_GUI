@@ -3,7 +3,18 @@
     "allow": [
       "Bash(grep:*)",
       "Bash(git rm:*)",
-      "Bash(pwsh:*)"
+      "Bash(pwsh:*)",
+      "Bash(docker context:*)",
+      "Bash(docker:*)",
+      "Bash(Out-Null)",
+      "Bash(\")",
+      "Bash(DOCKER_CONTEXT=desktop-linux docker images:*)",
+      "Bash(DOCKER_CONTEXT=desktop-linux docker run:*)",
+      "Bash(DOCKER_CONTEXT=desktop-linux docker ps:*)",
+      "Bash(DOCKER_CONTEXT=desktop-linux docker cp:*)",
+      "Bash(DOCKER_CONTEXT=desktop-linux docker exec:*)",
+      "Bash(ssh:*)",
+      "Bash(cd:*)"
     ]
   }
 }
