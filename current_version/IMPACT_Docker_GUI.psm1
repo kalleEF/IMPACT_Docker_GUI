@@ -242,7 +242,7 @@ function Set-DockerSSHEnvironment {
         if (-not $env:DOCKER_SSH_OPTS -or [string]::IsNullOrEmpty($env:DOCKER_SSH_OPTS)) {
             $keyPath = $State.Paths.SshPrivate
             if (-not $keyPath) { $keyPath = "$HOME/.ssh/id_ed25519_$($State.UserName)" }
-            $env:DOCKER_SSH_OPTS = "-i `"$keyPath`" -o IdentitiesOnly=yes -o ConnectTimeout=30"
+            $env:DOCKER_SSH_OPTS = "-i `"$keyPath`" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=30"
             Write-Log "Prepared DOCKER_SSH_OPTS for remote Docker access." 'Info'
         }
         if ($State.Flags.UseDirectSsh) {
@@ -305,8 +305,8 @@ function Test-RemoteSSHKeyFiles {
     $remoteKeyPath = "/home/$($State.RemoteUser)/.ssh/id_ed25519_$($State.UserName)"
     $knownHosts = "/home/$($State.RemoteUser)/.ssh/known_hosts"
     try {
-        $keyCheck = & ssh -i $localKeyPath -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "[ -f '$remoteKeyPath' ] && echo OK" 2>$null
-        $khCheck  = & ssh -i $localKeyPath -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "[ -f '$knownHosts' ] && echo OK" 2>$null
+        $keyCheck = & ssh -n -i $localKeyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "[ -f '$remoteKeyPath' ] && echo OK" 2>$null
+        $khCheck  = & ssh -n -i $localKeyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "[ -f '$knownHosts' ] && echo OK" 2>$null
         $present = ($keyCheck -match 'OK' -and $khCheck -match 'OK')
         Write-Log "Remote SSH check raw outputs -> key:'$keyCheck' kh:'$khCheck'" 'Debug'
         Write-Log ("Remote SSH prerequisites present: key={0} known_hosts={1}" -f ($keyCheck -match 'OK'), ($khCheck -match 'OK')) 'Info'
@@ -341,7 +341,7 @@ function Write-RemoteContainerMetadata {
     Write-Log ("Metadata payload (masked): container={0} repo={1} port={2} useVolumes={3}" -f $State.ContainerName, $State.SelectedRepo, $Port, $UseVolumes) 'Debug'
     $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload))
     try {
-        & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "mkdir -p /tmp/impactncd && umask 177 && echo $b64 | base64 -d > '$metaPath'" 2>$null
+        & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "mkdir -p /tmp/impactncd && umask 177 && echo $b64 | base64 -d > '$metaPath'" 2>$null
         Write-Log 'Remote metadata saved.' 'Info'
     } catch {
         Write-Log "Remote metadata SSH write failed: $($_.Exception.Message)" 'Warn'
@@ -355,7 +355,7 @@ function Remove-RemoteContainerMetadata {
     $keyPath = $State.Paths.SshPrivate
     $metaPath = "/tmp/impactncd/$($State.ContainerName).json"
     Write-Log "Removing remote metadata at $metaPath on $remoteHost" 'Info'
-    try { & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "rm -f '$metaPath'" 2>$null } catch {
+    try { & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "rm -f '$metaPath'" 2>$null } catch {
         Write-Log "Remote metadata removal failed: $($_.Exception.Message)" 'Warn'
     }
 }
@@ -368,7 +368,7 @@ function Read-RemoteContainerMetadata {
     $metaPath = "/tmp/impactncd/$($State.ContainerName).json"
     Write-Log "Attempting to read remote metadata from $metaPath on $remoteHost" 'Info'
     try {
-        $json = & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "cat '$metaPath' 2>/dev/null" 2>$null
+        $json = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "cat '$metaPath' 2>/dev/null" 2>$null
         if ($json) {
             Write-Log 'Remote metadata read successfully.' 'Info'
             return $json | ConvertFrom-Json -ErrorAction Stop
@@ -441,7 +441,7 @@ function Ensure-RemoteDockerLogin {
 
     $envContent = $null
     try {
-        $envContent = & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cat '$envPathRemote' 2>/dev/null || true"
+        $envContent = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cat '$envPathRemote' 2>/dev/null || true"
     } catch {
         Write-Log "Failed to read remote .env: $($_.Exception.Message)" 'Debug'
         return $false
@@ -459,7 +459,7 @@ function Ensure-RemoteDockerLogin {
     try {
         $pwB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($pw))
         $cmd = "echo $pwB64 | base64 -d | docker login -u '$user' --password-stdin 2>&1 || true"
-        $sshArgs = @('-o','ConnectTimeout=15','-o','BatchMode=yes','-o','IdentitiesOnly=yes','-i',"$keyPath",$remoteHost,$cmd)
+        $sshArgs = @('-n','-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=15','-o','BatchMode=yes','-o','IdentitiesOnly=yes','-i',"$keyPath",$remoteHost,$cmd)
         $out = & ssh @sshArgs
         $outText = if ($out -is [System.Array]) { ($out -join "`n") } else { [string]$out }
         if ($outText -match 'Login Succeeded') { Write-Log 'Remote docker login succeeded (masked).' 'Info'; return $true }
@@ -516,7 +516,7 @@ function Get-YamlPathValue {
         $remoteHost = Get-RemoteHostString -State $State
         $keyPath = $State.Paths.SshPrivate
         try {
-            $content = & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=30 -o BatchMode=yes $remoteHost "cat '$YamlPath'" 2>$null
+            $content = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=30 -o BatchMode=yes $remoteHost "cat '$YamlPath'" 2>$null
         } catch { return $null }
     } else {
         if (-not (Test-Path $YamlPath)) { return $null }
@@ -553,7 +553,7 @@ function Test-AndCreateDirectory {
         $remoteHost = Get-RemoteHostString -State $State
         $keyPath = $State.Paths.SshPrivate
         try {
-            $check = & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "test -d '$Path' && echo EXISTS || echo MISSING" 2>$null
+            $check = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "test -d '$Path' && echo EXISTS || echo MISSING" 2>$null
             if ($check -notmatch 'EXISTS') {
                 Write-Log "Remote path missing (no auto-create): $Path" 'Error'
                 return $false
@@ -607,7 +607,7 @@ function Get-GitRepositoryState {
             $remoteHost = Get-RemoteHostString -State $State
             $keyPath = $State.Paths.SshPrivate
             $cmd = "cd '$RepoPath' && git status --porcelain=v1 && git rev-parse --abbrev-ref HEAD && git remote get-url origin"
-            $out = & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=20 -o BatchMode=yes $remoteHost $cmd 2>$null
+            $out = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=20 -o BatchMode=yes $remoteHost $cmd 2>$null
             $lines = ($out -split "`n")
             $statusLines = @()
             $branch = ''
@@ -699,13 +699,13 @@ function Invoke-GitChangeDetection {
         if ($IsRemote) {
             $remoteHost = Get-RemoteHostString -State $State
             $keyPath = $State.Paths.SshPrivate
-            $remoteUrl = & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost "cd '$RepoPath' && git remote get-url origin" 2>$null
+            $remoteUrl = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cd '$RepoPath' && git remote get-url origin" 2>$null
             if ($remoteUrl -and $remoteUrl -match '^https://github.com/(.+)$') {
                 $sshUrl = "git@github.com:$($matches[1])"
-                & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost "cd '$RepoPath' && git remote set-url origin '$sshUrl'" 2>$null
+                & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cd '$RepoPath' && git remote set-url origin '$sshUrl'" 2>$null
             }
             $commitCmd = "cd '$RepoPath' && git add -A && git commit -m `"$safeMsg`""
-            $commitOut = & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost $commitCmd 2>&1
+            $commitOut = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost $commitCmd 2>&1
             Write-Log "Remote git commit exit=$LASTEXITCODE output=$commitOut" 'Debug'
             if ($LASTEXITCODE -ne 0 -and $commitOut -notmatch 'nothing to commit') {
                 if (-not $script:NonInteractive) { [System.Windows.Forms.MessageBox]::Show("Git commit failed on remote: $commitOut",'Git commit failed','OK','Error') | Out-Null }
@@ -716,26 +716,26 @@ function Invoke-GitChangeDetection {
                 $remoteKey = "~/.ssh/id_ed25519_$($State.UserName)"
                 # Try 1: IMPACT-specific key via ssh-agent
                 $pushAgent = "cd '$RepoPath' && eval `$(ssh-agent -s) && ssh-add $remoteKey 2>/dev/null && GIT_SSH_COMMAND='ssh -i $remoteKey -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' git push"
-                $pushOut = & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost $pushAgent 2>&1
+                $pushOut = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost $pushAgent 2>&1
                 Write-Log "Remote git push (agent) exit=$LASTEXITCODE output=$pushOut" 'Debug'
                 if ($LASTEXITCODE -ne 0) {
                     # Try 2: IMPACT-specific key directly (no agent)
                     $pushDirect = "cd '$RepoPath' && GIT_SSH_COMMAND='ssh -i $remoteKey -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' git push"
-                    $pushOut = & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost $pushDirect 2>&1
+                    $pushOut = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost $pushDirect 2>&1
                     Write-Log "Remote git push (direct) exit=$LASTEXITCODE output=$pushOut" 'Debug'
                 }
                 if ($LASTEXITCODE -ne 0) {
                     # Try 3: workstation's own key (commonly named id_ed25519_workstation)
                     Write-Log 'IMPACT key push failed; trying workstation SSH keys.' 'Warn'
                     $pushWs = "cd '$RepoPath' && for k in ~/.ssh/id_ed25519_workstation ~/.ssh/id_ed25519 ~/.ssh/id_rsa; do [ -f `"`$k`" ] && GIT_SSH_COMMAND='ssh -i `$k -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' git push && exit 0; done; exit 1"
-                    $pushOut = & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost $pushWs 2>&1
+                    $pushOut = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost $pushWs 2>&1
                     Write-Log "Remote git push (workstation keys) exit=$LASTEXITCODE output=$pushOut" 'Debug'
                 }
                 if ($LASTEXITCODE -ne 0) {
                     # Try 4: let the workstation's SSH config / agent decide
                     Write-Log 'Explicit key push failed; falling back to default SSH identity.' 'Warn'
                     $pushDefault = "cd '$RepoPath' && git push"
-                    $pushOut = & ssh -i $keyPath -o IdentitiesOnly=yes -o BatchMode=yes $remoteHost $pushDefault 2>&1
+                    $pushOut = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost $pushDefault 2>&1
                     Write-Log "Remote git push (default SSH) exit=$LASTEXITCODE output=$pushOut" 'Debug'
                 }
                 if ($LASTEXITCODE -ne 0) {
