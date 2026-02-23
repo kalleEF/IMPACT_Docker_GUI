@@ -33,7 +33,7 @@
 7. [Security Considerations](#security-considerations)
 8. [Error Handling Patterns](#error-handling-patterns)
 9. [Dependency Matrix](#dependency-matrix)
-10. [Compile Pipeline](#compile-pipeline)
+10. [Launcher](#launcher)
 11. [Extension Points](#extension-points)
 12. [Known Limitations](#known-limitations)
 
@@ -473,47 +473,22 @@ The script uses several consistent error handling strategies:
 | **Posh-SSH** | Recommended | Password bootstrap (primary) | `Install-Module -Name Posh-SSH -Scope CurrentUser` |
 | **plink.exe** | Optional | Password bootstrap (fallback) | PuTTY installer |
 | **Git** | Optional | Commit/push on stop, build info | [git-scm.com](https://git-scm.com/) |
-| **ps2exe** | Compile only | EXE compilation | `Install-Module -Name ps2exe -Scope CurrentUser` |
+| **IMPACT.bat** | Launcher | Batch launcher for the GUI | Included in `current_version/` |
 | **rsync-alpine** | Auto-built | Volume data sync | Built from `alpine` + `apk add rsync` |
 
 ---
 
-## Compile Pipeline
+## Launcher
 
-The script is compiled to `IMPACT.exe` using the `ps2exe` PowerShell module.
+Users start the tool by double-clicking `IMPACT.bat`, which auto-detects PowerShell 7 (`pwsh.exe`) and falls back to Windows PowerShell.
 
 ### Files
 
 | File | Purpose |
 |---|---|
-| `Compile-IMPACT-v2.ps1` | Main compilation script; enforces PS7, installs `ps2exe` if missing, handles icon |
-| `Compile-IMPACT-v2.bat` | Interactive batch wrapper; tries pwsh first, falls back to `powershell.exe` |
-| `Quick-Compile-v2.bat` | Silent batch wrapper; forces overwrite, suppresses output |
-| `IMPACT_icon.ico` | Application icon embedded in the EXE |
-
-### Compilation Parameters
-
-```powershell
-Invoke-PS2EXE @{
-    InputFile    = "IMPACT_Docker_GUI_v2.ps1"
-    OutputFile   = "IMPACT.exe"
-    NoConsole    = $false    # Console needed for PS7 relaunch
-    NoOutput     = $false
-    NoError      = $false
-    NoConfigFile = $true
-    iconFile     = "IMPACT_icon.ico"  # if present
-}
-```
-
-### Icon Fallback
-
-If the icon causes a compilation error, the script retries without the icon file.
-
-### Important Notes
-
-- The compiler enforces PowerShell 7 (`PSEdition -eq 'Core'` and `Major -ge 7`) to produce a PS7-native EXE
-- When run from a batch file, `-Force` mode is auto-enabled
-- The resulting EXE includes a console window (required for `Ensure-PowerShell7` relaunch flow)
+| `IMPACT.bat` | Batch launcher — detects PS7, launches `IMPACT_Docker_GUI_v2.ps1` |
+| `Create-Shortcut.bat` | One-time script — creates a desktop shortcut with the IMPACT icon |
+| `IMPACT_icon.ico` | Application icon used by the desktop shortcut |
 
 ---
 

@@ -10,25 +10,23 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Determine the directory where this script (or compiled EXE) lives.
-# $PSScriptRoot works when running as .ps1 but is empty/wrong in a ps2exe EXE.
+# Determine the directory where this script lives.
 if ($PSScriptRoot -and (Test-Path $PSScriptRoot)) {
     $script:ScriptDir = $PSScriptRoot
 } else {
-    # Fallback for ps2exe-compiled EXE: use the process executable's directory
+    # Fallback: use the process executable's directory
     $script:ScriptDir = Split-Path -Parent ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
 }
 
-# Import the companion module (same directory as script/EXE)
+# Import the companion module (same directory as this script)
 $modulePath = Join-Path $script:ScriptDir 'IMPACT_Docker_GUI.psm1'
 if (Test-Path $modulePath) {
     Import-Module $modulePath -Force -DisableNameChecking
 } else {
     Write-Host "ERROR: Module not found at $modulePath" -ForegroundColor Red
-    Write-Host "The file 'IMPACT_Docker_GUI.psm1' must be in the same folder as this script/EXE." -ForegroundColor Red
+    Write-Host "The file 'IMPACT_Docker_GUI.psm1' must be in the same folder as this script." -ForegroundColor Red
     Write-Host ""
-    # Also show a GUI dialog so double-clicking the EXE makes the error visible
-    try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue; [System.Windows.Forms.MessageBox]::Show("IMPACT cannot start because 'IMPACT_Docker_GUI.psm1' is missing from the application folder.\nPlease place the module next to the EXE and retry.", 'IMPACT - Module missing', 'OK', 'Error') | Out-Null } catch {}
+    try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue; [System.Windows.Forms.MessageBox]::Show("IMPACT cannot start because 'IMPACT_Docker_GUI.psm1' is missing from the application folder.`nPlease place the module next to the script and retry.", 'IMPACT - Module missing', 'OK', 'Error') | Out-Null } catch {}
     Write-Host "Press any key to exit..." -ForegroundColor Yellow
     $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     exit 1
