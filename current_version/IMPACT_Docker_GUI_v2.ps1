@@ -59,6 +59,7 @@ function Ensure-RemotePreparation {
     $State.RemoteRepoBase = $remoteRepoBase
 
     $sshArgs = @(
+        '-n',
         '-i', $State.Paths.SshPrivate,
         '-o', 'IdentitiesOnly=yes',
         '-o', 'BatchMode=yes',
@@ -448,7 +449,7 @@ echo SSH_KEY_COPIED
     $remoteDockerOk = $false
     $remoteDockerCliExists = $false
     try {
-        $sshCheckArgs = @('-i', $State.Paths.SshPrivate, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', $remoteHost)
+        $sshCheckArgs = @('-n', '-i', $State.Paths.SshPrivate, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=15', $remoteHost)
         $dockerVer = & ssh @sshCheckArgs 'docker version --format "{{.Server.Version}}"' 2>&1
         if ($LASTEXITCODE -eq 0 -and $dockerVer -and $dockerVer -notmatch 'Cannot connect') {
             $remoteDockerOk = $true
@@ -486,14 +487,14 @@ echo SSH_KEY_COPIED
             Write-Host ''
             Write-Host '--- Enter the sudo password on the remote host when prompted ---' -ForegroundColor Yellow
             try {
-                $startArgs = @('-i', $State.Paths.SshPrivate, '-o', 'IdentitiesOnly=yes', '-o', 'ConnectTimeout=30', '-t', $remoteHost, 'sudo systemctl start docker')
+                $startArgs = @('-i', $State.Paths.SshPrivate, '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=30', '-t', $remoteHost, 'sudo systemctl start docker')
                 $p = Start-Process -FilePath 'ssh' -ArgumentList $startArgs -Wait -PassThru -NoNewWindow
                 if ($p.ExitCode -eq 0) {
                     Write-Log 'sudo systemctl start docker completed.' 'Info'
                     # Wait briefly for the daemon socket to become available
                     Start-Sleep -Seconds 3
                     # Re-check
-                    $sshCheckArgs2 = @('-i', $State.Paths.SshPrivate, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', $remoteHost)
+                    $sshCheckArgs2 = @('-n', '-i', $State.Paths.SshPrivate, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=15', $remoteHost)
                     $dockerVer2 = & ssh @sshCheckArgs2 'docker version --format "{{.Server.Version}}"' 2>&1
                     if ($LASTEXITCODE -eq 0 -and $dockerVer2 -and $dockerVer2 -notmatch 'Cannot connect') {
                         $remoteDockerOk = $true
@@ -520,7 +521,7 @@ echo SSH_KEY_COPIED
     # 4.1.7: Check docker group membership for the remote user
     Write-Log 'Checking remote user docker group membership...' 'Info'
     try {
-        $sshGroupArgs = @('-i', $State.Paths.SshPrivate, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', $remoteHost)
+        $sshGroupArgs = @('-n', '-i', $State.Paths.SshPrivate, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=15', $remoteHost)
         $groupsOutput = & ssh @sshGroupArgs 'groups' 2>&1
         if ($LASTEXITCODE -eq 0 -and $groupsOutput) {
             $groupList = $groupsOutput -split '\s+'
@@ -1072,7 +1073,7 @@ function Show-ContainerManager {
                     $remoteHost = Get-RemoteHostString -State $State
                     $sshKey = $State.Paths.SshPrivate
                     $cmd = "cd '$dockerContext' && docker build --build-arg REPO_NAME=$($State.SelectedRepo) -f '$dockerfileMain' -t '$imageName' --no-cache ."
-                    $sshArgs = @('-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',"$sshKey",$remoteHost,$cmd)
+                    $sshArgs = @('-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',"$sshKey",$remoteHost,$cmd)
                     $p = Start-Process -FilePath 'ssh' -ArgumentList $sshArgs -Wait -NoNewWindow -PassThru
                     $buildSucceeded = ($p.ExitCode -eq 0)
                 }
@@ -1091,7 +1092,7 @@ function Show-ContainerManager {
                             $remoteHost = Get-RemoteHostString -State $State
                             $sshKey = $State.Paths.SshPrivate
                             $cmdRetry = "cd '$dockerContext' && docker build --build-arg REPO_NAME=$($State.SelectedRepo) -f '$dockerfileMain' -t '$imageName' --no-cache ."
-                            $sshArgsRetry = @('-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',"$sshKey",$remoteHost,$cmdRetry)
+                            $sshArgsRetry = @('-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',"$sshKey",$remoteHost,$cmdRetry)
                             $pRetry = Start-Process -FilePath 'ssh' -ArgumentList $sshArgsRetry -Wait -NoNewWindow -PassThru
                             $buildSucceeded = ($pRetry.ExitCode -eq 0)
                             if ($buildSucceeded) { Write-Log 'Remote build succeeded after login; continuing.' 'Info' }
@@ -1117,7 +1118,7 @@ function Show-ContainerManager {
                         $remoteHost = Get-RemoteHostString -State $State
                         $sshKey = $State.Paths.SshPrivate
                         $cmd2 = "cd '$prereqContext' && docker build -f '$prereqDockerfile' -t '$imageName-prerequisite' --no-cache ."
-                        $sshArgs2 = @('-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',"$sshKey",$remoteHost,$cmd2)
+                        $sshArgs2 = @('-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',"$sshKey",$remoteHost,$cmd2)
                         $p2 = Start-Process -FilePath 'ssh' -ArgumentList $sshArgs2 -Wait -NoNewWindow -PassThru
                         $preSuccess = ($p2.ExitCode -eq 0)
                     }
@@ -1140,7 +1141,7 @@ function Show-ContainerManager {
                         $remoteHost = Get-RemoteHostString -State $State
                         $sshKey = $State.Paths.SshPrivate
                         $cmd3 = "cd '$dockerContext' && docker build --build-arg REPO_NAME=$($State.SelectedRepo) -f '$dockerfileMain' -t '$imageName' --no-cache ."
-                        $sshArgs3 = @('-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',"$sshKey",$remoteHost,$cmd3)
+                        $sshArgs3 = @('-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',"$sshKey",$remoteHost,$cmd3)
                         $p3 = Start-Process -FilePath 'ssh' -ArgumentList $sshArgs3 -Wait -NoNewWindow -PassThru
                         $buildSucceeded = ($p3.ExitCode -eq 0)
                     }
@@ -1168,8 +1169,8 @@ function Show-ContainerManager {
             } else {
                 $remoteHost = Get-RemoteHostString -State $State
                 $keyPath = $State.Paths.SshPrivate
-                $hash = & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cd '$projectRoot' && git rev-parse HEAD" 2>$null
-                $status = & ssh -i $keyPath -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cd '$projectRoot' && git status --porcelain" 2>$null
+                $hash = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cd '$projectRoot' && git rev-parse HEAD" 2>$null
+                $status = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cd '$projectRoot' && git status --porcelain" 2>$null
                 $State.Metadata.GitBaseline = @{ Repo=$projectRoot; Commit=$hash; Status=$status; Timestamp=Get-Date }
             }
             Write-Log "Captured git baseline: commit=$hash" 'Debug'
@@ -1202,7 +1203,7 @@ function Show-ContainerManager {
             try {
                 $remoteHost = Get-RemoteHostString -State $State
                 $sshKey = $State.Paths.SshPrivate
-                $idSshArgs = @('-i', $sshKey, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', $remoteHost)
+                $idSshArgs = @('-n', '-i', $sshKey, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=15', $remoteHost)
                 $uidOut = (& ssh @idSshArgs 'id -u' 2>$null)
                 $gidOut = (& ssh @idSshArgs 'id -g' 2>$null)
                 if ($LASTEXITCODE -eq 0 -and $uidOut -match '^\d+$') {
