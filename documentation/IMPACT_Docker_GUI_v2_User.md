@@ -124,7 +124,7 @@ This ensures that all SSH connections to the workstation use the correct key aut
 For experienced users — the fastest way from zero to RStudio:
 
 1. ▶️ Run `IMPACT_Docker_GUI_v2.ps1` (or double-click `IMPACT.exe`)
-2. 👤 Enter a **username** and **password**
+2. 👤 Enter your **GitHub username** and a **password**
 3. 🔑 Let it create your SSH key; copy the public key to **GitHub → Settings → SSH and GPG keys** if needed
 4. 🌐 Choose **Local** or **Remote** (enter the workstation IP if remote)
 5. 📁 Pick your repository (Local: folder picker; Remote: list from the workstation)
@@ -160,10 +160,12 @@ A dialog asks for:
 
 | Field | Purpose | Rules |
 |---|---|---|
-| **Username** | Identifies your SSH key, container, and Docker volumes | Spaces removed, converted to lowercase (e.g., `John Doe` → `johndoe`) |
+| **Username** | Must be your **GitHub username**. Used for SSH key generation, git identity inside the container, and container/volume naming. | Validated against GitHub's API, normalized to lowercase |
 | **Password** | Used to log in to RStudio Server inside the container | Any non-empty string |
 
-> 💡 **Keep your username consistent** across sessions. It is used to name your container (`<repo>_<username>`) and your per-user Docker volumes.
+> 💡 **Why your GitHub username?** The tool uses your GitHub username to: (1) generate SSH keys named `id_ed25519_<username>`, (2) set your git identity inside the container (`user.name` and `user.email`), and (3) name your container and volumes. Using your real GitHub username ensures that git commits are correctly attributed to your account.
+
+> ⚠️ The username is validated against GitHub when you click Continue. If you enter a username that doesn't exist on GitHub, you'll be asked to correct it.
 
 ---
 

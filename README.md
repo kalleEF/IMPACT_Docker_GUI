@@ -14,7 +14,7 @@ A Windows GUI tool for building, launching, and managing **IMPACT NCD Germany** 
 ## Quick Start
 
 1. Run `IMPACT_Docker_GUI_v2.ps1` (or the compiled `IMPACT.exe`)
-2. Enter a username and password
+2. Enter your **GitHub username** and a password
 3. Add the generated SSH public key to GitHub if needed
 4. Choose **Local** or **Remote** and select your repository
 5. Click **Start Container** → open the displayed URL → log in as `rstudio`

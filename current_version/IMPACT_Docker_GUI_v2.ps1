@@ -1324,11 +1324,14 @@ function Show-ContainerManager {
         }
 
         # Configure git inside the container for the rstudio user.
-        # The Docker image's system gitconfig ships pull.ff=only which aborts when
-        # fast-forward isn't possible. We override at global level so git pull
-        # works like GitKraken / vanilla-git (merge when not fast-forwardable).
-        # safe.directory='*' is a safety net for any remaining ownership edge cases.
-        $gitCfgCmd = "git config --global pull.ff true && git config --global pull.rebase false && git config --global --add safe.directory '*' && echo GIT_CONFIGURED"
+        # 1. Set user.name and user.email so that git commit works out of the box.
+        #    The username is the user's GitHub handle; email uses GitHub's noreply
+        #    address so commits are attributed correctly without exposing real email.
+        # 2. The Docker image's system gitconfig ships pull.ff=only which aborts when
+        #    fast-forward isn't possible. We override at global level so git pull
+        #    works like GitKraken / vanilla-git (merge when not fast-forwardable).
+        # 3. safe.directory='*' is a safety net for any remaining ownership edge cases.
+        $gitCfgCmd = "git config --global user.name '$($State.UserName)' && git config --global user.email '$($State.UserName)@users.noreply.github.com' && git config --global pull.ff true && git config --global pull.rebase false && git config --global --add safe.directory '*' && echo GIT_CONFIGURED"
         $gitCfgCtx = (Get-DockerContextArgs -State $State) + @('exec', '--user', 'rstudio', $State.ContainerName, 'sh', '-c', $gitCfgCmd)
         try {
             $gitCfgOut = & docker $gitCfgCtx 2>&1

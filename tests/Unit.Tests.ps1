@@ -940,12 +940,53 @@ Describe 'Ensure-PowerShell7' -Tag Unit {
     }
 }
 
-# Save Unit test artifacts (TestResults XML)
-AfterAll {
-    try {
-        if (-not (Get-Command -Name Save-TestArtifacts -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'Helpers' 'TestSessionState.ps1') }
-        Save-TestArtifacts -Suite 'unit' -ExtraFiles @('./tests/TestResults-Unit.xml')
-    } catch {
-        Write-Warning "Failed to save unit test artifacts: $($_.Exception.Message)"
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Test-GitHubUsername — GitHub API validation
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Test-GitHubUsername' -Tag Unit {
+    It 'Returns true when GitHub API responds with 200 (user exists)' {
+        Mock Invoke-RestMethod {
+            return @{ login = 'octocat'; id = 1 }
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $result = Test-GitHubUsername -UserName 'octocat'
+        $result | Should -BeTrue
+    }
+
+    It 'Returns false when GitHub API responds with 404 (user not found)' {
+        Mock Invoke-RestMethod {
+            $resp = New-Object System.Net.Http.HttpResponseMessage
+            $resp.StatusCode = [System.Net.HttpStatusCode]::NotFound
+            $exception = [Microsoft.PowerShell.Commands.HttpResponseException]::new("Response status code does not indicate success: 404 (Not Found).", $resp)
+            throw ([System.Management.Automation.ErrorRecord]::new(
+                $exception, 'WebCmdletWebResponseException',
+                [System.Management.Automation.ErrorCategory]::InvalidOperation, $null))
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $result = Test-GitHubUsername -UserName 'nonexistent-user-xyz-12345'
+        $result | Should -BeFalse
+    }
+
+    It 'Returns false when network error occurs' {
+        Mock Invoke-RestMethod {
+            throw [System.Net.WebException]::new('Unable to connect to the remote server')
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $result = Test-GitHubUsername -UserName 'anyuser'
+        $result | Should -BeFalse
+    }
+
+    It 'Passes the correct URL to Invoke-RestMethod' {
+        Mock Invoke-RestMethod {
+            return @{ login = 'testuser' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        Test-GitHubUsername -UserName 'myghuser'
+
+        Should -Invoke Invoke-RestMethod -ModuleName 'IMPACT_Docker_GUI' -Times 1 -ParameterFilter {
+            $Uri -eq 'https://api.github.com/users/myghuser'
+        }
     }
 }
+
+# Artifact persistence is handled by Invoke-Tests.ps1 (only on failure/skip).
