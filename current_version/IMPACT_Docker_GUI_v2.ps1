@@ -851,7 +851,8 @@ function Show-ContainerManager {
         $portDisplay = if ($State.Metadata.Recovered.Port) { ($State.Metadata.Recovered.Port -split '\s+')[0] } else { '8787' }
         $passDisplay = if ($State.Metadata.Recovered.Password) { $State.Metadata.Recovered.Password } else { $State.Password }
         $hostDisplay = if ($State.ContainerLocation -eq 'LOCAL') { "http://localhost:$portDisplay" } else { "http://$($State.RemoteHostIp):$portDisplay" }
-        [System.Windows.Forms.MessageBox]::Show("Container '$($State.ContainerName)' already running.`n`nURL: $hostDisplay`nUser: rstudio`nPassword: $passDisplay","Container already running",'OK','Information') | Out-Null
+        $maskedPass = [string]::new([char]0x2022, [Math]::Max($passDisplay.Length, 6))
+        [System.Windows.Forms.MessageBox]::Show("Container '$($State.ContainerName)' already running.`n`nURL: $hostDisplay`nUser: rstudio`nPassword: $maskedPass","Container already running",'OK','Information') | Out-Null
         Write-Log "Resumed existing container $($State.ContainerName) at $hostDisplay" 'Info'
         $State.Metadata.ActiveRepoPath = if ($State.ContainerLocation -eq 'LOCAL') { $State.Paths.LocalRepo } else { $State.Paths.RemoteRepo }
         $State.Metadata.ActiveIsRemote = ($State.ContainerLocation -like 'REMOTE@*')
@@ -904,16 +905,30 @@ function Show-ContainerManager {
     $form.Controls.Add($chkRebuild)
     $form.Controls.Add($chkHigh)
 
-    $lblPort = New-Object System.Windows.Forms.Label -Property @{ Text='Port Override'; Location=New-Object System.Drawing.Point(20,304); Size=New-Object System.Drawing.Size(110,22) }
-    $defaultPort = if ($State.Metadata.Recovered.Port) { $State.Metadata.Recovered.Port } else { '8787' }
+    $lblPort = New-Object System.Windows.Forms.Label -Property @{ Text='Port (8787-8799)'; Location=New-Object System.Drawing.Point(20,304); Size=New-Object System.Drawing.Size(110,22) }
+    $defaultPort = if ($State.Metadata.Recovered.Port) { $State.Metadata.Recovered.Port } else { Get-NextAvailablePort -UsedPorts $State.Ports.Used }
     $txtPort = New-Object System.Windows.Forms.TextBox -Property @{ Location=New-Object System.Drawing.Point(136,302); Size=New-Object System.Drawing.Size(90,24); Text=$defaultPort }
     Style-Label -Label $lblPort
     Style-TextBox -TextBox $txtPort
-    $form.Controls.Add($lblPort); $form.Controls.Add($txtPort)
+    $toolTip = New-Object System.Windows.Forms.ToolTip
+    $toolTip.SetToolTip($txtPort, 'RStudio Server port. Valid range: 8787-8799.')
+    $lblPortError = New-Object System.Windows.Forms.Label -Property @{ Text=''; Location=New-Object System.Drawing.Point(136,326); Size=New-Object System.Drawing.Size(200,14) }
+    $lblPortError.ForeColor = [System.Drawing.Color]::FromArgb(200,70,70)
+    $lblPortError.Font = New-Object System.Drawing.Font('Segoe UI',8,[System.Drawing.FontStyle]::Regular)
+    $form.Controls.Add($lblPort); $form.Controls.Add($txtPort); $form.Controls.Add($lblPortError)
+    $txtPort.Add_TextChanged({
+        $result = Test-PortValue -Port $txtPort.Text.Trim()
+        if ($result.Valid) {
+            $lblPortError.Text = ''
+            $txtPort.BackColor = (Get-ThemePalette).Field
+        } else {
+            $lblPortError.Text = $result.ErrorMessage
+            $txtPort.BackColor = [System.Drawing.Color]::FromArgb(60,30,30)
+        }
+    })
 
     $isLocal = ($State.ContainerLocation -eq 'LOCAL')
     if ($isLocal) {
-        $txtPort.Enabled = $false
         $chkHigh.Enabled = $false
     }
 
@@ -983,7 +998,6 @@ function Show-ContainerManager {
         $rebuild    = $chkRebuild.Checked
         $highComp   = $chkHigh.Checked
         $portOverride = $txtPort.Text.Trim()
-        if ($State.ContainerLocation -eq 'LOCAL') { $portOverride = '8787' }
         $customParams = $txtParams.Text.Trim()
         $simDesign = $txtYaml.Text.Trim()
 
@@ -993,6 +1007,13 @@ function Show-ContainerManager {
 
         if ($State.Metadata.ContainerRunning) {
             [System.Windows.Forms.MessageBox]::Show('Container already running; stop it first or close to reuse.','Already running','OK','Information') | Out-Null
+            return
+        }
+
+        # Validate port format and range
+        $portCheck = Test-PortValue -Port $portOverride
+        if (-not $portCheck.Valid) {
+            [System.Windows.Forms.MessageBox]::Show($portCheck.ErrorMessage, 'Invalid port', 'OK', 'Error') | Out-Null
             return
         }
 
@@ -1182,8 +1203,8 @@ function Show-ContainerManager {
         $baseDirForYaml = ($projectRoot -replace '\\','/')
         $outputDir = Get-YamlPathValue -State $State -YamlPath $simDesign -Key 'output_dir' -BaseDir $baseDirForYaml
         $synthDir  = Get-YamlPathValue -State $State -YamlPath $simDesign -Key 'synthpop_dir' -BaseDir $baseDirForYaml
-        if (-not (Test-AndCreateDirectory -State $State -Path $outputDir -PathKey 'output_dir')) { [System.Windows.Forms.MessageBox]::Show('Failed to ensure output_dir.','Path error','OK','Error') | Out-Null; return }
-        if (-not (Test-AndCreateDirectory -State $State -Path $synthDir -PathKey 'synthpop_dir')) { [System.Windows.Forms.MessageBox]::Show('Failed to ensure synthpop_dir.','Path error','OK','Error') | Out-Null; return }
+        if (-not (Test-AndCreateDirectory -State $State -Path $outputDir -PathKey 'output_dir')) { [System.Windows.Forms.MessageBox]::Show("Failed to ensure output_dir path:`n$outputDir`n`nCheck your sim_design YAML file.",'Path error','OK','Error') | Out-Null; return }
+        if (-not (Test-AndCreateDirectory -State $State -Path $synthDir -PathKey 'synthpop_dir')) { [System.Windows.Forms.MessageBox]::Show("Failed to ensure synthpop_dir path:`n$synthDir`n`nCheck your sim_design YAML file.",'Path error','OK','Error') | Out-Null; return }
 
         $State.Paths.OutputDir = $outputDir
         $State.Paths.SynthpopDir = $synthDir
@@ -1298,12 +1319,22 @@ function Show-ContainerManager {
                          '--workdir',"/home/rstudio/$($State.SelectedRepo)",
                          $imageName)
 
+        # Refresh port scan immediately before docker run to catch races
+        $freshUsedPorts = Get-UsedPorts -ContextArgs (Get-DockerContextArgs -State $State)
+        $chosenPort = if ($portOverride) { $portOverride } else { '8787' }
+        if ($freshUsedPorts -contains $chosenPort) {
+            [System.Windows.Forms.MessageBox]::Show("Port $chosenPort was just taken by another container. Choose a different port.", 'Port conflict', 'OK', 'Error') | Out-Null
+            return
+        }
+
         $runCmd = (Get-DockerContextArgs -State $State) + $dockerArgs
         Write-Log "Starting container with: docker $($runCmd -join ' ')" 'Debug'
 
         $rc = & docker $runCmd 2>&1
         if ($LASTEXITCODE -ne 0) {
-            [System.Windows.Forms.MessageBox]::Show("Failed to start container: $rc",'Container start failed','OK','Error') | Out-Null
+            $friendlyError = Format-DockerError -RawError ([string]$rc)
+            Write-Log "Docker run failed (exit=$LASTEXITCODE): $rc" 'Error'
+            [System.Windows.Forms.MessageBox]::Show($friendlyError, 'Container start failed', 'OK', 'Error') | Out-Null
             return
         }
 

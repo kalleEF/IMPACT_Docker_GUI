@@ -499,6 +499,121 @@ function Get-ContainerRuntimeInfo {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Port helpers
+# ══════════════════════════════════════════════════════════════════════════════
+function Get-NextAvailablePort {
+    param(
+        [string[]]$UsedPorts = @(),
+        [int]$RangeStart = 8787,
+        [int]$RangeEnd   = 8799
+    )
+    for ($p = $RangeStart; $p -le $RangeEnd; $p++) {
+        if ($UsedPorts -notcontains [string]$p) {
+            return [string]$p
+        }
+    }
+    return [string]$RangeStart
+}
+
+function Test-PortValue {
+    <#
+    .SYNOPSIS Validates a port string for the IMPACT port range.
+    .OUTPUTS  Hashtable @{ Valid = [bool]; ErrorMessage = [string] }
+    #>
+    param(
+        [string]$Port,
+        [int]$RangeStart = 8787,
+        [int]$RangeEnd   = 8799
+    )
+    if ([string]::IsNullOrWhiteSpace($Port)) {
+        return @{ Valid = $false; ErrorMessage = 'Port cannot be empty.' }
+    }
+    if ($Port -notmatch '^\d+$') {
+        return @{ Valid = $false; ErrorMessage = 'Port must be a number.' }
+    }
+    $portInt = [int]$Port
+    if ($portInt -lt $RangeStart -or $portInt -gt $RangeEnd) {
+        return @{ Valid = $false; ErrorMessage = "Port must be between $RangeStart and $RangeEnd." }
+    }
+    return @{ Valid = $true; ErrorMessage = '' }
+}
+
+function Get-UsedPorts {
+    <#
+    .SYNOPSIS Scans docker ps for ports mapped to 8787/tcp.
+              Lightweight alternative to full Get-ContainerStatus.
+    .PARAMETER ContextArgs Docker context arguments (from Get-DockerContextArgs).
+    .OUTPUTS   String array of port numbers currently in use.
+    #>
+    param(
+        [string[]]$ContextArgs = @()
+    )
+    $portUsers = @()
+    try {
+        $psCmd = $ContextArgs + @('ps', '--format', '{{.Ports}}')
+        $all = & docker @psCmd 2>$null
+        if ($LASTEXITCODE -eq 0 -and $all) {
+            foreach ($line in ($all -split "`n")) {
+                if ($line -match '0\.0\.0\.0:(\d{4,5})->8787/tcp') {
+                    $port = $matches[1]
+                    if ($portUsers -notcontains $port) { $portUsers += $port }
+                }
+            }
+        }
+    } catch {
+        Write-Log "Quick port scan failed: $($_.Exception.Message)" 'Warn'
+    }
+    return $portUsers
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Docker error helpers
+# ══════════════════════════════════════════════════════════════════════════════
+function Format-DockerError {
+    <#
+    .SYNOPSIS Translates raw Docker error output into user-friendly messages.
+    .PARAMETER RawError The raw stderr/stdout from a failed docker run.
+    .OUTPUTS   A user-friendly error string.
+    #>
+    param([string]$RawError)
+
+    if ([string]::IsNullOrWhiteSpace($RawError)) {
+        return 'Docker error: unknown failure (no output captured).'
+    }
+
+    $lower = $RawError.ToLower()
+
+    if ($lower -match 'port is already allocated' -or $lower -match 'address already in use') {
+        if ($RawError -match '(\d{4,5})') {
+            return "Port $($matches[1]) is already in use. Choose a different port."
+        }
+        return 'The selected port is already in use. Choose a different port.'
+    }
+
+    if ($lower -match 'no such file or directory' -or $lower -match 'mount path' -or $lower -match 'invalid mount config') {
+        return "A mount path does not exist or is invalid. Check your repository and YAML paths.`n`nDocker details: $RawError"
+    }
+
+    if ($lower -match 'no space left on device') {
+        return 'Disk is full. Free up space and try again.'
+    }
+
+    if ($lower -match 'denied' -or $lower -match 'permission') {
+        return "Permission denied. Check Docker permissions and ensure your user can run Docker.`n`nDocker details: $RawError"
+    }
+
+    if ($lower -match 'conflict.*name.*already in use') {
+        return "A container with this name already exists. Stop it first or use a different name.`n`nDocker details: $RawError"
+    }
+
+    if ($lower -match 'image.*not found' -or $lower -match 'no such image') {
+        return "The Docker image was not found. Ensure the image has been built.`n`nDocker details: $RawError"
+    }
+
+    return "Docker error: $RawError"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  YAML / path helpers
 # ══════════════════════════════════════════════════════════════════════════════
 function Get-YamlPathValue {
@@ -833,6 +948,7 @@ function Initialize-ThemePalette {
 function Apply-ThemeToForm {
     param([System.Windows.Forms.Form]$Form)
     Initialize-ThemePalette
+    $Form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
     $Form.BackColor = $script:ThemePalette.Back
     $Form.ForeColor = $script:ThemePalette.Text
     $Form.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Regular)
@@ -1810,6 +1926,12 @@ Export-ModuleMember -Function @(
     'Remove-RemoteContainerMetadata'
     'Read-RemoteContainerMetadata'
     'Get-ContainerRuntimeInfo'
+    # Port helpers
+    'Get-NextAvailablePort'
+    'Test-PortValue'
+    'Get-UsedPorts'
+    # Docker error helpers
+    'Format-DockerError'
     # YAML / paths
     'Get-YamlPathValue'
     'Test-AndCreateDirectory'
