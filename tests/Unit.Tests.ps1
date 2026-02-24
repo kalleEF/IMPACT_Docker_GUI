@@ -746,20 +746,150 @@ Describe 'New-TestSessionState (helper)' -Tag Unit {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Get-DockerCredentialsFromDotEnv — pure .env parser
+#  Get-NextAvailablePort
 # ═══════════════════════════════════════════════════════════════════════════════
-Describe 'Get-DockerCredentialsFromDotEnv' -Tag Unit {
-    It 'Parses DOCKERHUB_USERNAME / DOCKERHUB_TOKEN pair' {
-        $env = @"
-DOCKERHUB_USERNAME=myuser
-DOCKERHUB_TOKEN=mytoken123
-"@
-        $result = Get-DockerCredentialsFromDotEnv -EnvContent $env
-        $result | Should -Not -BeNullOrEmpty
-        $result.Username | Should -Be 'myuser'
-        $result.Password | Should -Be 'mytoken123'
-        $result.Registry | Should -Be 'docker.io'
-        $result.Source   | Should -Be 'dotenv'
+Describe 'Get-NextAvailablePort' -Tag Unit {
+    It 'Returns 8787 when no ports are used' {
+        Get-NextAvailablePort -UsedPorts @() | Should -Be '8787'
+    }
+
+    It 'Returns 8787 with default parameters' {
+        Get-NextAvailablePort | Should -Be '8787'
+    }
+
+    It 'Skips used ports and returns the first available' {
+        Get-NextAvailablePort -UsedPorts @('8787','8788') | Should -Be '8789'
+    }
+
+    It 'Returns the first gap in used ports' {
+        Get-NextAvailablePort -UsedPorts @('8787','8789') | Should -Be '8788'
+    }
+
+    It 'Returns RangeStart when all ports are occupied' {
+        $all = 8787..8799 | ForEach-Object { [string]$_ }
+        Get-NextAvailablePort -UsedPorts $all | Should -Be '8787'
+    }
+
+    It 'Accepts custom range' {
+        Get-NextAvailablePort -UsedPorts @('9000') -RangeStart 9000 -RangeEnd 9005 | Should -Be '9001'
+    }
+
+    It 'Returns a string' {
+        $result = Get-NextAvailablePort -UsedPorts @()
+        $result | Should -BeOfType [string]
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Test-PortValue
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Test-PortValue' -Tag Unit {
+    It 'Accepts 8787 as valid' {
+        $result = Test-PortValue -Port '8787'
+        $result.Valid | Should -BeTrue
+        $result.ErrorMessage | Should -BeNullOrEmpty
+    }
+
+    It 'Accepts 8799 as valid (upper bound)' {
+        $result = Test-PortValue -Port '8799'
+        $result.Valid | Should -BeTrue
+    }
+
+    It 'Rejects empty string' {
+        $result = Test-PortValue -Port ''
+        $result.Valid | Should -BeFalse
+        $result.ErrorMessage | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Rejects whitespace-only input' {
+        $result = Test-PortValue -Port '   '
+        $result.Valid | Should -BeFalse
+    }
+
+    It 'Rejects non-numeric input' {
+        $result = Test-PortValue -Port 'abc'
+        $result.Valid | Should -BeFalse
+        $result.ErrorMessage | Should -Match 'number'
+    }
+
+    It 'Rejects mixed alphanumeric input' {
+        $result = Test-PortValue -Port '87a87'
+        $result.Valid | Should -BeFalse
+        $result.ErrorMessage | Should -Match 'number'
+    }
+
+    It 'Rejects port below range' {
+        $result = Test-PortValue -Port '8786'
+        $result.Valid | Should -BeFalse
+        $result.ErrorMessage | Should -Match '8787.*8799'
+    }
+
+    It 'Rejects port above range' {
+        $result = Test-PortValue -Port '8800'
+        $result.Valid | Should -BeFalse
+        $result.ErrorMessage | Should -Match '8787.*8799'
+    }
+
+    It 'Accepts custom range' {
+        $result = Test-PortValue -Port '9000' -RangeStart 9000 -RangeEnd 9010
+        $result.Valid | Should -BeTrue
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Format-DockerError
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Format-DockerError' -Tag Unit {
+    It 'Detects port-already-allocated errors' {
+        $result = Format-DockerError -RawError 'Error response from daemon: Ports are not available: exposing port TCP 0.0.0.0:8787 -> 0.0.0.0:0: listen tcp4 0.0.0.0:8787: bind: address already in use'
+        $result | Should -Match 'already in use'
+        $result | Should -Match 'Choose a different port'
+    }
+
+    It 'Detects mount path errors' {
+        $result = Format-DockerError -RawError 'Error response from daemon: invalid mount config for type "bind": bind source path does not exist: /nonexistent/path'
+        $result | Should -Match 'mount path'
+    }
+
+    It 'Detects disk full errors' {
+        $result = Format-DockerError -RawError 'no space left on device'
+        $result | Should -Match 'Disk is full'
+    }
+
+    It 'Detects permission errors' {
+        $result = Format-DockerError -RawError 'Got permission denied while trying to connect to the Docker daemon socket'
+        $result | Should -Match 'Permission denied'
+    }
+
+    It 'Detects name conflict errors' {
+        $result = Format-DockerError -RawError 'Conflict. The container name "/test" is already in use by container "abc123".'
+        $result | Should -Match 'already exists'
+    }
+
+    It 'Detects image not found errors' {
+        $result = Format-DockerError -RawError 'Unable to find image "myapp:latest" locally: no such image'
+        $result | Should -Match 'image was not found'
+    }
+
+    It 'Returns default message for unknown errors' {
+        $result = Format-DockerError -RawError 'some other error xyz'
+        $result | Should -Match '^Docker error:'
+        $result | Should -Match 'xyz'
+    }
+
+    It 'Handles empty input' {
+        $result = Format-DockerError -RawError ''
+        $result | Should -Match 'unknown failure'
+    }
+}
+
+# Save Unit test artifacts (TestResults XML)
+AfterAll {
+    try {
+        if (-not (Get-Command -Name Save-TestArtifacts -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'Helpers' 'TestSessionState.ps1') }
+        Save-TestArtifacts -Suite 'unit' -ExtraFiles @('./tests/TestResults-Unit.xml')
+    } catch {
+        Write-Warning "Failed to save unit test artifacts: $($_.Exception.Message)"
     }
 
     It 'Parses DOCKER_USERNAME / DOCKER_PASSWORD pair' {

@@ -14,7 +14,10 @@
       "Bash(DOCKER_CONTEXT=desktop-linux docker cp:*)",
       "Bash(DOCKER_CONTEXT=desktop-linux docker exec:*)",
       "Bash(ssh:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(git -C \"C:/Users/ge28bak/OneDrive - TUM/TUM_Personal/1_Research/Repos/IMPACT_Docker_GUI/.claude/worktrees/nervous-faraday\" diff --stat main...HEAD)",
+      "Bash(git -C \"C:/Users/ge28bak/OneDrive - TUM/TUM_Personal/1_Research/Repos/IMPACT_Docker_GUI/.claude/worktrees/nervous-faraday\" diff --stat HEAD)",
+      "Bash(git -C \"C:/Users/ge28bak/OneDrive - TUM/TUM_Personal/1_Research/Repos/IMPACT_Docker_GUI/.claude/worktrees/nervous-faraday\" diff HEAD -- \"current_version/IMPACT_Docker_GUI.psm1\" \"current_version/IMPACT_Docker_GUI_v2.ps1\" \"tests/Unit.Tests.ps1\")"
     ]
   }
 }
