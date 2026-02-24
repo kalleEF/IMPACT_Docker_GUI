@@ -866,7 +866,7 @@ function Show-ContainerManager {
 
     $form = New-Object System.Windows.Forms.Form -Property @{
         Text = 'Container Management - IMPACT NCD Germany'
-        Size = New-Object System.Drawing.Size(540,500)
+        Size = New-Object System.Drawing.Size(540,510)
         FormBorderStyle = 'FixedDialog'
         MaximizeBox = $false
     }
@@ -938,28 +938,28 @@ function Show-ContainerManager {
     $form.Controls.Add($lblParams); $form.Controls.Add($txtParams)
 
     $defaultYaml = if ($isLocal) { '.\inputs\sim_design_local.yaml' } else { '.\inputs\sim_design.yaml' }
-    $lblYaml = New-Object System.Windows.Forms.Label -Property @{ Text='sim_design.yaml'; Location=New-Object System.Drawing.Point(20,336); Size=New-Object System.Drawing.Size(130,22) }
-    $txtYaml = New-Object System.Windows.Forms.TextBox -Property @{ Location=New-Object System.Drawing.Point(152,334); Size=New-Object System.Drawing.Size(352,24); Text=$defaultYaml }
+    $lblYaml = New-Object System.Windows.Forms.Label -Property @{ Text='sim_design.yaml'; Location=New-Object System.Drawing.Point(20,344); Size=New-Object System.Drawing.Size(130,22) }
+    $txtYaml = New-Object System.Windows.Forms.TextBox -Property @{ Location=New-Object System.Drawing.Point(152,342); Size=New-Object System.Drawing.Size(352,24); Text=$defaultYaml }
     Style-Label -Label $lblYaml
     Style-TextBox -TextBox $txtYaml
     $form.Controls.Add($lblYaml); $form.Controls.Add($txtYaml)
 
-    $lblStatus = New-Object System.Windows.Forms.Label -Property @{ Text=''; Location=New-Object System.Drawing.Point(20,410); Size=New-Object System.Drawing.Size(460,26) }
+    $lblStatus = New-Object System.Windows.Forms.Label -Property @{ Text=''; Location=New-Object System.Drawing.Point(20,418); Size=New-Object System.Drawing.Size(460,26) }
     Style-Label -Label $lblStatus
     $lblStatus.ForeColor = [System.Drawing.Color]::LightGreen
     $form.Controls.Add($lblStatus)
 
     $buildInfo = $State.Metadata.BuildInfo
     $footerText = if ($buildInfo) { "Build: $($buildInfo.Version) | Commit: $($buildInfo.Commit) | Built: $($buildInfo.Built)" } else { 'Build: unknown' }
-    $lblFooter = New-Object System.Windows.Forms.Label -Property @{ Text=$footerText; Location=New-Object System.Drawing.Point(20,440); Size=New-Object System.Drawing.Size(460,22) }
+    $lblFooter = New-Object System.Windows.Forms.Label -Property @{ Text=$footerText; Location=New-Object System.Drawing.Point(20,448); Size=New-Object System.Drawing.Size(460,22) }
     Style-Label -Label $lblFooter -Muted:$true
     $form.Controls.Add($lblFooter)
 
-    $btnBack = New-Object System.Windows.Forms.Button -Property @{ Text=[char]0x2190 + ' Back'; Location=New-Object System.Drawing.Point(12,374); Size=New-Object System.Drawing.Size(100,34) }
+    $btnBack = New-Object System.Windows.Forms.Button -Property @{ Text=[char]0x2190 + ' Back'; Location=New-Object System.Drawing.Point(12,382); Size=New-Object System.Drawing.Size(100,34) }
     Style-Button -Button $btnBack -Variant 'secondary'
     $form.Controls.Add($btnBack)
 
-    $btnClose = New-Object System.Windows.Forms.Button -Property @{ Text='Close'; Location=New-Object System.Drawing.Point(414,374); Size=New-Object System.Drawing.Size(90,34) }
+    $btnClose = New-Object System.Windows.Forms.Button -Property @{ Text='Close'; Location=New-Object System.Drawing.Point(414,382); Size=New-Object System.Drawing.Size(90,34) }
     Style-Button -Button $btnClose -Variant 'secondary'
     $form.Controls.Add($btnClose)
     $form.CancelButton = $btnClose
@@ -985,23 +985,65 @@ function Show-ContainerManager {
     function Update-InfoBox {
         param($Status)
         $info.Clear()
-        $info.SelectionFont = New-Object System.Drawing.Font('Segoe UI Semibold',10,[System.Drawing.FontStyle]::Bold)
+        $palette = Get-ThemePalette
 
         $passDisplay = if ($State.Metadata.Recovered.Password) { $State.Metadata.Recovered.Password } else { $State.Password }
         $portDisplay = if ($State.Metadata.ActivePort) { $State.Metadata.ActivePort } elseif ($State.Metadata.Recovered.Port) { ($State.Metadata.Recovered.Port -split '\s+')[0] } else { '8787' }
         $hostDisplay = if ($State.ContainerLocation -eq 'LOCAL') { "http://localhost:$portDisplay" } else { "http://$($State.RemoteHostIp):$portDisplay" }
 
-        # Status line with emphasis
-        $info.SelectionColor = if ($Status -eq 'RUNNING') { [System.Drawing.Color]::LightGreen } else { [System.Drawing.Color]::Orange }
-        $info.AppendText("Status: $Status`n")
+        # Status indicator — large and prominent
+        $info.SelectionFont = New-Object System.Drawing.Font('Segoe UI Semibold',11,[System.Drawing.FontStyle]::Bold)
+        if ($Status -eq 'RUNNING') {
+            $info.SelectionColor = $palette.Success
+            $info.AppendText("$([char]0x25CF)  RUNNING`n")
+        } else {
+            $info.SelectionColor = $palette.AccentAlt
+            $info.AppendText("$([char]0x25CB)  STOPPED`n")
+        }
 
-        $info.SelectionColor = $form.ForeColor
-        $info.SelectionFont = New-Object System.Drawing.Font('Segoe UI',9,[System.Drawing.FontStyle]::Regular)
-        $info.AppendText("URL: $hostDisplay`n")
-        $info.AppendText("RStudio login: rstudio (Password: $passDisplay)`n")
-        $info.AppendText("Repo: $($State.SelectedRepo)`n")
-        $info.AppendText("Container: $($State.ContainerName)`n")
-        $info.AppendText("Location: $($State.ContainerLocation)`n")
+        # Section separator
+        $info.SelectionFont = New-Object System.Drawing.Font('Segoe UI',4,[System.Drawing.FontStyle]::Regular)
+        $info.AppendText("`n")
+
+        # Reusable fonts
+        $labelFont = New-Object System.Drawing.Font('Segoe UI',9,[System.Drawing.FontStyle]::Regular)
+        $bodyFont  = New-Object System.Drawing.Font('Segoe UI',9,[System.Drawing.FontStyle]::Regular)
+
+        # Connection info
+        $info.SelectionFont = $labelFont; $info.SelectionColor = $palette.Accent
+        $info.AppendText("  URL          ")
+        $info.SelectionFont = $bodyFont;  $info.SelectionColor = $palette.Text
+        $info.AppendText("$hostDisplay`n")
+
+        $info.SelectionFont = $labelFont; $info.SelectionColor = $palette.Accent
+        $info.AppendText("  Login        ")
+        $info.SelectionFont = $bodyFont;  $info.SelectionColor = $palette.Text
+        $info.AppendText("rstudio`n")
+
+        $info.SelectionFont = $labelFont; $info.SelectionColor = $palette.Accent
+        $info.AppendText("  Password     ")
+        $info.SelectionFont = $bodyFont;  $info.SelectionColor = $palette.Text
+        $info.AppendText("$passDisplay`n")
+
+        # Section separator
+        $info.SelectionFont = New-Object System.Drawing.Font('Segoe UI',4,[System.Drawing.FontStyle]::Regular)
+        $info.AppendText("`n")
+
+        # Project info
+        $info.SelectionFont = $labelFont; $info.SelectionColor = $palette.Accent
+        $info.AppendText("  Repository   ")
+        $info.SelectionFont = $bodyFont;  $info.SelectionColor = $palette.Text
+        $info.AppendText("$($State.SelectedRepo)`n")
+
+        $info.SelectionFont = $labelFont; $info.SelectionColor = $palette.Muted
+        $info.AppendText("  Container    ")
+        $info.SelectionFont = $bodyFont;  $info.SelectionColor = $palette.Muted
+        $info.AppendText("$($State.ContainerName)`n")
+
+        $info.SelectionFont = $labelFont; $info.SelectionColor = $palette.Accent
+        $info.AppendText("  Location     ")
+        $info.SelectionFont = $bodyFont;  $info.SelectionColor = $palette.Text
+        $info.AppendText("$($State.ContainerLocation)`n")
     }
     Update-InfoBox -Status ($(if($isRunning){'RUNNING'}else{'STOPPED'}))
     $lblStatus.Text = ''
