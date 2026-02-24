@@ -498,6 +498,21 @@ function Get-ContainerRuntimeInfo {
     return $info
 }
 
+function Get-NextAvailablePort {
+    param(
+        [string[]]$UsedPorts = @(),
+        [int]$RangeStart = 8787,
+        [int]$RangeEnd   = 8799
+    )
+    for ($p = $RangeStart; $p -le $RangeEnd; $p++) {
+        if ($UsedPorts -notcontains [string]$p) {
+            return [string]$p
+        }
+    }
+    # All ports in range occupied — return the default; conflict check at start time will catch it
+    return [string]$RangeStart
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  YAML / path helpers
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1863,6 +1878,7 @@ Export-ModuleMember -Function @(
     'Remove-RemoteContainerMetadata'
     'Read-RemoteContainerMetadata'
     'Get-ContainerRuntimeInfo'
+    'Get-NextAvailablePort'
     # YAML / paths
     'Get-YamlPathValue'
     'Test-AndCreateDirectory'
