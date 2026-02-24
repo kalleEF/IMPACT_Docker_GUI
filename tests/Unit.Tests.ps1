@@ -891,7 +891,9 @@ AfterAll {
     } catch {
         Write-Warning "Failed to save unit test artifacts: $($_.Exception.Message)"
     }
+}
 
+Describe 'Get-DockerCredentialsFromDotEnv' -Tag Unit {
     It 'Parses DOCKER_USERNAME / DOCKER_PASSWORD pair' {
         $env = @"
 DOCKER_USERNAME=dockuser
