@@ -903,8 +903,8 @@ function Show-ContainerManager {
     $form.Controls.Add($chkRebuild)
     $form.Controls.Add($chkHigh)
 
-    $lblPort = New-Object System.Windows.Forms.Label -Property @{ Text='Port Override'; Location=New-Object System.Drawing.Point(20,304); Size=New-Object System.Drawing.Size(110,22) }
-    $defaultPort = if ($State.Metadata.Recovered.Port) { $State.Metadata.Recovered.Port } else { '8787' }
+    $lblPort = New-Object System.Windows.Forms.Label -Property @{ Text='Port'; Location=New-Object System.Drawing.Point(20,304); Size=New-Object System.Drawing.Size(110,22) }
+    $defaultPort = if ($State.Metadata.Recovered.Port) { $State.Metadata.Recovered.Port } else { Get-NextAvailablePort -UsedPorts $State.Ports.Used }
     $txtPort = New-Object System.Windows.Forms.TextBox -Property @{ Location=New-Object System.Drawing.Point(136,302); Size=New-Object System.Drawing.Size(90,24); Text=$defaultPort }
     Style-Label -Label $lblPort
     Style-TextBox -TextBox $txtPort
@@ -912,7 +912,6 @@ function Show-ContainerManager {
 
     $isLocal = ($State.ContainerLocation -eq 'LOCAL')
     if ($isLocal) {
-        $txtPort.Enabled = $false
         $chkHigh.Enabled = $false
     }
 
