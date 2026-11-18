@@ -1122,3 +1122,196 @@ Describe 'Test-GitHubUsername' -Tag Unit {
 }
 
 # Artifact persistence is handled by Invoke-Tests.ps1 (only on failure/skip).
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Get-YamlPathValue: quoted values, empty values, '~' and unreadable files
+#  (an empty or missing YAML used to throw under StrictMode instead of returning $null)
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Get-YamlPathValue (quotes, empty values, ~, unreadable YAML)' -Tag Unit {
+    BeforeAll {
+        # Pester can only mock a command that exists. On machines without an ssh client
+        # (for example a Linux test box) we define a throw-away global 'ssh' function so the
+        # REMOTE mocks below still work. It is removed again in AfterAll.
+        $script:yamlSshStubAdded = $false
+        if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+            function global:ssh { throw 'ssh stub: this call should have been mocked' }
+            $script:yamlSshStubAdded = $true
+        }
+    }
+
+    AfterAll {
+        # Note: 'Function:\ssh' (not 'function:global:ssh', which silently removes nothing).
+        # The stub must really go, or later test files would see a fake ssh command.
+        if ($script:yamlSshStubAdded) { Remove-Item -Path Function:\ssh -ErrorAction SilentlyContinue }
+    }
+
+    BeforeEach {
+        $testDir = Join-Path ([System.IO.Path]::GetTempPath()) "impact_yaml_q_$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        New-Item -ItemType Directory -Path $testDir -Force | Out-Null
+        $yamlFile = Join-Path $testDir 'sim_design.yaml'
+        $baseDir = ($testDir -replace '\\', '/')
+    }
+
+    AfterEach {
+        Remove-Item -Recurse -Force -Path $testDir -ErrorAction SilentlyContinue
+    }
+
+    It 'Strips double quotes from an absolute path (and ignores a trailing comment)' {
+        Set-Content -Path $yamlFile -Value 'output_dir: "/data/impact/outputs"  # shared folder'
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Get-YamlPathValue -State $state -YamlPath $yamlFile -Key 'output_dir' -BaseDir $baseDir
+        $result | Should -Be '/data/impact/outputs'
+    }
+
+    It 'Strips single quotes and keeps a # that is inside the quotes' {
+        Set-Content -Path $yamlFile -Value "output_dir: './out#1'"
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Get-YamlPathValue -State $state -YamlPath $yamlFile -Key 'output_dir' -BaseDir $baseDir
+        $result | Should -Be "$baseDir/./out#1"
+    }
+
+    It 'Unescapes doubled backslashes inside double quotes' {
+        Set-Content -Path $yamlFile -Value 'output_dir: "C:\\IMPACT\\outputs"'
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Get-YamlPathValue -State $state -YamlPath $yamlFile -Key 'output_dir' -BaseDir $baseDir
+        # On Windows the path is absolute and returned as-is; elsewhere it is joined to BaseDir.
+        # Either way the quotes are gone and \\ became one separator.
+        $result | Should -BeLike '*C:/IMPACT/outputs'
+        $result | Should -Not -Match '"'
+    }
+
+    It 'Returns null for an empty value instead of the repository folder' {
+        Set-Content -Path $yamlFile -Value "output_dir:`nsynthpop_dir: ./inputs/synthpop"
+        $state = New-TestSessionState -Location 'LOCAL'
+        Get-YamlPathValue -State $state -YamlPath $yamlFile -Key 'output_dir' -BaseDir $baseDir | Should -BeNullOrEmpty
+    }
+
+    It 'Returns null for the YAML null marker ~' {
+        Set-Content -Path $yamlFile -Value 'output_dir: ~'
+        $state = New-TestSessionState -Location 'LOCAL'
+        Get-YamlPathValue -State $state -YamlPath $yamlFile -Key 'output_dir' -BaseDir $baseDir | Should -BeNullOrEmpty
+    }
+
+    It 'Returns null (and does not throw) for an empty local YAML file' {
+        [System.IO.File]::WriteAllText($yamlFile, '')
+        $state = New-TestSessionState -Location 'LOCAL'
+        { Get-YamlPathValue -State $state -YamlPath $yamlFile -Key 'output_dir' -BaseDir $baseDir } | Should -Not -Throw
+        Get-YamlPathValue -State $state -YamlPath $yamlFile -Key 'output_dir' -BaseDir $baseDir | Should -BeNullOrEmpty
+    }
+
+    It 'Returns null (and does not throw) when SSH returns nothing' {
+        Mock ssh { } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.7'
+        { Get-YamlPathValue -State $state -YamlPath '/repo/inputs/nope.yaml' -Key 'output_dir' -BaseDir '/repo' } | Should -Not -Throw
+        Get-YamlPathValue -State $state -YamlPath '/repo/inputs/nope.yaml' -Key 'output_dir' -BaseDir '/repo' | Should -BeNullOrEmpty
+    }
+
+    It 'Returns null when the remote YAML file does not exist' {
+        Mock ssh { '__IMPACT_YAML_MISSING__' } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.7'
+        Get-YamlPathValue -State $state -YamlPath '/repo/inputs/nope.yaml' -Key 'output_dir' -BaseDir '/repo' | Should -BeNullOrEmpty
+    }
+
+    It 'Expands ~/ to the remote user home folder in REMOTE mode' {
+        Mock ssh { 'output_dir: ~/IMPACT/outputs' } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.7'
+        $result = Get-YamlPathValue -State $state -YamlPath '/repo/inputs/sim_design.yaml' -Key 'output_dir' -BaseDir '/repo'
+        $result | Should -Be "/home/$($state.RemoteUser)/IMPACT/outputs"
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Test-AndCreateDirectory: -Reason codes and -Create
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Test-AndCreateDirectory (-Reason and -Create)' -Tag Unit {
+    BeforeAll {
+        # Same ssh stub as above, for machines without an ssh client.
+        $script:dirSshStubAdded = $false
+        if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+            function global:ssh { throw 'ssh stub: this call should have been mocked' }
+            $script:dirSshStubAdded = $true
+        }
+    }
+
+    AfterAll {
+        if ($script:dirSshStubAdded) { Remove-Item -Path Function:\ssh -ErrorAction SilentlyContinue }
+    }
+
+    BeforeEach {
+        $testDir = Join-Path ([System.IO.Path]::GetTempPath()) "impact_dir_test_$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        New-Item -ItemType Directory -Path $testDir -Force | Out-Null
+    }
+
+    AfterEach {
+        Remove-Item -Recurse -Force -Path $testDir -ErrorAction SilentlyContinue
+    }
+
+    It 'Still works without -Reason (old callers)' {
+        $state = New-TestSessionState -Location 'LOCAL'
+        Test-AndCreateDirectory -State $state -Path $testDir -PathKey 'output_dir' | Should -BeTrue
+        Test-AndCreateDirectory -State $state -Path (Join-Path $testDir 'missing') -PathKey 'output_dir' | Should -BeFalse
+    }
+
+    It 'Reports EmptyPath for a null path' {
+        $state = New-TestSessionState -Location 'LOCAL'
+        $why = $null
+        Test-AndCreateDirectory -State $state -Path $null -PathKey 'output_dir' -Reason ([ref]$why) | Should -BeFalse
+        $why | Should -Be 'EmptyPath'
+    }
+
+    It 'Reports Missing for a local folder that does not exist, and creates nothing' {
+        $state = New-TestSessionState -Location 'LOCAL'
+        $missing = Join-Path $testDir 'outputs'
+        $why = $null
+        Test-AndCreateDirectory -State $state -Path $missing -PathKey 'output_dir' -Reason ([ref]$why) | Should -BeFalse
+        $why | Should -Be 'Missing'
+        Test-Path $missing | Should -BeFalse
+    }
+
+    It 'Creates a missing local folder (including parents) with -Create' {
+        $state = New-TestSessionState -Location 'LOCAL'
+        $missing = Join-Path (Join-Path $testDir 'inputs') 'synthpop'
+        $why = $null
+        Test-AndCreateDirectory -State $state -Path $missing -PathKey 'synthpop_dir' -Create -Reason ([ref]$why) | Should -BeTrue
+        Test-Path $missing -PathType Container | Should -BeTrue
+        $why | Should -BeNullOrEmpty
+    }
+
+    It 'Reports PosixPathInLocalMode for a Linux-style path in LOCAL mode' -Skip:(-not $IsWindows) {
+        $state = New-TestSessionState -Location 'LOCAL'
+        $why = $null
+        Test-AndCreateDirectory -State $state -Path '/home/user/data' -PathKey 'output_dir' -Reason ([ref]$why) | Should -BeFalse
+        $why | Should -Be 'PosixPathInLocalMode'
+    }
+
+    It 'Reports Missing when the remote folder does not exist' {
+        Mock ssh { 'MISSING' } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.5'
+        $why = $null
+        Test-AndCreateDirectory -State $state -Path '/repo/outputs' -PathKey 'output_dir' -Reason ([ref]$why) | Should -BeFalse
+        $why | Should -Be 'Missing'
+    }
+
+    It 'Reports Unreachable when SSH returns nothing' {
+        Mock ssh { } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.5'
+        $why = $null
+        Test-AndCreateDirectory -State $state -Path '/repo/outputs' -PathKey 'output_dir' -Reason ([ref]$why) | Should -BeFalse
+        $why | Should -Be 'Unreachable'
+    }
+
+    It 'Creates a missing remote folder with mkdir -p when -Create is given' {
+        Mock ssh { if ("$args" -match 'mkdir -p') { 'CREATED' } else { 'MISSING' } } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.5'
+        Test-AndCreateDirectory -State $state -Path '/repo/outputs' -PathKey 'output_dir' -Create | Should -BeTrue
+        Should -Invoke ssh -ModuleName 'IMPACT_Docker_GUI' -Times 2 -Exactly
+    }
+
+    It 'Reports CreateFailed when the remote mkdir does not succeed' {
+        Mock ssh { if ("$args" -match 'mkdir -p') { } else { 'MISSING' } } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.5'
+        $why = $null
+        Test-AndCreateDirectory -State $state -Path '/repo/outputs' -PathKey 'output_dir' -Create -Reason ([ref]$why) | Should -BeFalse
+        $why | Should -Be 'CreateFailed'
+    }
+}

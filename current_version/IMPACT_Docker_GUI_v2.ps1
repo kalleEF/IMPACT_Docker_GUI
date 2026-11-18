@@ -974,6 +974,15 @@ function Show-ContainerManager {
     })
 
     $form.Add_FormClosing({
+        # While a long step is running (see Set-ManagerBusy below), closing the window would
+        # abandon that step halfway, so we refuse and explain instead. The ['Busy'] index form
+        # is used because it simply returns $null when the key was never set; reading a missing
+        # key with .Busy would throw under StrictMode.
+        if ($State.Metadata['Busy']) {
+            [System.Windows.Forms.MessageBox]::Show("Please wait: a long task (for example building the Docker image) is still running.`n`nIts progress is shown in the console window. You can close this window once it has finished.",'Please wait','OK','Information') | Out-Null
+            $_.Cancel = $true
+            return
+        }
         if ($State.Metadata.ContainerRunning) {
             if ($form.Tag -ne 'back') {
                 $answer = [System.Windows.Forms.MessageBox]::Show('A container is still running. Close without stopping?','Container running','YesNo','Warning')
@@ -981,6 +990,51 @@ function Show-ContainerManager {
             }
         }
     })
+
+    # Busy mode for long steps such as 'docker build'. These steps run on the window's own
+    # thread, so the window cannot react until they finish (Windows may even show it as
+    # "Not Responding"). To make that clear and safe, busy mode:
+    #   - disables the Start, Stop, Back and Close buttons,
+    #   - shows a short status text and the wait cursor,
+    #   - sets $State.Metadata.Busy, so FormClosing (above) refuses to close the window.
+    # Usage: Set-ManagerBusy -Busy $true -Message '...' before the step, and
+    #        Set-ManagerBusy -Busy $false inside a 'finally' block after it, so the buttons
+    #        come back even when the step fails or returns early.
+    # We deliberately do NOT call [System.Windows.Forms.Application]::DoEvents(): it would let
+    # other clicks (Stop, Back, Close) run in the middle of the step.
+    function Set-ManagerBusy {
+        param([bool]$Busy, [string]$Message = '')
+        if ($Busy) {
+            if (-not $State.Metadata['Busy']) {
+                # Remember which buttons were usable, so exactly that state can be restored.
+                $State.Metadata.BusyButtonState = @{ Start = $btnStart.Enabled; Stop = $btnStop.Enabled; Back = $btnBack.Enabled; Close = $btnClose.Enabled }
+            }
+            $State.Metadata.Busy = $true
+            $btnStart.Enabled = $false
+            $btnStop.Enabled  = $false
+            $btnBack.Enabled  = $false
+            $btnClose.Enabled = $false
+            $lblStatus.Text = $Message
+            $form.UseWaitCursor = $true
+            [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::WaitCursor
+            # Repaint right now: the thread is about to be blocked, and without this the new text
+            # and the greyed-out buttons would only appear after the step is over.
+            $form.Refresh()
+        } else {
+            $State.Metadata.Busy = $false
+            $saved = $State.Metadata['BusyButtonState']
+            if ($saved) {
+                $btnStart.Enabled = $saved.Start
+                $btnStop.Enabled  = $saved.Stop
+                $btnBack.Enabled  = $saved.Back
+                $btnClose.Enabled = $saved.Close
+                $State.Metadata.BusyButtonState = $null
+            }
+            $lblStatus.Text = $Message
+            $form.UseWaitCursor = $false
+            [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::Default
+        }
+    }
 
     function Update-InfoBox {
         param($Status)
@@ -1109,6 +1163,76 @@ function Show-ContainerManager {
         if ($State.ContainerLocation -eq 'LOCAL' -and -not (Test-Path $simDesign)) {
             [System.Windows.Forms.MessageBox]::Show("YAML file not found at $simDesign",'Missing YAML','OK','Error') | Out-Null; return
         }
+        if ($State.ContainerLocation -like 'REMOTE@*') {
+            # Same check for the workstation: Test-Path above cannot see files there, so we ask
+            # over SSH. It runs before any image build, so a mistyped YAML name is reported in
+            # seconds instead of after a long build. The two marker words let us tell
+            # "file missing" apart from "connection failed" (which prints nothing at all).
+            $yamlCheck = $null
+            try {
+                $yamlHost = Get-RemoteHostString -State $State
+                $yamlCheck = & ssh -n -i $State.Paths.SshPrivate -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $yamlHost "test -f '$simDesign' && echo YAML_OK || echo YAML_MISSING" 2>$null
+            } catch {
+                Write-Log "Remote YAML check failed: $($_.Exception.Message)" 'Warn'
+            }
+            if ("$yamlCheck" -match 'YAML_MISSING') {
+                [System.Windows.Forms.MessageBox]::Show("YAML file not found on the workstation at:`n$simDesign`n`nCheck the file name in the 'sim_design.yaml' box.",'Missing YAML','OK','Error') | Out-Null; return
+            }
+            if ("$yamlCheck" -notmatch 'YAML_OK') {
+                [System.Windows.Forms.MessageBox]::Show("Could not reach the workstation to check the YAML file:`n$simDesign`n`nCheck your network or VPN connection and try again.",'Connection problem','OK','Error') | Out-Null; return
+            }
+        }
+
+        # Resolve output/synthpop from sim_design and check that both folders exist.
+        # This used to run after the image build; it now runs before it, so a missing folder or
+        # YAML setting is reported in seconds instead of after a build that can take an hour.
+        $baseDirForYaml = ($projectRoot -replace '\\','/')
+        $outputDir = Get-YamlPathValue -State $State -YamlPath $simDesign -Key 'output_dir' -BaseDir $baseDirForYaml
+        $synthDir  = Get-YamlPathValue -State $State -YamlPath $simDesign -Key 'synthpop_dir' -BaseDir $baseDirForYaml
+
+        # Checks one folder from the YAML and, when something is wrong, explains exactly what
+        # (instead of one generic "check your YAML" message). If the folder is simply missing,
+        # which is normal for a fresh copy of the repository, it offers to create it.
+        # Returns $true when the folder exists (or was just created), $false to stop Start.
+        function Confirm-YamlFolder {
+            param([string]$Key, [string]$Path)
+            $isRemote = ($State.ContainerLocation -like 'REMOTE@*')
+            if (-not $Path) {
+                $hint = if ($isRemote) { "`n`n(If the workstation connection dropped, simply try again.)" } else { '' }
+                [System.Windows.Forms.MessageBox]::Show("The setting '$Key' was not found (or is empty) in the YAML file:`n$simDesign`n`nAdd a line such as '${Key}: ./outputs' to that file and try again.$hint",'Setting missing in YAML','OK','Error') | Out-Null
+                return $false
+            }
+            $why = $null
+            if (Test-AndCreateDirectory -State $State -Path $Path -PathKey $Key -Reason ([ref]$why)) { return $true }
+            switch ($why) {
+                'PosixPathInLocalMode' {
+                    [System.Windows.Forms.MessageBox]::Show("The setting '$Key' in`n$simDesign`nuses a Linux-style path:`n$Path`n`nLocal runs need a Windows path, for example ./outputs or C:\IMPACT\outputs. Use sim_design_local.yaml for local runs.",'Path error','OK','Error') | Out-Null
+                    return $false
+                }
+                'Unreachable' {
+                    [System.Windows.Forms.MessageBox]::Show("Could not check the folder for '$Key' on the workstation (the SSH connection failed):`n$Path`n`nCheck your network or VPN connection and try again.",'Connection problem','OK','Error') | Out-Null
+                    return $false
+                }
+            }
+            # The folder does not exist. Only offer to create it where that is safe: on this PC
+            # (the dialog shows the full path, so a typo is visible), or on the workstation when
+            # the folder lies inside the repository. Shared storage elsewhere on the workstation
+            # (for example /mnt/...) is never created from here: a wrong path there could create
+            # a stray folder that other users then see.
+            $repoPrefix = ($projectRoot -replace '\\','/').TrimEnd('/') + '/'
+            $insideRepo = $Path.StartsWith($repoPrefix) -and $Path -notmatch '/\.\./'
+            if ($isRemote -and -not $insideRepo) {
+                [System.Windows.Forms.MessageBox]::Show("The folder for '$Key' does not exist on the workstation:`n$Path`n`nIt is outside the repository, so it is not created automatically. Check the path in your YAML file, or ask the workstation administrator.",'Folder missing','OK','Error') | Out-Null
+                return $false
+            }
+            $answer = [System.Windows.Forms.MessageBox]::Show("The folder for '$Key' does not exist yet:`n$Path`n`nThis is normal for a fresh copy of the repository. Create it now?",'Folder missing','YesNo','Question')
+            if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return $false }
+            if (Test-AndCreateDirectory -State $State -Path $Path -PathKey $Key -Create) { return $true }
+            [System.Windows.Forms.MessageBox]::Show("Could not create the folder for '$Key':`n$Path`n`nCheck that the drive or parent folder exists and that you are allowed to write there.",'Path error','OK','Error') | Out-Null
+            return $false
+        }
+        if (-not (Confirm-YamlFolder -Key 'output_dir' -Path $outputDir)) { return }
+        if (-not (Confirm-YamlFolder -Key 'synthpop_dir' -Path $synthDir)) { return }
 
         # Build image name
         $imageName = $State.SelectedRepo.ToLower()
@@ -1132,44 +1256,71 @@ function Show-ContainerManager {
 
         if (-not $imageExists) {
             Write-Log "Building image $imageName (streaming output)..." 'Info'
-            # Build args as single string with quoted paths to survive spaces (parity with v1 streaming)
-            $buildArgsString = "build --build-arg REPO_NAME=$($State.SelectedRepo) -f `"$dockerfileMain`" -t $imageName --no-cache --progress=plain `".`""
-            $buildSucceeded = $false
-            $buildStart = Get-Date
-            try {
-                if ($State.ContainerLocation -eq 'LOCAL') {
-                    # Stream docker build output directly to console (parity with v1)
-                    Push-Location $dockerContext
-                    try {
-                        $p = Start-Process -FilePath 'docker' -ArgumentList $buildArgsString -Wait -PassThru -NoNewWindow
-                        $buildSucceeded = ($p.ExitCode -eq 0)
-                    } finally { Pop-Location }
-                } else {
-                    $remoteHost = Get-RemoteHostString -State $State
-                    $sshKey = $State.Paths.SshPrivate
-                    $cmd = "cd '$dockerContext' && docker build --build-arg REPO_NAME=$($State.SelectedRepo) -f '$dockerfileMain' -t '$imageName' --no-cache ."
-                    $sshArgs = @('-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',"$sshKey",$remoteHost,$cmd)
-                    $p = Start-Process -FilePath 'ssh' -ArgumentList $sshArgs -Wait -NoNewWindow -PassThru
-                    $buildSucceeded = ($p.ExitCode -eq 0)
-                }
-            } catch {
-                $buildSucceeded = $false
+
+            # Wraps one command-line argument in double quotes when needed. Start-Process joins
+            # its -ArgumentList items with plain spaces and adds no quotes, so an item containing
+            # a space (for example a key file under 'C:\Users\Max Mustermann\.ssh') used to reach
+            # ssh as two separate arguments, and the build failed. This follows the standard
+            # Windows rules: a " inside becomes \" and backslashes right before a " are doubled.
+            function ConvertTo-QuotedArgument {
+                param([string]$Value)
+                if ($Value -and $Value -notmatch '[\s"]') { return $Value }
+                $escaped = $Value -replace '(\\*)"', '$1$1\"'
+                $escaped = $escaped -replace '(\\+)$', '$1$1'
+                return '"' + $escaped + '"'
             }
 
-            if (-not $buildSucceeded) {
-                # If this was a REMOTE build, attempt automatic docker login using the repo .env and retry once
-                if ($State.ContainerLocation -like 'REMOTE@*' -and -not $State.Metadata.RemoteLoginAttempted) {
-                    Write-Log 'Remote build failed — attempting automatic remote docker login from repo .env and retrying build.' 'Info'
-                    $State.Metadata.RemoteLoginAttempted = $true
+            # Runs one 'docker build' and returns $true when it succeeded. LOCAL builds run docker
+            # on this PC from inside the build context folder; REMOTE builds run docker on the
+            # workstation over SSH. Start-Process -NoNewWindow is kept (instead of '& docker')
+            # because it streams the build log live into the console window, which is where the
+            # user can follow the progress. One helper replaces four copies of the same code.
+            function Invoke-StartImageBuild {
+                param([string]$Dockerfile, [string]$Tag, [string]$Context, [bool]$WithRepoArg)
+                try {
+                    if ($State.ContainerLocation -eq 'LOCAL') {
+                        $buildArgs = @('build')
+                        if ($WithRepoArg) { $buildArgs += @('--build-arg', "REPO_NAME=$($State.SelectedRepo)") }
+                        $buildArgs += @('-f', $Dockerfile, '-t', $Tag, '--no-cache', '--progress=plain', '.')
+                        $argString = ($buildArgs | ForEach-Object { ConvertTo-QuotedArgument $_ }) -join ' '
+                        Push-Location $Context
+                        try {
+                            $p = Start-Process -FilePath 'docker' -ArgumentList $argString -Wait -PassThru -NoNewWindow
+                            return ($p.ExitCode -eq 0)
+                        } finally { Pop-Location }
+                    }
+                    $repoArg = if ($WithRepoArg) { "--build-arg REPO_NAME=$($State.SelectedRepo) " } else { '' }
+                    $cmd = "cd '$Context' && docker build $($repoArg)-f '$Dockerfile' -t '$Tag' --no-cache ."
+                    $sshArgs = @('-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',$State.Paths.SshPrivate,(Get-RemoteHostString -State $State),$cmd)
+                    $argString = ($sshArgs | ForEach-Object { ConvertTo-QuotedArgument $_ }) -join ' '
+                    $p = Start-Process -FilePath 'ssh' -ArgumentList $argString -Wait -NoNewWindow -PassThru
+                    return ($p.ExitCode -eq 0)
+                } catch {
+                    Write-Log "Could not run docker build: $($_.Exception.Message)" 'Warn'
+                    return $false
+                }
+            }
+
+            $buildSucceeded = $false
+            $buildStart = Get-Date
+            # A build can take a long time and blocks this window meanwhile, so switch to busy
+            # mode (buttons disabled, status text, wait cursor, closing refused). The 'finally'
+            # below always switches it off again, also on the early 'return' paths.
+            Set-ManagerBusy -Busy $true -Message 'Building the Docker image (30+ min). Progress: see the console window.'
+            try {
+                $buildSucceeded = Invoke-StartImageBuild -Dockerfile $dockerfileMain -Tag $imageName -Context $dockerContext -WithRepoArg $true
+
+                if (-not $buildSucceeded -and $State.ContainerLocation -like 'REMOTE@*') {
+                    # REMOTE build failed: try an automatic docker login from the repo .env and
+                    # retry once. This used to be guarded by $State.Metadata.RemoteLoginAttempted,
+                    # but that key was never created, and reading a missing key crashes under
+                    # StrictMode, so this whole recovery path could never run. It runs at most once
+                    # per Start click anyway, so no flag is needed.
+                    Write-Log 'Remote build failed; attempting automatic remote docker login from repo .env and retrying build.' 'Info'
                     try {
                         if (Ensure-RemoteDockerLogin -State $State -ProjectRoot $projectRoot) {
-                            Write-Log 'Remote docker login from .env succeeded — retrying build.' 'Info'
-                            $remoteHost = Get-RemoteHostString -State $State
-                            $sshKey = $State.Paths.SshPrivate
-                            $cmdRetry = "cd '$dockerContext' && docker build --build-arg REPO_NAME=$($State.SelectedRepo) -f '$dockerfileMain' -t '$imageName' --no-cache ."
-                            $sshArgsRetry = @('-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',"$sshKey",$remoteHost,$cmdRetry)
-                            $pRetry = Start-Process -FilePath 'ssh' -ArgumentList $sshArgsRetry -Wait -NoNewWindow -PassThru
-                            $buildSucceeded = ($pRetry.ExitCode -eq 0)
+                            Write-Log 'Remote docker login from .env succeeded; retrying build.' 'Info'
+                            $buildSucceeded = Invoke-StartImageBuild -Dockerfile $dockerfileMain -Tag $imageName -Context $dockerContext -WithRepoArg $true
                             if ($buildSucceeded) { Write-Log 'Remote build succeeded after login; continuing.' 'Info' }
                         } else {
                             Write-Log 'Automatic remote docker login from .env did not provide credentials or failed.' 'Debug'
@@ -1177,58 +1328,33 @@ function Show-ContainerManager {
                     } catch { Write-Log "Remote login attempt failed: $($_.Exception.Message)" 'Warn' }
                 }
 
-                Write-Log 'Main image build failed; attempting prerequisite build fallback.' 'Warn'
-                $prereqDockerfile = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup 'Dockerfile.prerequisite.IMPACTncdGER' } else { "$dockerSetup/Dockerfile.prerequisite.IMPACTncdGER" }
-                $prereqContext = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup '.' } else { "$dockerSetup" }
-                $prereqArgsString = "build -f `"$prereqDockerfile`" -t $imageName-prerequisite --no-cache --progress=plain `".`""
-                $preSuccess = $false
-                try {
-                    if ($State.ContainerLocation -eq 'LOCAL') {
-                        Push-Location $prereqContext
-                        try {
-                            $p2 = Start-Process -FilePath 'docker' -ArgumentList $prereqArgsString -Wait -PassThru -NoNewWindow
-                            $preSuccess = ($p2.ExitCode -eq 0)
-                        } finally { Pop-Location }
-                    } else {
-                        $remoteHost = Get-RemoteHostString -State $State
-                        $sshKey = $State.Paths.SshPrivate
-                        $cmd2 = "cd '$prereqContext' && docker build -f '$prereqDockerfile' -t '$imageName-prerequisite' --no-cache ."
-                        $sshArgs2 = @('-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',"$sshKey",$remoteHost,$cmd2)
-                        $p2 = Start-Process -FilePath 'ssh' -ArgumentList $sshArgs2 -Wait -NoNewWindow -PassThru
-                        $preSuccess = ($p2.ExitCode -eq 0)
-                    }
-                } catch { $preSuccess = $false }
+                # Only fall back to the prerequisite build if the image is STILL not built. Before,
+                # this ran even after the login retry had succeeded, starting two more long builds
+                # and possibly reporting a failure for an image that was already built.
+                if (-not $buildSucceeded) {
+                    Write-Log 'Main image build failed; attempting prerequisite build fallback.' 'Warn'
+                    $prereqDockerfile = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup 'Dockerfile.prerequisite.IMPACTncdGER' } else { "$dockerSetup/Dockerfile.prerequisite.IMPACTncdGER" }
+                    $prereqContext = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup '.' } else { "$dockerSetup" }
+                    $preSuccess = Invoke-StartImageBuild -Dockerfile $prereqDockerfile -Tag "$imageName-prerequisite" -Context $prereqContext -WithRepoArg $false
 
-                if (-not $preSuccess) {
-                    [System.Windows.Forms.MessageBox]::Show('Docker build failed (including prerequisite fallback).','Build failed','OK','Error') | Out-Null
-                    return
+                    if (-not $preSuccess) {
+                        [System.Windows.Forms.MessageBox]::Show('Docker build failed (including prerequisite fallback).','Build failed','OK','Error') | Out-Null
+                        return
+                    }
+
+                    # Retry main build after prerequisite
+                    $buildSucceeded = Invoke-StartImageBuild -Dockerfile $dockerfileMain -Tag $imageName -Context $dockerContext -WithRepoArg $true
                 }
 
-                # Retry main build after prerequisite
-                try {
-                    if ($State.ContainerLocation -eq 'LOCAL') {
-                        Push-Location $dockerContext
-                        try {
-                            $p3 = Start-Process -FilePath 'docker' -ArgumentList $buildArgsString -Wait -PassThru -NoNewWindow
-                            $buildSucceeded = ($p3.ExitCode -eq 0)
-                        } finally { Pop-Location }
-                    } else {
-                        $remoteHost = Get-RemoteHostString -State $State
-                        $sshKey = $State.Paths.SshPrivate
-                        $cmd3 = "cd '$dockerContext' && docker build --build-arg REPO_NAME=$($State.SelectedRepo) -f '$dockerfileMain' -t '$imageName' --no-cache ."
-                        $sshArgs3 = @('-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',"$sshKey",$remoteHost,$cmd3)
-                        $p3 = Start-Process -FilePath 'ssh' -ArgumentList $sshArgs3 -Wait -NoNewWindow -PassThru
-                        $buildSucceeded = ($p3.ExitCode -eq 0)
-                    }
-                } catch { $buildSucceeded = $false }
-            }
-
-            $elapsed = (Get-Date) - $buildStart
-            Write-Log "Docker build duration: $([int]$elapsed.TotalSeconds)s" 'Info'
-            Write-Log "Docker build success=$buildSucceeded" 'Debug'
-            if (-not $buildSucceeded) {
-                [System.Windows.Forms.MessageBox]::Show('Docker build failed. See console output for details.','Build failed','OK','Error') | Out-Null
-                return
+                $elapsed = (Get-Date) - $buildStart
+                Write-Log "Docker build duration: $([int]$elapsed.TotalSeconds)s" 'Info'
+                Write-Log "Docker build success=$buildSucceeded" 'Debug'
+                if (-not $buildSucceeded) {
+                    [System.Windows.Forms.MessageBox]::Show('Docker build failed. See console output for details.','Build failed','OK','Error') | Out-Null
+                    return
+                }
+            } finally {
+                Set-ManagerBusy -Busy $false
             }
         }
 
@@ -1236,10 +1362,13 @@ function Show-ContainerManager {
         $State.Metadata.GitBaseline = $null
         try {
             if ($State.ContainerLocation -eq 'LOCAL') {
-                Push-Location $projectRoot
-                $hash = git rev-parse HEAD 2>$null
-                $status = git status --porcelain 2>$null
-                Pop-Location
+                # 'git -C <folder>' runs git in that folder without changing PowerShell's current
+                # folder. The old Push-Location/Pop-Location pair skipped Pop-Location when git
+                # failed (for example git not installed), which left the current folder at the
+                # repository root; a later 'docker build ... .' then uploaded the whole repository
+                # as build context.
+                $hash = git -C $projectRoot rev-parse HEAD 2>$null
+                $status = git -C $projectRoot status --porcelain 2>$null
                 $State.Metadata.GitBaseline = @{ Repo=$projectRoot; Commit=$hash; Status=$status; Timestamp=Get-Date }
             } else {
                 $remoteHost = Get-RemoteHostString -State $State
@@ -1254,12 +1383,7 @@ function Show-ContainerManager {
             $State.Metadata.GitBaseline = $null
         }
 
-        # Resolve output/synthpop from sim_design
-        $baseDirForYaml = ($projectRoot -replace '\\','/')
-        $outputDir = Get-YamlPathValue -State $State -YamlPath $simDesign -Key 'output_dir' -BaseDir $baseDirForYaml
-        $synthDir  = Get-YamlPathValue -State $State -YamlPath $simDesign -Key 'synthpop_dir' -BaseDir $baseDirForYaml
-        if (-not (Test-AndCreateDirectory -State $State -Path $outputDir -PathKey 'output_dir')) { [System.Windows.Forms.MessageBox]::Show("Failed to ensure output_dir path:`n$outputDir`n`nCheck your sim_design YAML file.",'Path error','OK','Error') | Out-Null; return }
-        if (-not (Test-AndCreateDirectory -State $State -Path $synthDir -PathKey 'synthpop_dir')) { [System.Windows.Forms.MessageBox]::Show("Failed to ensure synthpop_dir path:`n$synthDir`n`nCheck your sim_design YAML file.",'Path error','OK','Error') | Out-Null; return }
+        # $outputDir and $synthDir were resolved and checked before the image build (see Confirm-YamlFolder above)
 
         $State.Paths.OutputDir = $outputDir
         $State.Paths.SynthpopDir = $synthDir

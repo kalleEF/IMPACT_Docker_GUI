@@ -645,19 +645,61 @@ function Get-YamlPathValue {
         Set-DockerSSHEnvironment -State $State
         $remoteHost = Get-RemoteHostString -State $State
         $keyPath = $State.Paths.SshPrivate
+        # When the file does not exist we print a marker word instead of its content. Without it a
+        # missing file and a failed SSH connection would both just give empty output, and the log
+        # could not say which of the two happened.
+        $missingMarker = '__IMPACT_YAML_MISSING__'
         try {
-            $content = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=30 -o BatchMode=yes $remoteHost "cat '$YamlPath'" 2>$null
+            $content = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=30 -o BatchMode=yes $remoteHost "if [ -f '$YamlPath' ]; then cat '$YamlPath'; else echo $missingMarker; fi" 2>$null
         } catch { return $null }
+        if ("$content" -match $missingMarker) {
+            Write-Log "YAML file not found on the workstation: $YamlPath" 'Warn'
+            return $null
+        }
+        if (-not $content) {
+            Write-Log "Could not read YAML file over SSH (connection problem or empty file): $YamlPath" 'Warn'
+            return $null
+        }
     } else {
         if (-not (Test-Path $YamlPath)) { return $null }
         $content = Get-Content -Path $YamlPath -Raw
     }
 
-    Write-Log ("Fetched YAML content length: {0}" -f ($content.Length)) 'Debug'
+    # Check for "no content" BEFORE reading .Length. Under StrictMode, reading .Length of $null
+    # throws ("The property 'Length' cannot be found"), so an empty file used to crash the Start
+    # button with a raw error instead of returning $null.
     if (-not $content) { Write-Log 'YAML content empty; aborting parse.' 'Debug'; return $null }
+    Write-Log ("Fetched YAML content length: {0}" -f ($content.Length)) 'Debug'
     $line = ($content -split "`n") | Where-Object { $_ -match "^$Key\s*:" } | Select-Object -First 1
     if (-not $line) { Write-Log "YAML key '$Key' not found." 'Debug'; return $null }
-    $value = ($line -split ":\s*",2)[1].Split('#')[0].Trim()
+    $value = ($line -split ":\s*",2)[1].Trim()
+    # YAML allows a value to be written in quotes ("..." or '...'), and R reads it without them.
+    # We must strip the quotes too: otherwise a quoted absolute path such as "/mnt/data/outputs"
+    # is not recognised as absolute and gets glued onto the repository path. Anything after the
+    # closing quote (for example a comment) is ignored.
+    if ($value -match '^"((?:[^"\\]|\\.)*)"') {
+        # Double quotes: backslash escapes are allowed, so \\ means \ and \" means "
+        $value = $Matches[1] -replace '\\(["\\])', '$1'
+    } elseif ($value -match "^'((?:[^']|'')*)'") {
+        # Single quotes: the only escape is '' for a literal '
+        $value = $Matches[1] -replace "''", "'"
+    } else {
+        # Unquoted value: as before, everything after '#' is a comment
+        $value = $value.Split('#')[0].Trim()
+        # In YAML an unquoted ~ or null means "no value"
+        if ($value -eq '~' -or $value -eq 'null') { $value = '' }
+    }
+    # An empty value means the setting is not filled in. Without this check an empty value
+    # would silently resolve to the repository folder itself.
+    if (-not $value) { Write-Log "YAML key '$Key' has no value." 'Warn'; return $null }
+    # '~/...' means "the user's home folder". Docker and our SSH folder checks do not expand '~'
+    # (they would look for a folder literally named '~' inside the repository), so on the
+    # workstation we replace it with the SSH user's home, /home/<RemoteUser>. The same home
+    # folder layout is assumed elsewhere in this tool. Local mode is left unchanged on purpose:
+    # Test-AndCreateDirectory rejects such Linux-style paths there with a clear message.
+    if ($State.ContainerLocation -like 'REMOTE@*' -and $State.RemoteUser -and $value -match '^~/') {
+        $value = "/home/$($State.RemoteUser)" + $value.Substring(1)
+    }
     Write-Log "Raw YAML value for '$Key': $value" 'Debug'
 
     if ([System.IO.Path]::IsPathRooted($value) -or $value.StartsWith('/')) {
@@ -673,9 +715,25 @@ function Test-AndCreateDirectory {
     param(
         [pscustomobject]$State,
         [string]$Path,
-        [string]$PathKey
+        [string]$PathKey,
+        # Optional: create the folder if it is missing. Without this switch nothing is ever
+        # created. The GUI only passes it after the user said Yes in a dialog that shows the
+        # path, so a mistyped path never silently gets a new empty folder.
+        [switch]$Create,
+        # Optional: when the function returns $false, this receives a short code saying why, so
+        # the caller can show a precise message instead of one generic error:
+        #   'EmptyPath'            no path was given (for example the YAML key is missing)
+        #   'Missing'              the folder does not exist (or is a file, not a folder)
+        #   'PosixPathInLocalMode' a Linux-style path (/... or ~...) was used for a local run
+        #   'Unreachable'          the workstation could not be reached over SSH to check it
+        #   'CreateFailed'         -Create was given but the folder could not be created
+        # Usage: $why = $null; Test-AndCreateDirectory ... -Reason ([ref]$why)
+        [ref]$Reason
     )
-    if (-not $Path) { return $false }
+    # Stores the reason code, but only if the caller asked for it (an unused [ref] is $null).
+    function Set-Reason([string]$Code) { if ($null -ne $Reason) { $Reason.Value = $Code } }
+
+    if (-not $Path) { Set-Reason 'EmptyPath'; return $false }
 
     Write-Log "Ensuring directory for ${PathKey}: $Path" 'Info'
 
@@ -684,29 +742,64 @@ function Test-AndCreateDirectory {
         $keyPath = $State.Paths.SshPrivate
         try {
             $check = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "test -d '$Path' && echo EXISTS || echo MISSING" 2>$null
-            if ($check -notmatch 'EXISTS') {
-                Write-Log "Remote path missing (no auto-create): $Path" 'Error'
+            if ("$check" -match 'EXISTS') {
+                Write-Log "Remote path verified for ${PathKey}: $Path" 'Debug'
+                return $true
+            }
+            if ("$check" -notmatch 'MISSING') {
+                # Neither word came back, so the SSH command itself failed (network, VPN, key,
+                # workstation switched off). That is not the same as "folder missing".
+                Write-Log "Could not check remote path for ${PathKey} (SSH failed): $Path" 'Error'
+                Set-Reason 'Unreachable'
                 return $false
             }
-            Write-Log "Remote path verified for ${PathKey}: $Path" 'Debug'
-            return $true
+            if (-not $Create) {
+                Write-Log "Remote path missing (no auto-create): $Path" 'Error'
+                Set-Reason 'Missing'
+                return $false
+            }
+            # mkdir runs as the SSH user, so the new folder belongs to the same user whose
+            # uid/gid the container later uses for its bind mounts.
+            $made = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "mkdir -p '$Path' && echo CREATED" 2>$null
+            if ("$made" -match 'CREATED') {
+                Write-Log "Created remote directory for ${PathKey}: $Path" 'Info'
+                return $true
+            }
+            Write-Log "Could not create remote directory for ${PathKey}: $Path" 'Error'
+            Set-Reason 'CreateFailed'
+            return $false
         } catch {
             Write-Log "Failed to validate remote directory ${Path}: $($_.Exception.Message)" 'Debug'
+            Set-Reason 'Unreachable'
             return $false
         }
     }
 
     if ($IsWindows -and $State.ContainerLocation -eq 'LOCAL' -and $Path -match '^(?:/|~)') {
         Write-Log "POSIX-style path not allowed in local mode for ${PathKey}: $Path" 'Error'
+        Set-Reason 'PosixPathInLocalMode'
         return $false
     }
 
     if ($State.ContainerLocation -eq 'LOCAL') {
+        if ($Create -and -not (Test-Path -LiteralPath $Path)) {
+            # Only reached when the caller explicitly asked to create the folder (see -Create).
+            # -Force also creates missing parent folders.
+            try {
+                New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
+                Write-Log "Created local directory for ${PathKey}: $Path" 'Info'
+            } catch {
+                Write-Log "Could not create local directory ${Path}: $($_.Exception.Message)" 'Error'
+                Set-Reason 'CreateFailed'
+                return $false
+            }
+        }
         try {
             $resolved = Resolve-Path -LiteralPath $Path -ErrorAction Stop
             $native = $resolved.Path
         } catch {
             Write-Log "Local path missing or not a directory (no auto-create): $Path" 'Error'
+            Set-Reason 'Missing'
             return $false
         }
     } else {
@@ -715,6 +808,7 @@ function Test-AndCreateDirectory {
 
     if (-not (Test-Path $native -PathType Container)) {
         Write-Log "Local path missing or not a directory (no auto-create): $native" 'Error'
+        Set-Reason 'Missing'
         return $false
     }
     Write-Log "Local directory exists for ${PathKey}: $native" 'Debug'
