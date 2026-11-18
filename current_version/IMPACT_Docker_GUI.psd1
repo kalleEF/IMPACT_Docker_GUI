@@ -46,6 +46,7 @@
         'Ensure-SshConfigEntry'
         'Ensure-GitKeySetup'
         'Select-Location'
+        'ConvertTo-DockerSafeRepoName'
         'Build-DockerRunCommand'
         'Test-DockerDaemonReady'
         'Start-DockerDesktopIfNeeded'
