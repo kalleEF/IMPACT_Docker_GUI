@@ -895,3 +895,98 @@ Describe 'Show-CredentialDialog NonInteractive with GitHub validation' -Tag Inte
 }
 
 # Artifact persistence is handled by Invoke-Tests.ps1 (only on failure/skip).
+
+# =============================================================================
+#  Batch B6a: credential dialog (NonInteractive) and remote docker login
+# =============================================================================
+Describe 'Show-CredentialDialog NonInteractive: GitHub unreachable or bad input' -Tag Integration {
+    BeforeEach {
+        Enable-NonInteractiveMode
+    }
+    AfterEach {
+        Disable-NonInteractiveMode
+    }
+
+    # Show-CredentialDialog also contains the WinForms/System.Drawing dialog code, which
+    # cannot be loaded on Linux/macOS (the other Show-CredentialDialog tests above fail
+    # there for that reason), so these tests only run on Windows.
+    It 'Continues (does not cancel) when GitHub cannot be reached' -Skip:(-not $IsWindows) {
+        Mock Invoke-RestMethod {
+            throw [System.Net.Http.HttpRequestException]::new('No such host is known.')
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'offlineuser' -Password 'OfflinePass99!'
+        Show-CredentialDialog -State $state | Should -Be 'next'
+        $state.UserName | Should -Be 'offlineuser'
+    }
+
+    It 'Cancels for an e-mail address without asking GitHub' -Skip:(-not $IsWindows) {
+        Mock Invoke-RestMethod {
+            return [pscustomobject]@{ login = 'x'; type = 'User' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'j.doe@institute.de' -Password 'Pass12345!'
+        Show-CredentialDialog -State $state | Should -Be 'cancel'
+        Should -Invoke Invoke-RestMethod -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly
+    }
+
+    It 'Cancels for an organisation name' -Skip:(-not $IsWindows) {
+        Mock Invoke-RestMethod {
+            return [pscustomobject]@{ login = 'impact-ncd'; type = 'Organization' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'impact-ncd' -Password 'Pass12345!'
+        Show-CredentialDialog -State $state | Should -Be 'cancel'
+    }
+}
+
+Describe 'Ensure-RemoteDockerLogin (mocked SSH)' -Tag Integration {
+    BeforeAll {
+        # Pester can only mock a command that exists. On machines without an ssh client
+        # (e.g. a minimal Linux CI image) a do-nothing stand-in is created for these tests.
+        $script:b6aCreatedSshStub = $false
+        if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+            function global:ssh { }
+            $script:b6aCreatedSshStub = $true
+        }
+    }
+    AfterAll {
+        if ($script:b6aCreatedSshStub) { Remove-Item function:global:ssh -ErrorAction SilentlyContinue }
+    }
+
+    It 'Reads multi-line .env output, logs in to the right registry and keeps the password off the command line' {
+        $script:b6aSshCalls = [System.Collections.Generic.List[object]]::new()
+        Mock ssh {
+            $script:b6aSshCalls.Add(@($args))
+            if ([string]$args[-1] -like 'cat *') {
+                # Native command output arrives as one string per line.
+                return @('# registry login', 'GHCR_USERNAME=ghuser', 'GHCR_TOKEN=ghp_SeCrEt123')
+            }
+            return 'Login Succeeded'
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.9'
+        Ensure-RemoteDockerLogin -State $state -ProjectRoot '/srv/repo' | Should -BeTrue
+
+        $script:b6aSshCalls.Count | Should -Be 2
+        $loginArgs = @($script:b6aSshCalls[1])
+        [string]$loginArgs[-1] | Should -Match "docker login 'ghcr\.io' -u 'ghuser' --password-stdin"
+        ($loginArgs -join ' ') | Should -Not -Match 'ghp_SeCrEt123'
+        $pwB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('ghp_SeCrEt123'))
+        ($loginArgs -join ' ') | Should -Not -Match ([regex]::Escape($pwB64))
+        # '-n' would cut off standard input, through which the password is sent.
+        $loginArgs | Should -Not -Contain '-n'
+    }
+
+    It 'Does not log in when the .env user name contains shell characters' {
+        Mock ssh {
+            if ([string]$args[-1] -like 'cat *') { return @("DOCKERHUB_USERNAME=bad'name", 'DOCKERHUB_TOKEN=tok') }
+            return 'Login Succeeded'
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.9'
+        Ensure-RemoteDockerLogin -State $state -ProjectRoot '/srv/repo' | Should -BeFalse
+        # Only the 'cat .env' call happened, no login attempt.
+        Should -Invoke ssh -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly
+    }
+}

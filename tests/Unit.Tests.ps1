@@ -1122,3 +1122,298 @@ Describe 'Test-GitHubUsername' -Tag Unit {
 }
 
 # Artifact persistence is handled by Invoke-Tests.ps1 (only on failure/skip).
+
+# =============================================================================
+#  Batch B6a: startup, credentials and module export checks
+# =============================================================================
+
+Describe 'Test-GitHubUsername -Detailed (not found vs. could not check)' -Tag Unit {
+    It 'Returns NotFound only for a real 404 answer from GitHub' {
+        Mock Invoke-RestMethod {
+            $resp = New-Object System.Net.Http.HttpResponseMessage
+            $resp.StatusCode = [System.Net.HttpStatusCode]::NotFound
+            $exception = [Microsoft.PowerShell.Commands.HttpResponseException]::new('Response status code does not indicate success: 404 (Not Found).', $resp)
+            throw ([System.Management.Automation.ErrorRecord]::new(
+                $exception, 'WebCmdletWebResponseException',
+                [System.Management.Automation.ErrorCategory]::InvalidOperation, $null))
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $r = Test-GitHubUsername -UserName 'nobody-xyz-12345' -Detailed
+        $r.Status | Should -Be 'NotFound'
+        $r.Message | Should -Match 'not found'
+    }
+
+    It 'Returns Unknown (not NotFound) when GitHub cannot be reached' {
+        Mock Invoke-RestMethod {
+            throw [System.Net.Http.HttpRequestException]::new('No such host is known.')
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $r = Test-GitHubUsername -UserName 'anyuser' -Detailed
+        $r.Status | Should -Be 'Unknown'
+        $r.Message | Should -Match 'could not be reached'
+        # The plain form keeps its old contract: only an existing user gives $true.
+        Test-GitHubUsername -UserName 'anyuser' | Should -BeFalse
+    }
+
+    It 'Returns Unknown with a rate-limit hint for HTTP 403' {
+        Mock Invoke-RestMethod {
+            $resp = New-Object System.Net.Http.HttpResponseMessage
+            $resp.StatusCode = [System.Net.HttpStatusCode]::Forbidden
+            $exception = [Microsoft.PowerShell.Commands.HttpResponseException]::new('Response status code does not indicate success: 403 (rate limit exceeded).', $resp)
+            throw ([System.Management.Automation.ErrorRecord]::new(
+                $exception, 'WebCmdletWebResponseException',
+                [System.Management.Automation.ErrorCategory]::InvalidOperation, $null))
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $r = Test-GitHubUsername -UserName 'anyuser' -Detailed
+        $r.Status | Should -Be 'Unknown'
+        $r.Message | Should -Match 'too many checks'
+    }
+
+    It 'Returns Organization for an organisation account' {
+        Mock Invoke-RestMethod {
+            return [pscustomobject]@{ login = 'IMPACT-NCD'; type = 'Organization' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        (Test-GitHubUsername -UserName 'impact-ncd' -Detailed).Status | Should -Be 'Organization'
+        Test-GitHubUsername -UserName 'impact-ncd' | Should -BeFalse
+    }
+
+    It 'Returns Exists for a personal account' {
+        Mock Invoke-RestMethod {
+            return [pscustomobject]@{ login = 'octocat'; type = 'User' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        (Test-GitHubUsername -UserName 'octocat' -Detailed).Status | Should -Be 'Exists'
+    }
+
+    It 'Escapes the username in the request address and sets a timeout' {
+        Mock Invoke-RestMethod {
+            return [pscustomobject]@{ login = 'foo'; type = 'User' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        Test-GitHubUsername -UserName 'foo?x' -Detailed | Out-Null
+
+        # '?' must be sent as part of the name, not start a query string.
+        Should -Invoke Invoke-RestMethod -ModuleName 'IMPACT_Docker_GUI' -Times 1 -ParameterFilter {
+            ([uri]$Uri).AbsolutePath -eq '/users/foo%3Fx' -and
+            ($PesterBoundParameters.ContainsKey('TimeoutSec') -or $PesterBoundParameters.ContainsKey('ConnectionTimeoutSeconds'))
+        }
+    }
+}
+
+Describe 'Resolve-GitHubUsernameInput (local username check)' -Tag Unit {
+    It 'Lowercases and removes spaces' {
+        InModuleScope 'IMPACT_Docker_GUI' {
+            $r = Resolve-GitHubUsernameInput -InputText ' J Doe '
+            $r.UserName | Should -Be 'jdoe'
+            $r.Problem | Should -BeNullOrEmpty
+        }
+    }
+
+    It 'Rejects an e-mail address with a specific hint' {
+        InModuleScope 'IMPACT_Docker_GUI' {
+            $r = Resolve-GitHubUsernameInput -InputText 'j.doe@institute.de'
+            $r.UserName | Should -BeNullOrEmpty
+            $r.Problem | Should -Match 'e-mail'
+        }
+    }
+
+    It 'Accepts a pasted GitHub profile link and an @mention' {
+        InModuleScope 'IMPACT_Docker_GUI' {
+            (Resolve-GitHubUsernameInput -InputText 'https://github.com/JDoe?tab=repositories').UserName | Should -Be 'jdoe'
+            (Resolve-GitHubUsernameInput -InputText '@JDoe').UserName | Should -Be 'jdoe'
+        }
+    }
+
+    It 'Rejects <Text> (characters that would change the request or a shell command)' -ForEach @(
+        @{ Text = 'foo?x' }
+        @{ Text = 'foo#x' }
+        @{ Text = 'foo/repos' }
+        @{ Text = "foo'bar" }
+        @{ Text = '-foo' }
+    ) {
+        InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ Text = $Text } {
+            param($Text)
+            $r = Resolve-GitHubUsernameInput -InputText $Text
+            $r.UserName | Should -BeNullOrEmpty
+            $r.Problem | Should -Match 'not a valid GitHub username'
+        }
+    }
+
+    It 'Rejects names longer than 39 characters and empty input' {
+        InModuleScope 'IMPACT_Docker_GUI' {
+            (Resolve-GitHubUsernameInput -InputText ('a' * 40)).Problem | Should -Not -BeNullOrEmpty
+            (Resolve-GitHubUsernameInput -InputText '   ').Problem | Should -Match 'enter your GitHub username'
+        }
+    }
+}
+
+Describe 'Get-RStudioPasswordProblem (RStudio password rules)' -Tag Unit {
+    It 'Accepts a reasonable password' {
+        InModuleScope 'IMPACT_Docker_GUI' {
+            Get-RStudioPasswordProblem -Password 'Sunny-Garden-42' -UserName 'jdoe' | Should -BeNullOrEmpty
+        }
+    }
+
+    It 'Rejects passwords shorter than 8 characters' {
+        InModuleScope 'IMPACT_Docker_GUI' {
+            Get-RStudioPasswordProblem -Password '1234' -UserName 'jdoe' | Should -Match 'at least 8'
+            Get-RStudioPasswordProblem -Password 'rstudio' -UserName 'jdoe' | Should -Match 'at least 8'
+        }
+    }
+
+    It 'Rejects an empty password, the username, and very common passwords' {
+        InModuleScope 'IMPACT_Docker_GUI' {
+            Get-RStudioPasswordProblem -Password '' -UserName 'jdoe' | Should -Not -BeNullOrEmpty
+            Get-RStudioPasswordProblem -Password 'JDoe1234' -UserName 'jdoe1234' | Should -Match 'same as your username'
+            Get-RStudioPasswordProblem -Password 'Password' -UserName 'jdoe' | Should -Match 'too easy'
+        }
+    }
+}
+
+Describe 'Test-PowerShellVersionSupported (minimum PowerShell 7.3)' -Tag Unit {
+    It 'Accepts <Edition> <Version> = <Expected>' -ForEach @(
+        @{ Edition = 'Core';    Version = '7.4'; Expected = $true }
+        @{ Edition = 'Core';    Version = '7.3'; Expected = $true }
+        @{ Edition = 'Core';    Version = '7.2'; Expected = $false }
+        @{ Edition = 'Core';    Version = '7.0'; Expected = $false }
+        @{ Edition = 'Desktop'; Version = '5.1'; Expected = $false }
+    ) {
+        InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ Edition = $Edition; Version = $Version; Expected = $Expected } {
+            param($Edition, $Version, $Expected)
+            Test-PowerShellVersionSupported -Edition $Edition -Version ([version]$Version) | Should -Be $Expected
+        }
+    }
+}
+
+Describe 'Test-PortValue edge cases' -Tag Unit {
+    It 'Rejects a very long number without throwing' {
+        { Test-PortValue -Port '99999999999999999999' } | Should -Not -Throw
+        (Test-PortValue -Port '99999999999999999999').Valid | Should -BeFalse
+    }
+
+    It 'Rejects a leading zero (would bypass the port-in-use check)' {
+        $r = Test-PortValue -Port '08787'
+        $r.Valid | Should -BeFalse
+        $r.ErrorMessage | Should -Match 'start with 0'
+    }
+}
+
+Describe 'Format-DockerError port extraction' -Tag Unit {
+    It 'Reports the bound port, not digits from the container ID, endpoint hash or user name' {
+        $raw = "3f2a9c1e0b7d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f`ndocker: Error response from daemon: driver failed programming external connectivity on endpoint IMPACTncd_Germany_user2236 (5512a3be4c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f): Bind for 0.0.0.0:8788 failed: port is already allocated."
+        Format-DockerError -RawError $raw | Should -Be 'Port 8788 is already in use. Choose a different port.'
+    }
+
+    It 'Treats a port reserved by Windows as a port problem, not a permission problem' {
+        $raw = 'Error response from daemon: Ports are not available: exposing port TCP 0.0.0.0:8790 -> 0.0.0.0:0: listen tcp 0.0.0.0:8790: bind: An attempt was made to access a socket in a way forbidden by its access permissions.'
+        $result = Format-DockerError -RawError $raw
+        $result | Should -Match 'Port 8790 is blocked or reserved by Windows'
+        $result | Should -Not -Match 'Permission denied'
+    }
+
+    It 'Recognises the Windows "Only one usage of each socket address" message' {
+        $raw = 'Error response from daemon: Ports are not available: exposing port TCP 0.0.0.0:8791 -> 0.0.0.0:0: listen tcp 0.0.0.0:8791: bind: Only one usage of each socket address (protocol/network address/port) is normally permitted.'
+        Format-DockerError -RawError $raw | Should -Be 'Port 8791 is already in use. Choose a different port.'
+    }
+}
+
+Describe 'Get-DockerCredentialsFromDotEnv with native command output' -Tag Unit {
+    It 'Parses an array of lines (the shape that ssh/cat output arrives in)' {
+        $lines = @('# registry', 'DOCKERHUB_USERNAME=alice', 'DOCKERHUB_TOKEN=tok123')
+        $result = Get-DockerCredentialsFromDotEnv -EnvContent $lines
+        $result | Should -Not -BeNullOrEmpty
+        $result.Username | Should -Be 'alice'
+        $result.Password | Should -Be 'tok123'
+    }
+}
+
+Describe 'Get-NextAvailablePort is defined only once' -Tag Unit {
+    It 'Has exactly one definition in the module' {
+        $modulePath = Join-Path $PSScriptRoot '..' 'current_version' 'IMPACT_Docker_GUI.psm1'
+        $tokens = $null; $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($modulePath, [ref]$tokens, [ref]$errors)
+        $defs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-NextAvailablePort' }, $true)
+        @($defs).Count | Should -Be 1
+    }
+}
+
+Describe 'Set-DockerSSHEnvironment when the workstation or user changes' -Tag Unit {
+    AfterEach {
+        $env:DOCKER_SSH_OPTS = $null
+        $env:DOCKER_HOST = $null
+    }
+
+    It 'Points DOCKER_HOST at the NEW workstation after switching' {
+        $a = New-TestSessionState -Location 'REMOTE@10.0.0.1'
+        $a.Flags.UseDirectSsh = $true
+        Set-DockerSSHEnvironment -State $a
+        $env:DOCKER_HOST | Should -Be 'ssh://php-workstation@10.0.0.1'
+
+        $b = New-TestSessionState -Location 'REMOTE@10.0.0.2'
+        $b.Flags.UseDirectSsh = $true
+        Set-DockerSSHEnvironment -State $b
+        $env:DOCKER_HOST | Should -Be 'ssh://php-workstation@10.0.0.2'
+    }
+
+    It 'Uses the key of the CURRENT user in DOCKER_SSH_OPTS' {
+        $a = New-TestSessionState -UserName 'alice' -Location 'REMOTE@10.0.0.1'
+        Set-DockerSSHEnvironment -State $a
+        $env:DOCKER_SSH_OPTS | Should -Match 'id_ed25519_alice'
+
+        $b = New-TestSessionState -UserName 'bob' -Location 'REMOTE@10.0.0.1'
+        Set-DockerSSHEnvironment -State $b
+        $env:DOCKER_SSH_OPTS | Should -Match 'id_ed25519_bob'
+    }
+
+    It 'Clears a leftover ssh:// DOCKER_HOST when a Docker context is used' {
+        $env:DOCKER_HOST = 'ssh://php-workstation@10.0.0.1'
+        $s = New-TestSessionState -Location 'REMOTE@10.0.0.2'
+        $s.Flags.UseDirectSsh = $false
+        Set-DockerSSHEnvironment -State $s
+        $env:DOCKER_HOST | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Module exports and manifest stay in sync' -Tag Unit {
+    BeforeAll {
+        $script:b6aRoot = Join-Path $PSScriptRoot '..' 'current_version'
+        $script:b6aExported = @((Get-Module -Name 'IMPACT_Docker_GUI' | Select-Object -First 1).ExportedFunctions.Keys)
+    }
+
+    It 'The .psd1 FunctionsToExport lists exactly the functions the .psm1 exports' {
+        $manifest = Import-PowerShellDataFile (Join-Path $script:b6aRoot 'IMPACT_Docker_GUI.psd1')
+        $listed = @($manifest.FunctionsToExport)
+        @($script:b6aExported | Where-Object { $listed -notcontains $_ }) | Should -BeNullOrEmpty -Because 'every function exported by the .psm1 must also be listed in the .psd1'
+        @($listed | Where-Object { $script:b6aExported -notcontains $_ }) | Should -BeNullOrEmpty -Because 'the .psd1 must not list functions the .psm1 does not export'
+    }
+
+    It 'The .psd1 requires PowerShell 7.3 or newer' {
+        $manifest = Import-PowerShellDataFile (Join-Path $script:b6aRoot 'IMPACT_Docker_GUI.psd1')
+        [version]$manifest.PowerShellVersion | Should -BeGreaterOrEqual ([version]'7.3')
+    }
+
+    It 'Every module function called by the GUI script is exported' {
+        # The GUI imports the .psm1 directly, so a module function that is called by the
+        # GUI but missing from Export-ModuleMember fails at run time with
+        # "command not found" (this happened to Ensure-RemoteDockerLogin).
+        $tokens = $null; $errors = $null
+        $guiAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:b6aRoot 'IMPACT_Docker_GUI_v2.ps1'), [ref]$tokens, [ref]$errors)
+        $modAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:b6aRoot 'IMPACT_Docker_GUI.psm1'), [ref]$tokens, [ref]$errors)
+        $isFunctionDef = { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }
+        $moduleFunctions = @($modAst.FindAll($isFunctionDef, $true) | ForEach-Object { $_.Name })
+        $guiFunctions = @($guiAst.FindAll($isFunctionDef, $true) | ForEach-Object { $_.Name })
+        $called = @($guiAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+            ForEach-Object { $_.GetCommandName() } | Where-Object { $_ } | Sort-Object -Unique)
+        $missing = @($called | Where-Object { $moduleFunctions -contains $_ -and $guiFunctions -notcontains $_ -and $script:b6aExported -notcontains $_ })
+        $missing | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-BuildInfo reads the version from the manifest' -Tag Unit {
+    It 'Version equals ModuleVersion in the .psd1' {
+        $manifest = Import-PowerShellDataFile (Join-Path $PSScriptRoot '..' 'current_version' 'IMPACT_Docker_GUI.psd1')
+        (Get-BuildInfo).Version | Should -Be ([string]$manifest.ModuleVersion)
+    }
+}

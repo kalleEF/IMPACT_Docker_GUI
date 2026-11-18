@@ -1,10 +1,15 @@
 @{
     RootModule        = 'IMPACT_Docker_GUI.psm1'
     ModuleVersion     = '2.0.0'
-    GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+    # A real, unique module ID (the previous value was a made-up placeholder).
+    GUID              = '631d6966-f3fa-491c-88cb-238a2b2d0777'
     Author            = 'IMPACT NCD Germany'
     Description       = 'Core functions for the IMPACT Docker GUI – container lifecycle, SSH helpers, theming, and GitHub integration.'
-    PowerShellVersion = '7.0'
+    # 7.3 is the minimum: older versions drop empty native arguments (ssh-keygen -N '').
+    # Note: the launcher imports the .psm1 directly, so the real check is Ensure-PowerShell7.
+    PowerShellVersion = '7.3'
+    # Must list the same functions as Export-ModuleMember at the end of the .psm1
+    # (a unit test compares the two lists).
     FunctionsToExport = @(
         'Enable-NonInteractiveMode'
         'Disable-NonInteractiveMode'
@@ -25,6 +30,10 @@
         'Get-DockerCredentialsFromDotEnv'
         'Ensure-RemoteDockerLogin'
         'Get-ContainerRuntimeInfo'
+        'Get-NextAvailablePort'
+        'Test-PortValue'
+        'Get-UsedPorts'
+        'Format-DockerError'
         'Get-YamlPathValue'
         'Test-AndCreateDirectory'
         'Get-GitRepositoryState'
@@ -32,6 +41,7 @@
         'Invoke-GitChangeDetection'
         'Set-FormCenterOnCurrentScreen'
         'Initialize-ThemePalette'
+        'Get-ThemePalette'
         'Apply-ThemeToForm'
         'Style-Label'
         'Style-TextBox'
@@ -51,6 +61,7 @@
         'Start-DockerDesktopIfNeeded'
         'Add-GitHubSshKey'
         'Remove-GitHubSshKey'
+        'Test-GitHubUsername'
     )
     CmdletsToExport   = @()
     VariablesToExport  = @()
