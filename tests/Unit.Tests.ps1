@@ -1122,3 +1122,95 @@ Describe 'Test-GitHubUsername' -Tag Unit {
 }
 
 # Artifact persistence is handled by Invoke-Tests.ps1 (only on failure/skip).
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ConvertTo-RemoteRepoList (remote repository picker)
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'ConvertTo-RemoteRepoList' -Tag Unit {
+    BeforeAll {
+        # Helper: an ErrorRecord, which is how a stderr line arrives with 2>&1.
+        function New-StderrLine([string]$Text) {
+            [System.Management.Automation.ErrorRecord]::new(
+                [System.Exception]::new($Text), 'NativeCommandError',
+                [System.Management.Automation.ErrorCategory]::NotSpecified, $null)
+        }
+    }
+
+    It 'Returns an array with Count 1 for a single repository (StrictMode safe)' {
+        # With exactly one line PowerShell would hand back a plain string; .Count on
+        # that throws under Set-StrictMode, which crashed the app before the fix.
+        Set-StrictMode -Version Latest
+        $list = @(ConvertTo-RemoteRepoList -Output 'IMPACTncd_Germany')
+        $list.Count | Should -Be 1
+        $list[0] | Should -Be 'IMPACTncd_Germany'
+    }
+
+    It 'Returns an empty array for no output' {
+        Set-StrictMode -Version Latest
+        @(ConvertTo-RemoteRepoList -Output $null).Count | Should -Be 0
+        @(ConvertTo-RemoteRepoList -Output @()).Count | Should -Be 0
+    }
+
+    It 'Drops error lines (ErrorRecords) so they never appear as repositories' {
+        $raw = @(
+            (New-StderrLine 'basename: missing operand'),
+            'IMPACTncd_Germany',
+            (New-StderrLine 'Permission denied (publickey).')
+        )
+        $list = @(ConvertTo-RemoteRepoList -Output $raw)
+        $list.Count | Should -Be 1
+        $list[0] | Should -Be 'IMPACTncd_Germany'
+    }
+
+    It 'Keeps folder names with spaces whole, trims CR and blank lines, and sorts' {
+        $raw = @("zeta`r", '', 'My Repo', '  ', 'alpha')
+        $list = @(ConvertTo-RemoteRepoList -Output $raw)
+        $list | Should -Be @('alpha', 'My Repo', 'zeta')
+    }
+
+    It 'Splits a single multi-line string into names' {
+        $list = @(ConvertTo-RemoteRepoList -Output "b_repo`na_repo`n")
+        $list | Should -Be @('a_repo', 'b_repo')
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Get-SshFailureKind (why did an ssh call fail?)
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Get-SshFailureKind' -Tag Unit {
+    It 'Classifies <Text> as <Expected>' -ForEach @(
+        @{ Text = 'ssh: connect to host 10.0.0.5 port 22: Connection timed out'; Expected = 'Unreachable' }
+        @{ Text = 'ssh: connect to host 10.0.0.5 port 22: Connection refused'; Expected = 'Unreachable' }
+        @{ Text = 'ssh: connect to host 10.0.0.5 port 22: No route to host'; Expected = 'Unreachable' }
+        @{ Text = 'ssh: Could not resolve hostname wks: No such host is known.'; Expected = 'Unreachable' }
+        @{ Text = 'Renci.SshNet.Common.SshOperationTimeoutException: Socket read operation has timed out'; Expected = 'Unreachable' }
+        @{ Text = 'System.Net.Sockets.SocketException: Der angegebene Host ist unbekannt.'; Expected = 'Unreachable' }
+        @{ Text = 'php-workstation@10.0.0.5: Permission denied (publickey,password).'; Expected = 'AuthFailed' }
+        @{ Text = 'Renci.SshNet.Common.SshAuthenticationException: Permission denied (password).'; Expected = 'AuthFailed' }
+        @{ Text = 'Host key verification failed.'; Expected = 'HostKeyChanged' }
+        @{ Text = 'something completely different'; Expected = 'Unknown' }
+    ) {
+        Get-SshFailureKind -Output $Text | Should -Be $Expected
+    }
+
+    It 'Recognises a changed host key even though other lines are printed too' {
+        $out = @(
+            '@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@',
+            '@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @',
+            'Offending ECDSA key in C:\Users\jan/.ssh/known_hosts:3',
+            'Host key verification failed.'
+        )
+        Get-SshFailureKind -Output $out | Should -Be 'HostKeyChanged'
+    }
+
+    It 'Reads ErrorRecords (stderr lines from 2>&1) as text' {
+        $err = [System.Management.Automation.ErrorRecord]::new(
+            [System.Exception]::new('ssh: connect to host 10.0.0.5 port 22: Network is unreachable'),
+            'NativeCommandError', [System.Management.Automation.ErrorCategory]::NotSpecified, $null)
+        Get-SshFailureKind -Output @($err) | Should -Be 'Unreachable'
+    }
+
+    It 'Returns Unknown for no output' {
+        Get-SshFailureKind -Output $null | Should -Be 'Unknown'
+    }
+}

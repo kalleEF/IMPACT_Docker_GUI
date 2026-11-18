@@ -297,24 +297,121 @@ function Convert-PathToDockerFormat {
 #  Remote SSH key / metadata helpers
 # ══════════════════════════════════════════════════════════════════════════════
 function Test-RemoteSSHKeyFiles {
+    <#
+    .SYNOPSIS Checks, just before a remote container starts, that the user's
+              private SSH key is on the workstation (the container mounts it).
+    .DESCRIPTION Returns $true when the key file exists there, otherwise $false.
+                 Only the key is required. known_hosts is no longer checked:
+                 IMPACT stopped copying this PC's known_hosts over the shared
+                 workstation account's file, so it is not ours to require.
+                 The function also records WHY the check failed, so the GUI can
+                 say "check your VPN" instead of always "files missing":
+                   $State.Metadata['RemoteSshCheckStatus']  = 'OK', 'KeyMissing',
+                       'Unreachable', 'HostKeyChanged' or 'LoginFailed'
+                   $State.Metadata['RemoteSshCheckMessage'] = text for the user
+                       ($null when everything is fine)
+    #>
     param([pscustomobject]$State)
     if ($State.ContainerLocation -notlike 'REMOTE@*') { return $true }
     $remoteHost = Get-RemoteHostString -State $State
-    Write-Log "Checking remote SSH key and known_hosts on $remoteHost" 'Info'
+    Write-Log "Checking remote SSH key on $remoteHost" 'Info'
     $localKeyPath = $State.Paths.SshPrivate
     $remoteKeyPath = "/home/$($State.RemoteUser)/.ssh/id_ed25519_$($State.UserName)"
-    $knownHosts = "/home/$($State.RemoteUser)/.ssh/known_hosts"
+    $remoteIp = if ($State.RemoteHostIp) { $State.RemoteHostIp } else { $remoteHost }
+
+    # One ssh call whose remote command ALWAYS prints a marker once it runs on
+    # the workstation. If neither marker comes back, ssh itself failed (network,
+    # VPN, login), which is a different problem from "the key file is missing".
+    $checkCmd = "if [ -f '$remoteKeyPath' ]; then echo IMPACT_KEY_OK; else echo IMPACT_KEY_MISSING; fi"
+    $checkOut = $null
     try {
-        $keyCheck = & ssh -n -i $localKeyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "[ -f '$remoteKeyPath' ] && echo OK" 2>$null
-        $khCheck  = & ssh -n -i $localKeyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "[ -f '$knownHosts' ] && echo OK" 2>$null
-        $present = ($keyCheck -match 'OK' -and $khCheck -match 'OK')
-        Write-Log "Remote SSH check raw outputs -> key:'$keyCheck' kh:'$khCheck'" 'Debug'
-        Write-Log ("Remote SSH prerequisites present: key={0} known_hosts={1}" -f ($keyCheck -match 'OK'), ($khCheck -match 'OK')) 'Info'
-        return $present
+        # 2>&1 keeps ssh's own error text, so we can tell the user what went wrong.
+        $checkOut = & ssh -n -i $localKeyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost $checkCmd 2>&1
     } catch {
-        Write-Log "Remote SSH prerequisite check failed: $($_.Exception.Message)" 'Debug'
-        return $false
+        $checkOut = $_.Exception.Message
     }
+    $checkText = (@($checkOut) | ForEach-Object { "$_" }) -join ' | '
+    Write-Log "Remote SSH check raw output: '$checkText'" 'Debug'
+
+    if ($checkText -match 'IMPACT_KEY_OK') {
+        $status = 'OK'
+    } elseif ($checkText -match 'IMPACT_KEY_MISSING') {
+        $status = 'KeyMissing'
+    } else {
+        $status = switch (Get-SshFailureKind -Output $checkOut) {
+            'Unreachable'    { 'Unreachable' }
+            'HostKeyChanged' { 'HostKeyChanged' }
+            default          { 'LoginFailed' }
+        }
+    }
+
+    # Plain-language text for the GUI. The GUI cannot re-run the key setup by
+    # itself; the remote setup step runs when IMPACT starts, so "start IMPACT
+    # again" is the way to repair a missing or no longer accepted key.
+    $message = switch ($status) {
+        'OK'             { $null }
+        'KeyMissing'     { "Your SSH key was not found on the workstation ($remoteIp).`n`nClose IMPACT and start it again. The remote setup step copies your key to the workstation." }
+        'Unreachable'    { "IMPACT cannot reach the workstation ($remoteIp).`n`nPlease check that you are connected to the institute network (or the VPN when working from home) and that the workstation is switched on, then press Start again." }
+        'HostKeyChanged' { "The workstation ($remoteIp) identified itself with a different SSH host key than the one this PC remembers. This is expected after the workstation was reinstalled, but it can also mean that the connection is being intercepted.`n`nAsk the workstation admin whether it was reinstalled. If it was, run this command in PowerShell and then start IMPACT again:`n  ssh-keygen -R $remoteIp" }
+        default          { "IMPACT could not log in to the workstation ($remoteIp) with your SSH key.`n`nClose IMPACT and start it again. The remote setup step will ask for the workstation password and set up your key again." }
+    }
+
+    Write-Log "Remote SSH key check result: $status" $(if ($status -eq 'OK') { 'Info' } else { 'Warn' })
+    if ($State.PSObject.Properties['Metadata'] -and $State.Metadata -is [hashtable]) {
+        $State.Metadata['RemoteSshCheckStatus']  = $status
+        $State.Metadata['RemoteSshCheckMessage'] = $message
+    }
+    return ($status -eq 'OK')
+}
+
+<#
+.SYNOPSIS Sorts the error text of a failed ssh (or Posh-SSH) call into a few
+          plain categories, so the GUI can tell the user what to do next.
+.DESCRIPTION Returns one of:
+               'HostKeyChanged' the workstation's SSH host key differs from the
+                                stored one (reinstalled machine, or interception)
+               'Unreachable'    no network connection to the workstation
+                                (VPN off, machine off, wrong IP, name not found)
+               'AuthFailed'     the workstation answered but refused the login
+                                (key not authorised yet, or wrong password)
+               'Unknown'        anything else, including no output at all
+             The patterns are OpenSSH's own messages (OpenSSH does not translate
+             them, and "connect to host ... port ..." is its prefix for every
+             network error) plus the .NET exception names Posh-SSH throws, so the
+             result does not depend on the Windows display language.
+.PARAMETER Output Whatever the call produced: strings, ErrorRecords from 2>&1,
+                  or an exception message. $null is allowed.
+#>
+function Get-SshFailureKind {
+    param([AllowNull()][object]$Output)
+    $text = (@($Output) | ForEach-Object { "$_" }) -join "`n"
+    # Checked first: when a host key changed, OpenSSH also prints other lines.
+    if ($text -match 'REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|Offending \S+ key') { return 'HostKeyChanged' }
+    if ($text -match 'connect to host \S+ port \d+|Could not resolve hostname|timed out|No route to host|Network is unreachable|Connection refused|kex_exchange_identification|SocketException|SshOperationTimeoutException') { return 'Unreachable' }
+    if ($text -match 'Permission denied|Too many authentication failures|SshAuthenticationException') { return 'AuthFailed' }
+    return 'Unknown'
+}
+
+<#
+.SYNOPSIS Turns the output of the remote "list repository folders" command into
+          a clean list of folder names.
+.DESCRIPTION Only normal output lines (strings) are kept. Error lines printed by
+             ssh or by the remote command arrive as ErrorRecord objects when the
+             call uses 2>&1; they are dropped, so messages such as "Permission
+             denied" can never show up as a repository to pick. Blank lines are
+             removed, stray carriage returns are trimmed and the names are sorted.
+             Callers should wrap the call in @(...): with exactly one repository
+             PowerShell would otherwise hand back a plain string, and under
+             Set-StrictMode reading .Count on that throws.
+#>
+function ConvertTo-RemoteRepoList {
+    param([AllowNull()][object]$Output)
+    @($Output) |
+        Where-Object { $_ -is [string] } |
+        ForEach-Object { $_ -split "`r?`n" } |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ } |
+        Sort-Object -Unique
 }
 
 function Write-RemoteContainerMetadata {
@@ -1990,6 +2087,8 @@ Export-ModuleMember -Function @(
     'Convert-PathToDockerFormat'
     # Remote SSH
     'Test-RemoteSSHKeyFiles'
+    'Get-SshFailureKind'
+    'ConvertTo-RemoteRepoList'
     'Write-RemoteContainerMetadata'
     'Remove-RemoteContainerMetadata'
     'Read-RemoteContainerMetadata'
