@@ -573,11 +573,18 @@ Describe 'Get-GitRepositoryState (local, mocked)' -Tag Integration {
 Describe 'Get-GitRepositoryState (remote, mocked SSH)' -Tag Integration {
     It 'Parses combined SSH output into status/branch/remote' {
         Mock ssh {
-            # Simulated output: porcelain status lines, then branch, then remote URL
+            # Simulated output: each section starts with a marker line printed by
+            # the remote command (status lines, branch, remote URL, ahead count, ops)
             return @(
+                '__IMPACT_STATUS__'
                 ' M inputs/sim_design.yaml'
+                '__IMPACT_BRANCH__'
                 'main'
+                '__IMPACT_REMOTE__'
                 'git@github.com:IMPACT/repo.git'
+                '__IMPACT_AHEAD__'
+                '0'
+                '__IMPACT_OP__'
             )
         } -ModuleName 'IMPACT_Docker_GUI'
 
@@ -593,10 +600,16 @@ Describe 'Get-GitRepositoryState (remote, mocked SSH)' -Tag Integration {
 
     It 'Returns HasChanges=$false for clean remote repo' {
         Mock ssh {
-            # No porcelain lines — just branch and remote
+            # No porcelain lines after the status marker: clean repo
             return @(
+                '__IMPACT_STATUS__'
+                '__IMPACT_BRANCH__'
                 'feature-branch'
+                '__IMPACT_REMOTE__'
                 'git@github.com:IMPACT/repo.git'
+                '__IMPACT_AHEAD__'
+                '0'
+                '__IMPACT_OP__'
             )
         } -ModuleName 'IMPACT_Docker_GUI'
 
@@ -650,7 +663,9 @@ Describe 'Invoke-GitChangeDetection in NonInteractive mode' -Tag Integration {
             if ($joined -match 'status --porcelain') { return @(' M file.R') }
             if ($joined -match 'rev-parse --abbrev-ref') { return 'main' }
             if ($joined -match 'remote get-url') { return 'git@github.com:u/r.git' }
-            # If we get here, commit/push is being attempted — fail
+            # Read-only checks for unpushed commits and an unfinished merge/rebase
+            if ($joined -match 'rev-list --count|rev-parse --git-dir') { return '' }
+            # If we get here, commit/push is being attempted, so fail
             throw "git commit/push should not be called in NonInteractive mode without dialog"
         } -ModuleName 'IMPACT_Docker_GUI'
 
@@ -895,3 +910,288 @@ Describe 'Show-CredentialDialog NonInteractive with GitHub validation' -Tag Inte
 }
 
 # Artifact persistence is handled by Invoke-Tests.ps1 (only on failure/skip).
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Git commit flow on Stop: status parsing, merge guard, commit and push checks
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Get-GitRepositoryState: every status code, ahead count and unfinished merge' -Tag Integration {
+    BeforeAll {
+        # Pester can only mock a command that exists. Some CI machines have no
+        # ssh client, so add a throw-away global stub that the mocks replace.
+        $script:addedSshStub = $false
+        if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+            function global:ssh { throw 'ssh stub called without a mock' }
+            $script:addedSshStub = $true
+        }
+    }
+    AfterAll {
+        if ($script:addedSshStub) { Remove-Item -Path function:global:ssh -ErrorAction SilentlyContinue }
+    }
+
+    It 'Local: counts staged, deleted, renamed and conflicted files and reads ahead + merge state' {
+        $gitDir = Join-Path $TestDrive 'dotgit'
+        New-Item -ItemType Directory -Path $gitDir -Force | Out-Null
+        Set-Content -Path (Join-Path $gitDir 'MERGE_HEAD') -Value 'abc'
+        $script:fakeGitDir = $gitDir
+        Mock git {
+            $joined = ($args | ForEach-Object { "$_" }) -join ' '
+            if ($joined -match 'status --porcelain') { return @('M  staged.R', ' D deleted.R', 'R  old.R -> new.R', 'UU conflict.R') }
+            if ($joined -match 'rev-parse --abbrev-ref') { return 'main' }
+            if ($joined -match 'remote get-url') { return 'git@github.com:u/r.git' }
+            if ($joined -match 'rev-list --count') { return '3' }
+            if ($joined -match 'rev-parse --git-dir') { return $script:fakeGitDir }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Get-GitRepositoryState -State $state -RepoPath $TestDrive -IsRemote $false
+
+        $result.HasChanges | Should -BeTrue
+        ($result.StatusText -split "`n").Count | Should -Be 4
+        $result.Branch | Should -Be 'main'
+        $result.Ahead | Should -Be 3
+        $result.HasUpstream | Should -BeTrue
+        @($result.Conflicts) | Should -Be @('conflict.R')
+        $result.OperationInProgress | Should -Be 'merge'
+    }
+
+    It 'Local: reports no upstream when rev-list prints nothing' {
+        Mock git {
+            $joined = ($args | ForEach-Object { "$_" }) -join ' '
+            if ($joined -match 'status --porcelain') { return @() }
+            if ($joined -match 'rev-parse --abbrev-ref') { return 'new-branch' }
+            return $null
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Get-GitRepositoryState -State $state -RepoPath $TestDrive -IsRemote $false
+        $result.HasChanges | Should -BeFalse
+        $result.HasUpstream | Should -BeFalse
+        $result.Ahead | Should -Be 0
+        $result.OperationInProgress | Should -Be ''
+    }
+
+    It 'Local: returns null (not "no changes") when git status fails' {
+        Mock git {
+            $joined = ($args | ForEach-Object { "$_" }) -join ' '
+            if ($joined -match 'status --porcelain') { $global:LASTEXITCODE = 128; return $null }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'LOCAL'
+        Get-GitRepositoryState -State $state -RepoPath $TestDrive -IsRemote $false | Should -BeNullOrEmpty
+    }
+
+    It 'Remote: reads sections by marker, so unusual status codes are never taken as the branch' {
+        Mock ssh {
+            return @(
+                '__IMPACT_STATUS__'
+                'M  staged.R'
+                ' D deleted.R'
+                'UU conflict.R'
+                '__IMPACT_BRANCH__'
+                'main'
+                '__IMPACT_REMOTE__'
+                'git@github.com:IMPACT/repo.git'
+                '__IMPACT_AHEAD__'
+                '__IMPACT_OP__'
+                'rebase-merge'
+            )
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.5'
+        $result = Get-GitRepositoryState -State $state -RepoPath '/home/user/repo' -IsRemote $true
+        $result.HasChanges | Should -BeTrue
+        $result.StatusText | Should -Match 'staged\.R'
+        $result.StatusText | Should -Match 'deleted\.R'
+        $result.Branch | Should -Be 'main'
+        $result.Remote | Should -Be 'git@github.com:IMPACT/repo.git'
+        $result.HasUpstream | Should -BeFalse
+        @($result.Conflicts) | Should -Be @('conflict.R')
+        $result.OperationInProgress | Should -Be 'rebase'
+    }
+
+    It 'Remote: returns null when the command did not run (no markers)' {
+        Mock ssh { return @() } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.5'
+        Get-GitRepositoryState -State $state -RepoPath '/home/user/repo' -IsRemote $true | Should -BeNullOrEmpty
+    }
+
+    It 'Remote: quotes a repository path that contains an apostrophe' {
+        $script:sentCommand = ''
+        Mock ssh { $script:sentCommand = "$($args[-1])"; return @('__IMPACT_STATUS__') } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.5'
+        $null = Get-GitRepositoryState -State $state -RepoPath "/home/u/Bob's repo" -IsRemote $true
+        $script:sentCommand | Should -BeLike "cd '/home/u/Bob'\''s repo' || exit 1;*"
+    }
+}
+
+Describe 'Invoke-GitChangeDetection commit and push flow (mocked)' -Tag Integration {
+    BeforeAll {
+        $script:addedSshStub = $false
+        if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+            function global:ssh { throw 'ssh stub called without a mock' }
+            $script:addedSshStub = $true
+        }
+        # A clean, typical state: one modified file on 'main' with an upstream.
+        $script:changedState = [pscustomobject]@{
+            HasChanges = $true; StatusText = ' M f.R'; Branch = 'main'; Remote = 'https://github.com/o/r.git'
+            Ahead = 0; HasUpstream = $true; Conflicts = @(); OperationInProgress = ''
+        }
+    }
+    AfterAll {
+        if ($script:addedSshStub) { Remove-Item -Path function:global:ssh -ErrorAction SilentlyContinue }
+    }
+    BeforeEach {
+        Enable-NonInteractiveMode
+        $script:gitCalls = @()
+        $script:sshCalls = @()
+        $script:sshDuringPush = $null
+        Mock Get-GitRepositoryState { return $script:changedState } -ModuleName 'IMPACT_Docker_GUI'
+        Mock Show-GitCommitDialog { return @{ Message = 'Fix `x` for $HOME'; Push = $true } } -ModuleName 'IMPACT_Docker_GUI'
+    }
+    AfterEach {
+        Disable-NonInteractiveMode
+    }
+
+    It 'Local: a failed commit is reported and nothing is pushed' {
+        Mock git {
+            $joined = ($args | ForEach-Object { "$_" }) -join ' '
+            $script:gitCalls += $joined
+            $global:LASTEXITCODE = 0
+            if ($joined -match 'diff --cached') { $global:LASTEXITCODE = 1; return }
+            if ($joined -match ' commit ') { $global:LASTEXITCODE = 128; return 'Author identity unknown' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Invoke-GitChangeDetection -State $state -RepoPath $TestDrive -IsRemote $false
+        $result.Success | Should -BeFalse
+        $result.Outcome | Should -Be 'CommitFailed'
+        ($script:gitCalls | Where-Object { $_ -match '\bpush\b' }) | Should -BeNullOrEmpty
+    }
+
+    It 'Local: commits as the GitHub user and pushes with only the IMPACT key, without changing origin' {
+        $before = $env:GIT_SSH_COMMAND
+        Mock git {
+            $joined = ($args | ForEach-Object { "$_" }) -join ' '
+            $script:gitCalls += $joined
+            $global:LASTEXITCODE = 0
+            if ($joined -match 'diff --cached') { $global:LASTEXITCODE = 1; return }
+            if ($joined -match '\bpush\b') { $script:sshDuringPush = $env:GIT_SSH_COMMAND; return 'To github.com:o/r.git' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'alice' -Location 'LOCAL'
+        $result = Invoke-GitChangeDetection -State $state -RepoPath $TestDrive -IsRemote $false
+        $result.Outcome | Should -Be 'Pushed'
+        $result.Success | Should -BeTrue
+
+        $commit = $script:gitCalls | Where-Object { $_ -match ' commit ' }
+        $commit | Should -Match 'user\.name=alice'
+        $commit | Should -Match 'user\.email=alice@users\.noreply\.github\.com'
+        $push = $script:gitCalls | Where-Object { $_ -match '\bpush\b' }
+        $push | Should -Match 'url\.git@github\.com:\.pushInsteadOf=https://github\.com/'
+        $script:sshDuringPush | Should -Match 'IdentitiesOnly=yes'
+        $script:sshDuringPush | Should -Match 'BatchMode=yes'
+        $script:sshDuringPush | Should -Match 'id_ed25519_alice'
+        ($script:gitCalls | Where-Object { $_ -match 'set-url' }) | Should -BeNullOrEmpty
+        $env:GIT_SSH_COMMAND | Should -Be $before
+    }
+
+    It 'Local: a rejected push is reported as a failure, not as success' {
+        Mock git {
+            $joined = ($args | ForEach-Object { "$_" }) -join ' '
+            $script:gitCalls += $joined
+            $global:LASTEXITCODE = 0
+            if ($joined -match 'diff --cached') { $global:LASTEXITCODE = 1; return }
+            if ($joined -match '\bpush\b') { $global:LASTEXITCODE = 1; return ' ! [rejected]        main -> main (fetch first)' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Invoke-GitChangeDetection -State $state -RepoPath $TestDrive -IsRemote $false
+        $result.Success | Should -BeFalse
+        $result.Outcome | Should -Be 'PushFailed'
+    }
+
+    It 'Local: a branch without upstream is pushed with -u origin HEAD' {
+        $script:changedState.HasUpstream = $false
+        try {
+            Mock git {
+                $joined = ($args | ForEach-Object { "$_" }) -join ' '
+                $script:gitCalls += $joined
+                $global:LASTEXITCODE = 0
+                if ($joined -match 'diff --cached') { $global:LASTEXITCODE = 1; return }
+            } -ModuleName 'IMPACT_Docker_GUI'
+            $state = New-TestSessionState -Location 'LOCAL'
+            $result = Invoke-GitChangeDetection -State $state -RepoPath $TestDrive -IsRemote $false
+            $result.Outcome | Should -Be 'Pushed'
+            ($script:gitCalls | Where-Object { $_ -match '\bpush\b' }) | Should -Match 'push -u origin HEAD$'
+        } finally {
+            $script:changedState.HasUpstream = $true
+        }
+    }
+
+    It 'Refuses to commit during an unfinished merge and never opens the dialog' {
+        Mock Get-GitRepositoryState {
+            return [pscustomobject]@{ HasChanges = $true; StatusText = 'UU a.R'; Branch = 'main'; Remote = ''; Ahead = 0; HasUpstream = $true; Conflicts = @('a.R'); OperationInProgress = 'merge' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+        Mock git { $script:gitCalls += ($args -join ' ') } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Invoke-GitChangeDetection -State $state -RepoPath $TestDrive -IsRemote $false
+        $result.Outcome | Should -Be 'Blocked'
+        Should -Invoke Show-GitCommitDialog -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly
+        $script:gitCalls | Should -BeNullOrEmpty
+    }
+
+    It 'Reports unpushed commits on a clean tree (NonInteractive: no push)' {
+        Mock Get-GitRepositoryState {
+            return [pscustomobject]@{ HasChanges = $false; StatusText = ''; Branch = 'main'; Remote = ''; Ahead = 2; HasUpstream = $true; Conflicts = @(); OperationInProgress = '' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+        Mock git { $script:gitCalls += ($args -join ' ') } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Invoke-GitChangeDetection -State $state -RepoPath $TestDrive -IsRemote $false
+        $result.Outcome | Should -Be 'Skipped'
+        $result.Message | Should -Match '2 commit'
+        Should -Invoke Show-GitCommitDialog -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly
+        $script:gitCalls | Should -BeNullOrEmpty
+    }
+
+    It 'Remote: sends the message base64-encoded, sets the identity, and pushes once with only the IMPACT key' {
+        Mock ssh {
+            $script:sshCalls += "$($args[-1])"
+            $global:LASTEXITCODE = 0
+            return 'ok'
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'bob' -Location 'REMOTE@10.0.0.5'
+        $result = Invoke-GitChangeDetection -State $state -RepoPath '/home/php-workstation/repo' -IsRemote $true
+        $result.Outcome | Should -Be 'Pushed'
+        $script:sshCalls.Count | Should -Be 2
+
+        $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('Fix `x` for $HOME'))
+        $script:sshCalls[0] | Should -Match ([regex]::Escape($b64))
+        $script:sshCalls[0] | Should -Match 'commit -F -'
+        $script:sshCalls[0] | Should -Match "-c user\.name='bob' -c user\.email='bob@users\.noreply\.github\.com'"
+        $script:sshCalls[0] | Should -Not -Match ([regex]::Escape('$HOME'))
+
+        $script:sshCalls[1] | Should -Match ([regex]::Escape("GIT_SSH_COMMAND='ssh -i ~/.ssh/id_ed25519_bob -o IdentitiesOnly=yes"))
+        $script:sshCalls[1] | Should -Not -Match 'ssh-agent|id_ed25519_workstation|set-url'
+    }
+
+    It 'Remote: a failed push is reported once, with no fallback to other keys' {
+        Mock ssh {
+            $cmd = "$($args[-1])"
+            $script:sshCalls += $cmd
+            $global:LASTEXITCODE = 0
+            if ($cmd -match 'pushInsteadOf') { $global:LASTEXITCODE = 128; return 'git@github.com: Permission denied (publickey).' }
+            return 'ok'
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'bob' -Location 'REMOTE@10.0.0.5'
+        $result = Invoke-GitChangeDetection -State $state -RepoPath '/home/php-workstation/repo' -IsRemote $true
+        $result.Outcome | Should -Be 'PushFailed'
+        $result.Success | Should -BeFalse
+        $script:sshCalls.Count | Should -Be 2
+    }
+}

@@ -724,7 +724,88 @@ function Test-AndCreateDirectory {
 # ══════════════════════════════════════════════════════════════════════════════
 #  Git helpers
 # ══════════════════════════════════════════════════════════════════════════════
+function ConvertTo-PosixShellLiteral {
+    <#
+    .SYNOPSIS Wraps a value in single quotes so a Linux shell (bash/sh) reads it
+              as plain text.
+    .DESCRIPTION
+        Commands that we send over ssh are run by the workstation's shell, and
+        GIT_SSH_COMMAND is run by git through 'sh'. Inside single quotes the
+        shell does not expand anything ($VAR, `backticks`, $(...), \ are all
+        literal). The only character that needs special care is the single
+        quote itself: we write it as '\'' (close the quote, add an escaped
+        quote, open the quote again). Example: O'Brien -> 'O'\''Brien'
+    #>
+    param([AllowEmptyString()][string]$Value)
+    return "'" + ($Value -replace "'", "'\''") + "'"
+}
+
+function ConvertTo-GitOutputText {
+    <#
+    .SYNOPSIS Turns what a native command printed (captured with 2>&1) into one
+              trimmed text block with LF line breaks.
+    .DESCRIPTION
+        With 2>&1, each stderr line arrives as an ErrorRecord. For an EMPTY
+        stderr line, "$record" gives the text "System.Management.Automation.
+        RemoteException", which ended up in the error messages we show. The
+        record's Exception.Message holds the real line (empty in that case).
+    #>
+    param([object[]]$Output)
+    $lines = foreach ($item in @($Output)) {
+        if ($item -is [System.Management.Automation.ErrorRecord]) { $item.Exception.Message } else { "$item" }
+    }
+    return ((@($lines) -join "`n").Trim())
+}
+
+function Get-GitPushFailureHint {
+    <#
+    .SYNOPSIS Turns the text printed by a failed 'git push' into one plain
+              sentence that tells a non-expert what went wrong and what to do.
+    .DESCRIPTION
+        Pure text logic (no git, no ssh) so it can be unit tested. The order of
+        the checks matters: the most specific causes are tested first.
+    #>
+    param(
+        [AllowEmptyString()][string]$Output,
+        [string]$KeyName = 'your IMPACT SSH key'
+    )
+    $o = [string]$Output
+    if ($o -match 'Permission denied \(publickey') {
+        return "GitHub did not accept $KeyName. Check that this key is listed at https://github.com/settings/keys (the IMPACT tool normally adds it when you log in)."
+    }
+    if ($o -match 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED') {
+        return 'The identity of github.com could not be confirmed (SSH host key problem). Please ask the maintainer for help.'
+    }
+    if ($o -match 'Could not resolve hostname|Connection timed out|Operation timed out|Network is unreachable|Connection refused|ssh: connect to host') {
+        return 'GitHub could not be reached. Check the network or VPN connection and try again.'
+    }
+    if ($o -match 'Permission to \S+ denied|Repository not found|ERROR: Permission|returned error: 403') {
+        return 'Your GitHub account does not have write access to this repository. Ask the repository owner to add you as a collaborator.'
+    }
+    if ($o -match 'remote rejected|protected branch|hook declined') {
+        return 'GitHub refused the push for this branch (for example, the branch is protected). Push to another branch and open a pull request instead.'
+    }
+    if ($o -match 'non-fast-forward|fetch first|\[rejected\]|Updates were rejected') {
+        return 'Someone else pushed to this branch first. Start the container again, click Pull in the RStudio Git pane to merge their work, then click Push.'
+    }
+    if ($o -match 'could not read Username|terminal prompts disabled|Authentication failed') {
+        return 'GitHub asked for a user name and password (HTTPS remote), which this tool cannot type in. Push from RStudio instead.'
+    }
+    if ($o -match 'not on a branch|detached HEAD') {
+        return 'You are not on a branch (detached HEAD), so there is nothing to push. Switch to a branch in the RStudio Git pane first.'
+    }
+    return 'Git reported an error. The details are shown below.'
+}
+
 function Get-GitRepositoryState {
+    # Returns an object describing the repository:
+    #   HasChanges / StatusText / Branch / Remote  (as before)
+    #   Ahead               number of commits on this branch that are not on its
+    #                       upstream (GitHub) branch yet; 0 when unknown
+    #   HasUpstream         $false when the branch was never pushed (no upstream)
+    #   Conflicts           files git still marks as conflicted (UU, AA, ...)
+    #   OperationInProgress '' or 'merge' / 'rebase' / 'cherry-pick' / 'revert'
+    # Returns $null when the status could not be read at all.
     param(
         [pscustomobject]$State,
         [string]$RepoPath,
@@ -732,32 +813,119 @@ function Get-GitRepositoryState {
     )
     if (-not $RepoPath) { return $null }
     Write-Log "Checking git status for repo at $RepoPath (remote=$IsRemote)" 'Info'
+
+    # Defaults, so every variable exists below even if a branch does not set it (StrictMode).
+    $statusLines = @()
+    $branch = ''
+    $remote = ''
+    $aheadText = ''
+    $opNames = @()
     try {
         if ($IsRemote) {
             $remoteHost = Get-RemoteHostString -State $State
             $keyPath = $State.Paths.SshPrivate
-            $cmd = "cd '$RepoPath' && git status --porcelain=v1 && git rev-parse --abbrev-ref HEAD && git remote get-url origin"
+            # Each piece of output is preceded by its own marker line (__IMPACT_STATUS__ ...).
+            # The old code guessed "first line that is not a known status code = branch,
+            # next line = remote URL". That broke for status codes it did not list, for
+            # example 'M ' (file staged in RStudio), ' D' (file deleted) or 'UU' (merge
+            # conflict): those files were taken as the branch name and HasChanges could
+            # wrongly be $false, so the commit dialog never appeared.
+            # Other details:
+            #  - The path is single-quoted with ConvertTo-PosixShellLiteral, so an
+            #    apostrophe in a folder name cannot break the command.
+            #  - 'cd ... || exit 1' stops if the folder is missing (no markers are printed,
+            #    and we report that instead of pretending there are no changes).
+            #  - __IMPACT_GITFAIL__ is printed when 'git status' itself fails (not a repo,
+            #    "dubious ownership", ...).
+            #  - AHEAD: how many local commits are not on GitHub yet. This prints nothing
+            #    when the branch has no upstream (it was never pushed).
+            #  - OP: lists the files git creates while a merge / rebase / cherry-pick /
+            #    revert is unfinished, so we can refuse to commit in that state.
+            $repoQ = ConvertTo-PosixShellLiteral -Value $RepoPath
+            $cmd = "cd $repoQ || exit 1; " +
+                   "echo __IMPACT_STATUS__; git status --porcelain=v1 || echo __IMPACT_GITFAIL__; " +
+                   "echo __IMPACT_BRANCH__; git rev-parse --abbrev-ref HEAD 2>/dev/null; " +
+                   "echo __IMPACT_REMOTE__; git remote get-url origin 2>/dev/null; " +
+                   "echo __IMPACT_AHEAD__; git rev-list --count '@{u}..HEAD' 2>/dev/null; " +
+                   "echo __IMPACT_OP__; gd=`$(git rev-parse --git-dir 2>/dev/null) && for p in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do test -e `"`$gd/`$p`" && echo `$p; done; true"
+            # Reset first: a mocked or failed call must not leave an old exit code behind.
+            $global:LASTEXITCODE = 0
             $out = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=20 -o BatchMode=yes $remoteHost $cmd 2>$null
-            $lines = ($out -split "`n")
-            $statusLines = @()
-            $branch = ''
-            $remote = ''
-            foreach ($line in $lines) {
-                if ($line -match '^(\?\?| M|A |D )') { $statusLines += $line; continue }
-                if (-not $branch) { $branch = $line; continue }
-                if (-not $remote) { $remote = $line }
+            $sshExit = $LASTEXITCODE
+            $section = ''
+            $gitFailed = $false
+            $parts = @{ STATUS = @(); BRANCH = @(); REMOTE = @(); AHEAD = @(); OP = @() }
+            foreach ($raw in @($out | ForEach-Object { "$_" -split "`n" })) {
+                $line = $raw.TrimEnd("`r")
+                if ($line -eq '__IMPACT_GITFAIL__') { $gitFailed = $true; continue }
+                if ($line -match '^__IMPACT_(STATUS|BRANCH|REMOTE|AHEAD|OP)__$') { $section = $matches[1]; continue }
+                if (-not $section -or -not $line.Trim()) { continue }
+                $parts[$section] += $line
             }
-            Write-Log "Git status (remote) lines: $([string]::Join(';', $statusLines)) branch=$branch remote=$remote" 'Debug'
-            return [pscustomobject]@{ HasChanges = [bool]$statusLines; StatusText = ($statusLines -join "`n"); Branch=$branch; Remote=$remote }
+            if (-not $section -or $gitFailed) {
+                # No marker at all means ssh or 'cd' failed; GITFAIL means git status failed.
+                Write-Log "Could not read the git status of $RepoPath on the workstation (ssh exit=$sshExit). Skipping the commit check." 'Warn'
+                return $null
+            }
+            # "$(...)" (not [string]) so an empty section gives '' instead of $null.
+            $statusLines = @($parts.STATUS)
+            $branch = "$(@($parts.BRANCH) | Select-Object -First 1)"
+            $remote = "$(@($parts.REMOTE) | Select-Object -First 1)"
+            $aheadText = "$(@($parts.AHEAD) | Select-Object -First 1)"
+            $opNames = @($parts.OP)
         } else {
-            Push-Location $RepoPath
-            $lines = @(git status --porcelain=v1 2>$null)
-            if (-not $lines) { $lines = @() }
-            $branch = (git rev-parse --abbrev-ref HEAD 2>$null)
-            $remote = git remote get-url origin 2>$null
-            Pop-Location
-            Write-Log "Git status (local) lines: $([string]::Join(';', $lines)) branch=$branch remote=$remote" 'Debug'
-            return [pscustomobject]@{ HasChanges = [bool]$lines; StatusText = ($lines -join "`n"); Branch=$branch; Remote=$remote }
+            # -LiteralPath: a folder name with [brackets] is not treated as a wildcard.
+            # try/finally: we always return to the previous folder, even on an error.
+            Push-Location -LiteralPath $RepoPath
+            try {
+                $global:LASTEXITCODE = 0
+                $statusLines = @(git status --porcelain=v1 2>$null)
+                if ($LASTEXITCODE -ne 0) {
+                    # Not a repository, "dubious ownership", ...: say so instead of
+                    # silently reporting "no changes".
+                    Write-Log "Could not read the git status of $RepoPath (git exit=$LASTEXITCODE). Skipping the commit check." 'Warn'
+                    return $null
+                }
+                # "$(...)" (not [string]) so a command with no output gives '' instead of $null.
+                $branch = "$(git rev-parse --abbrev-ref HEAD 2>$null)"
+                $remote = "$(git remote get-url origin 2>$null)"
+                # '@{u}' must be quoted: unquoted, PowerShell would read @{ as a hashtable.
+                # Prints nothing (and fails) when the branch has no upstream.
+                $aheadText = "$(git rev-list --count '@{u}..HEAD' 2>$null)"
+                # Look for the files git leaves behind while an operation is unfinished.
+                $gitDir = "$(git rev-parse --git-dir 2>$null)"
+                if ($gitDir) {
+                    foreach ($p in 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply') {
+                        if (Test-Path -LiteralPath (Join-Path $gitDir $p)) { $opNames += $p }
+                    }
+                }
+            } finally {
+                Pop-Location
+            }
+        }
+
+        # Every non-empty porcelain line is a change (same rule for local and remote).
+        $statusLines = @($statusLines | ForEach-Object { "$_".TrimEnd("`r") } | Where-Object { $_.Trim() })
+        # Porcelain codes for files that still have merge conflicts (see 'git help status').
+        $conflicts = @($statusLines | Where-Object { $_ -match '^(DD|AU|UD|UA|DU|AA|UU) ' } | ForEach-Object { $_.Substring(3) })
+        $ahead = 0
+        $hasUpstream = [int]::TryParse($aheadText.Trim(), [ref]$ahead)
+        $operation = ''
+        if ($opNames -contains 'rebase-merge' -or $opNames -contains 'rebase-apply') { $operation = 'rebase' }
+        elseif ($opNames -contains 'MERGE_HEAD') { $operation = 'merge' }
+        elseif ($opNames -contains 'CHERRY_PICK_HEAD') { $operation = 'cherry-pick' }
+        elseif ($opNames -contains 'REVERT_HEAD') { $operation = 'revert' }
+
+        Write-Log "Git status (remote=$IsRemote) lines: $([string]::Join(';', $statusLines)) branch=$branch remote=$remote ahead=$ahead upstream=$hasUpstream op=$operation" 'Debug'
+        return [pscustomobject]@{
+            HasChanges          = ($statusLines.Count -gt 0)
+            StatusText          = ($statusLines -join "`n")
+            Branch              = $branch.Trim()
+            Remote              = $remote.Trim()
+            Ahead               = $ahead
+            HasUpstream         = $hasUpstream
+            Conflicts           = $conflicts
+            OperationInProgress = $operation
         }
     } catch {
         Write-Log "Git status retrieval failed: $($_.Exception.Message)" 'Debug'
@@ -780,7 +948,12 @@ function Show-GitCommitDialog {
     Style-Label -Label $lbl -Style ([System.Drawing.FontStyle]::Bold)
     $form.Controls.Add($lbl)
 
-    $txtChanges = New-Object System.Windows.Forms.TextBox -Property @{ Location=New-Object System.Drawing.Point(14,40); Size=New-Object System.Drawing.Size(600,310); Multiline=$true; ScrollBars='Vertical'; ReadOnly=$true; Font=New-Object System.Drawing.Font('Consolas',9); Text=$ChangesText }
+    # Git gives us the file list with LF line breaks, but a WinForms TextBox only
+    # starts a new line at CRLF. Without this conversion all files ran together on
+    # one line and the user could not review what 'git add -A' will commit.
+    # WordWrap off + horizontal scroll bar: one file per row even for long paths.
+    $changesForDisplay = ([string]$ChangesText) -replace "`r?`n", "`r`n"
+    $txtChanges = New-Object System.Windows.Forms.TextBox -Property @{ Location=New-Object System.Drawing.Point(14,40); Size=New-Object System.Drawing.Size(600,310); Multiline=$true; ScrollBars='Both'; WordWrap=$false; ReadOnly=$true; Font=New-Object System.Drawing.Font('Consolas',9); Text=$changesForDisplay }
     Style-TextBox -TextBox $txtChanges
     $txtChanges.BackColor = $script:ThemePalette.Panel
     $txtChanges.Font = New-Object System.Drawing.Font('Consolas',9,[System.Drawing.FontStyle]::Regular)
@@ -809,92 +982,251 @@ function Show-GitCommitDialog {
     return @{ Message=$txtMsg.Text.Trim(); Push=$chkPush.Checked }
 }
 
+function Invoke-GitPushWithImpactKey {
+    <#
+    .SYNOPSIS Pushes the current branch to GitHub with ONLY the colleague's IMPACT
+              SSH key. Returns [pscustomobject]@{ Success; Output }.
+    .DESCRIPTION
+        One attempt, one identity. The old remote code tried up to four ways
+        (ssh-agent, the IMPACT key, the workstation's own keys, then whatever
+        default key the shared account has). That could publish a colleague's
+        commit with somebody else's GitHub key, left an ssh-agent process
+        running on the workstation after every push, and showed only the error
+        of the LAST attempt (often a misleading "Permission denied").
+        SSH options used for the connection to GitHub:
+          -i <key> + IdentitiesOnly=yes   use the IMPACT key and nothing else
+          BatchMode=yes                   never wait for a password or a yes/no
+                                          question in a console nobody sees
+          StrictHostKeyChecking=accept-new  first contact with github.com is
+                                          accepted; a CHANGED key is still refused
+          ConnectTimeout=15               do not hang forever on a bad network
+        The origin URL is NOT changed. If origin is https://github.com/..., the
+        git option url.<ssh>.pushInsteadOf makes only this one push go over SSH,
+        so tools that use the HTTPS remote (GitHub Desktop, Git Credential
+        Manager) keep working.
+    #>
+    param(
+        [pscustomobject]$State,
+        [string]$RepoPath,
+        [bool]$IsRemote,
+        [bool]$HasUpstream,
+        [string]$Branch
+    )
+    # A branch that was never pushed has no "upstream". Plain 'git push' fails then,
+    # so we push it under the same name and remember the link (-u), as RStudio does.
+    # Without a branch (detached HEAD) there is nothing sensible to push.
+    if (-not $HasUpstream -and (-not $Branch -or $Branch -eq 'HEAD')) {
+        return [pscustomobject]@{ Success = $false; Output = 'fatal: You are not on a branch (detached HEAD), so there is nothing to push.' }
+    }
+    # @(...) keeps it an array even with one element, so the splat below is reliable.
+    $pushArgs = @(if ($HasUpstream) { 'push' } else { 'push', '-u', 'origin', 'HEAD' })
+    $insteadOf = 'url.git@github.com:.pushInsteadOf=https://github.com/'
+    $sshOpts = '-o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15'
+
+    if ($IsRemote) {
+        # The user name becomes part of a file name in a shell command below, so we
+        # only accept what GitHub allows in user names (letters, digits, hyphens).
+        $user = [string]$State.UserName
+        if ($user -notmatch '^[A-Za-z0-9][A-Za-z0-9-]*$') {
+            return [pscustomobject]@{ Success = $false; Output = "fatal: '$user' is not a valid GitHub user name, so the IMPACT key cannot be found." }
+        }
+        # The key lives in the shared account's ~/.ssh on the workstation. The ssh
+        # command is single-quoted for the workstation's shell; git later runs it
+        # through 'sh', which expands the ~.
+        $innerSsh = "ssh -i ~/.ssh/id_ed25519_$user $sshOpts"
+        $cmd = "cd $(ConvertTo-PosixShellLiteral -Value $RepoPath) && GIT_SSH_COMMAND=$(ConvertTo-PosixShellLiteral -Value $innerSsh) GIT_TERMINAL_PROMPT=0 git -c $(ConvertTo-PosixShellLiteral -Value $insteadOf) $($pushArgs -join ' ')"
+        $global:LASTEXITCODE = 0
+        $out = & ssh -n -i $State.Paths.SshPrivate -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes (Get-RemoteHostString -State $State) $cmd 2>&1
+        $code = $LASTEXITCODE
+    } else {
+        # Git for Windows runs GIT_SSH_COMMAND through its own 'sh', so the Windows
+        # key path gets forward slashes and POSIX quoting (spaces or an apostrophe
+        # in the user folder name would otherwise break it).
+        $keyPosix = ([string]$State.Paths.SshPrivate) -replace '\\', '/'
+        $oldSsh = $env:GIT_SSH_COMMAND
+        $oldPrompt = $env:GIT_TERMINAL_PROMPT
+        Push-Location -LiteralPath $RepoPath
+        try {
+            # Set only for this push and restored in 'finally', so nothing else in
+            # this PowerShell session is affected. GIT_TERMINAL_PROMPT=0 stops git
+            # from waiting for an HTTPS user name in the console window behind the
+            # GUI, where nobody would notice the question (the GUI would freeze).
+            $env:GIT_SSH_COMMAND = "ssh -i $(ConvertTo-PosixShellLiteral -Value $keyPosix) $sshOpts"
+            $env:GIT_TERMINAL_PROMPT = '0'
+            $global:LASTEXITCODE = 0
+            $out = & git -c $insteadOf @pushArgs 2>&1
+            $code = $LASTEXITCODE
+        } finally {
+            # Assigning $null removes the variable again if it was not set before.
+            $env:GIT_SSH_COMMAND = $oldSsh
+            $env:GIT_TERMINAL_PROMPT = $oldPrompt
+            Pop-Location
+        }
+    }
+    return [pscustomobject]@{ Success = ($code -eq 0); Output = (ConvertTo-GitOutputText -Output $out) }
+}
+
 function Invoke-GitChangeDetection {
+    <#
+    .SYNOPSIS Runs after a container stops: offers to commit (and push) changes,
+              or to push commits that are not on GitHub yet.
+    .OUTPUTS  [pscustomobject]@{ Success; Outcome; Message } so the caller can
+              show an honest status line. Outcome is one of: NoChanges,
+              Unavailable, Blocked, Skipped, Committed, Pushed, CommitFailed,
+              PushFailed, Error.
+    #>
     param(
         [pscustomobject]$State,
         [string]$RepoPath,
         [bool]$IsRemote
     )
+    $newResult = { param([bool]$Ok, [string]$Outcome, [string]$Text) [pscustomobject]@{ Success = $Ok; Outcome = $Outcome; Message = $Text } }
+    # Message boxes show only the last lines of git's output so they stay readable.
+    $lastLines = { param([string]$Text) ((@($Text -split "`r?`n") | Select-Object -Last 15) -join "`r`n") }
+    $where = if ($IsRemote) { 'in the repository on the workstation' } else { 'in the repository on this computer' }
+
     Write-Log "Detecting git changes at $RepoPath (remote=$IsRemote)" 'Info'
     $gitState = Get-GitRepositoryState -State $State -RepoPath $RepoPath -IsRemote $IsRemote
-    if (-not $gitState -or -not $gitState.HasChanges) { return }
-    $dialogResult = Show-GitCommitDialog -ChangesText $gitState.StatusText
-    if (-not $dialogResult) { Write-Log 'User skipped git commit/push.' 'Info'; return }
+    if (-not $gitState) { return (& $newResult $true 'Unavailable' 'The git status could not be read, so nothing was committed.') }
 
-    $msg = $dialogResult.Message
-    $doPush = $dialogResult.Push
-    $safeMsg = $msg.Replace('"','\"')
+    # Refuse to commit while git is in the middle of a merge / rebase, or while files
+    # still have conflicts. 'git add -A' would mark conflicted files as resolved and
+    # the commit would publish files that still contain <<<<<<< markers.
+    $conflicts = @($gitState.Conflicts)
+    $operation = [string]$gitState.OperationInProgress
+    if ($operation -or $conflicts.Count -gt 0) {
+        $opName = if ($operation) { $operation } else { 'merge' }
+        $why = "Nothing was committed or pushed, because git is in the middle of an unfinished $opName. Your files are unchanged."
+        if ($conflicts.Count -gt 0) {
+            $why += "`r`n`r`nThese files still have conflicts (sections between <<<<<<< and >>>>>>>):`r`n  " + ((@($conflicts) | Select-Object -First 15) -join "`r`n  ")
+        }
+        $how = switch ($opName) {
+            'merge'  { "Start the container again, fix those sections in RStudio, then click Commit in the RStudio Git pane. To cancel the merge instead, run 'git merge --abort' in the RStudio Terminal." }
+            'rebase' { "Start the container again and, in the RStudio Terminal, run 'git rebase --continue' after fixing conflicts, or 'git rebase --abort' to cancel." }
+            default  { "Start the container again and, in the RStudio Terminal, run 'git $opName --continue' after fixing conflicts, or 'git $opName --abort' to cancel." }
+        }
+        $why += "`r`n`r`n$how"
+        Write-Log $why 'Warn'
+        if (-not $script:NonInteractive) { [System.Windows.Forms.MessageBox]::Show($why, "Git: unfinished $opName", 'OK', 'Warning') | Out-Null }
+        return (& $newResult $false 'Blocked' "Not committed: unfinished git $opName.")
+    }
+
+    $doCommit = $false
+    $doPush = $false
+    $msg = ''
+    if (-not $gitState.HasChanges) {
+        if ($gitState.Ahead -le 0) { return (& $newResult $true 'NoChanges' 'No uncommitted changes.') }
+        # Clean working tree, but commits made earlier (for example with Commit in
+        # RStudio, without Push) are not on GitHub yet. Offer to push them.
+        $n = $gitState.Ahead
+        Write-Log "$n commit(s) on branch '$($gitState.Branch)' are not on GitHub yet." 'Warn'
+        if ($script:NonInteractive) { return (& $newResult $true 'Skipped' "$n commit(s) are not on GitHub yet.") }
+        $answer = [System.Windows.Forms.MessageBox]::Show("You have $n commit(s) saved $where that are not on GitHub yet.`r`n`r`nPush them to GitHub now?", 'Unpushed commits', 'YesNo', 'Question')
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
+            Write-Log 'User chose not to push the unpushed commits.' 'Info'
+            return (& $newResult $true 'Skipped' "$n commit(s) are still not on GitHub.")
+        }
+        $doPush = $true
+    } else {
+        $dialogResult = Show-GitCommitDialog -ChangesText $gitState.StatusText
+        if (-not $dialogResult) { Write-Log 'User skipped git commit/push.' 'Info'; return (& $newResult $true 'Skipped' 'Changes were not committed.') }
+        $doCommit = $true
+        $msg = [string]$dialogResult.Message
+        $doPush = [bool]$dialogResult.Push
+    }
 
     try {
-        if ($IsRemote) {
-            $remoteHost = Get-RemoteHostString -State $State
-            $keyPath = $State.Paths.SshPrivate
-            $remoteUrl = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cd '$RepoPath' && git remote get-url origin" 2>$null
-            if ($remoteUrl -and $remoteUrl -match '^https://github.com/(.+)$') {
-                $sshUrl = "git@github.com:$($matches[1])"
-                & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cd '$RepoPath' && git remote set-url origin '$sshUrl'" 2>$null
-            }
-            $commitCmd = "cd '$RepoPath' && git add -A && git commit -m `"$safeMsg`""
-            $commitOut = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost $commitCmd 2>&1
-            Write-Log "Remote git commit exit=$LASTEXITCODE output=$commitOut" 'Debug'
-            if ($LASTEXITCODE -ne 0 -and $commitOut -notmatch 'nothing to commit') {
-                if (-not $script:NonInteractive) { [System.Windows.Forms.MessageBox]::Show("Git commit failed on remote: $commitOut",'Git commit failed','OK','Error') | Out-Null }
-                return
-            }
-            if ($LASTEXITCODE -eq 0) { Write-Log 'Git commit completed on remote.' 'Info' }
-            if ($doPush) {
-                $remoteKey = "~/.ssh/id_ed25519_$($State.UserName)"
-                # Try 1: IMPACT-specific key via ssh-agent
-                $pushAgent = "cd '$RepoPath' && eval `$(ssh-agent -s) && ssh-add $remoteKey 2>/dev/null && GIT_SSH_COMMAND='ssh -i $remoteKey -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' git push"
-                $pushOut = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost $pushAgent 2>&1
-                Write-Log "Remote git push (agent) exit=$LASTEXITCODE output=$pushOut" 'Debug'
-                if ($LASTEXITCODE -ne 0) {
-                    # Try 2: IMPACT-specific key directly (no agent)
-                    $pushDirect = "cd '$RepoPath' && GIT_SSH_COMMAND='ssh -i $remoteKey -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' git push"
-                    $pushOut = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost $pushDirect 2>&1
-                    Write-Log "Remote git push (direct) exit=$LASTEXITCODE output=$pushOut" 'Debug'
+        if ($doCommit) {
+            # Commit as the colleague, with the same name and e-mail that the container
+            # uses for commits made in RStudio. Without this, a remote commit used the
+            # shared workstation account's identity (or failed with "Author identity
+            # unknown"), and a local commit depended on Windows git being configured.
+            # 'git -c' applies it to this one command and changes no config file.
+            # GitHub user names only contain letters, digits and hyphens; we check that
+            # before the name goes into a command line.
+            $gitUser = [string]$State.UserName
+            $useIdentity = $gitUser -match '^[A-Za-z0-9][A-Za-z0-9-]*$'
+            if (-not $useIdentity) { Write-Log "'$gitUser' is not a valid GitHub user name; committing with git's own identity settings." 'Warn' }
+            $gitEmail = "$gitUser@users.noreply.github.com"
+            $nothingToCommit = $false
+            if ($IsRemote) {
+                $idPart = if ($useIdentity) { "-c user.name=$(ConvertTo-PosixShellLiteral -Value $gitUser) -c user.email=$(ConvertTo-PosixShellLiteral -Value $gitEmail) " } else { '' }
+                # The message is sent base64-encoded and decoded on the workstation
+                # ('git commit -F -' reads it from the pipe). Base64 only contains
+                # A-Z a-z 0-9 + / =, so backticks, $, quotes or a trailing \ in the
+                # message can no longer run commands or break the quoting.
+                # UTF-8 keeps umlauts intact.
+                # 'git diff --cached --quiet' succeeds when nothing is staged; that is
+                # how we spot "nothing to commit" without depending on git's (possibly
+                # German) wording.
+                $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($msg))
+                $commitCmd = "cd $(ConvertTo-PosixShellLiteral -Value $RepoPath) && git add -A && if git diff --cached --quiet; then echo __IMPACT_NOTHING_TO_COMMIT__; else printf '%s' '$b64' | base64 -d | git ${idPart}commit -F -; fi"
+                $global:LASTEXITCODE = 0
+                $commitOut = & ssh -n -i $State.Paths.SshPrivate -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes (Get-RemoteHostString -State $State) $commitCmd 2>&1
+                $commitCode = $LASTEXITCODE
+                $commitText = ConvertTo-GitOutputText -Output $commitOut
+                $nothingToCommit = ($commitCode -eq 0 -and $commitText -match '__IMPACT_NOTHING_TO_COMMIT__')
+            } else {
+                $idArgs = @(if ($useIdentity) { '-c', "user.name=$gitUser", '-c', "user.email=$gitEmail" })
+                Push-Location -LiteralPath $RepoPath
+                try {
+                    # Each step's exit code is checked; before, failures were ignored
+                    # and the log said "completed" anyway.
+                    $global:LASTEXITCODE = 0
+                    $commitOut = @(git add -A 2>&1)
+                    $commitCode = $LASTEXITCODE
+                    if ($commitCode -eq 0) {
+                        $global:LASTEXITCODE = 0
+                        $null = git diff --cached --quiet 2>&1
+                        if ($LASTEXITCODE -eq 0) {
+                            $nothingToCommit = $true
+                        } else {
+                            $global:LASTEXITCODE = 0
+                            $commitOut = @(git @idArgs commit -m $msg 2>&1)
+                            $commitCode = $LASTEXITCODE
+                        }
+                    }
+                } finally {
+                    Pop-Location
                 }
-                if ($LASTEXITCODE -ne 0) {
-                    # Try 3: workstation's own key (commonly named id_ed25519_workstation)
-                    Write-Log 'IMPACT key push failed; trying workstation SSH keys.' 'Warn'
-                    $pushWs = "cd '$RepoPath' && for k in ~/.ssh/id_ed25519_workstation ~/.ssh/id_ed25519 ~/.ssh/id_rsa; do [ -f `"`$k`" ] && GIT_SSH_COMMAND='ssh -i `$k -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' git push && exit 0; done; exit 1"
-                    $pushOut = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost $pushWs 2>&1
-                    Write-Log "Remote git push (workstation keys) exit=$LASTEXITCODE output=$pushOut" 'Debug'
-                }
-                if ($LASTEXITCODE -ne 0) {
-                    # Try 4: let the workstation's SSH config / agent decide
-                    Write-Log 'Explicit key push failed; falling back to default SSH identity.' 'Warn'
-                    $pushDefault = "cd '$RepoPath' && git push"
-                    $pushOut = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost $pushDefault 2>&1
-                    Write-Log "Remote git push (default SSH) exit=$LASTEXITCODE output=$pushOut" 'Debug'
-                }
-                if ($LASTEXITCODE -ne 0) {
-                    if (-not $script:NonInteractive) { [System.Windows.Forms.MessageBox]::Show("Git push failed on remote: $pushOut",'Git push failed','OK','Error') | Out-Null }
-                } else { Write-Log 'Git push completed on remote.' 'Info' }
+                $commitText = ConvertTo-GitOutputText -Output $commitOut
             }
-        } else {
-            Push-Location $RepoPath
-            $url = git remote get-url origin 2>$null
-            if ($url -and $url -match '^https://github.com/(.+)$') {
-                $sshUrl = "git@github.com:$($matches[1])"
-                git remote set-url origin $sshUrl 2>$null
+            Write-Log "Git commit exit=$commitCode output=$commitText" 'Debug'
+            if ($commitCode -ne 0) {
+                $why = "The commit failed, so nothing was committed or pushed. Your files are unchanged.`r`n`r`nGit said:`r`n$(& $lastLines $commitText)"
+                Write-Log "Git commit failed (exit $commitCode): $commitText" 'Error'
+                if (-not $script:NonInteractive) { [System.Windows.Forms.MessageBox]::Show($why, 'Git commit failed', 'OK', 'Error') | Out-Null }
+                return (& $newResult $false 'CommitFailed' 'Git commit failed; nothing was committed or pushed.')
             }
-            git add -A | Out-Null
-            $commitLocal = git commit -m $msg 2>&1
-            Write-Log "Local git commit output: $commitLocal" 'Debug'
-            Write-Log 'Git commit completed locally.' 'Info'
-            if ($doPush) {
-                $pushLocal = git push 2>&1
-                Write-Log "Local git push output: $pushLocal" 'Debug'
-                Write-Log 'Git push completed locally.' 'Info'
-            }
-            Pop-Location
+            if ($nothingToCommit) { Write-Log 'Nothing new to commit after staging.' 'Info' }
+            else { Write-Log "Git commit created $where." 'Info' }
         }
+
+        if (-not $doPush) {
+            return (& $newResult $true 'Committed' "Changes committed $where, but not pushed to GitHub.")
+        }
+
+        if (-not $gitState.HasUpstream) { Write-Log "Branch '$($gitState.Branch)' is not on GitHub yet; pushing it as a new branch." 'Info' }
+        Write-Log 'Pushing to GitHub with your IMPACT SSH key...' 'Info'
+        $push = Invoke-GitPushWithImpactKey -State $State -RepoPath $RepoPath -IsRemote $IsRemote -HasUpstream ([bool]$gitState.HasUpstream) -Branch ([string]$gitState.Branch)
+        Write-Log "Git push success=$($push.Success) output=$($push.Output)" 'Debug'
+        if (-not $push.Success) {
+            # Say clearly that the commit exists but did NOT reach GitHub, why, and
+            # what to do; then show git's own words for the details.
+            $hint = Get-GitPushFailureHint -Output $push.Output -KeyName "your IMPACT SSH key (id_ed25519_$($State.UserName))"
+            $why = "Your commit is saved $where, but it was NOT uploaded to GitHub.`r`n`r`n$hint`r`n`r`nGit said:`r`n$(& $lastLines $push.Output)"
+            Write-Log "Git push failed: $hint Git output: $($push.Output)" 'Error'
+            if (-not $script:NonInteractive) { [System.Windows.Forms.MessageBox]::Show($why, 'Git push failed', 'OK', 'Error') | Out-Null }
+            return (& $newResult $false 'PushFailed' 'Committed, but the push to GitHub failed.')
+        }
+        Write-Log 'Git push to GitHub completed.' 'Info'
+        return (& $newResult $true 'Pushed' 'Changes are committed and pushed to GitHub.')
     } catch {
-        Write-Log "Git change detection error: $($_.Exception.Message)" 'Warn'
+        Write-Log "Git commit/push error: $($_.Exception.Message)" 'Error'
         if (-not $script:NonInteractive) {
-            [System.Windows.Forms.MessageBox]::Show('Git commit/push encountered an error. See console for details.','Git error','OK','Error') | Out-Null
+            [System.Windows.Forms.MessageBox]::Show("Git commit/push stopped with an error:`r`n$($_.Exception.Message)", 'Git error', 'OK', 'Error') | Out-Null
         }
+        return (& $newResult $false 'Error' "Git commit/push error: $($_.Exception.Message)")
     }
 }
 
