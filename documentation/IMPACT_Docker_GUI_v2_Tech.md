@@ -367,18 +367,26 @@ Within `Show-ContainerManager` Start button click handler:
    docker run -d --rm --name <container>
      -e PASSWORD=<pass>
      -e DISABLE_AUTH=false
-     -e USERID=1000 -e GROUPID=1000
-     -e GIT_SSH_COMMAND="ssh -i /keys/id_ed25519_<user> ..."
-     --mount type=bind,source=<repo>,target=/host-repo
+     -e USERID=<uid> -e GROUPID=<gid>
+     -e GIT_SSH_COMMAND="ssh -i /home/rstudio/.ssh/id_ed25519_<user> -o IdentitiesOnly=yes
+                         -o UserKnownHostsFile=/home/rstudio/.ssh/known_hosts
+                         -o StrictHostKeyChecking=accept-new"
      --mount type=bind,source=<repo>,target=/home/rstudio/<repo>
      -p <port>:8787
      [volume or bind mounts for outputs/synthpop]
      [--cpus 32 -m 384g if high compute]
-     --mount type=bind,source=<key>,target=/keys/...,readonly
-     --mount type=bind,source=<known_hosts>,target=/etc/ssh/ssh_known_hosts,readonly
+     --mount type=bind,source=<key>,target=/keys/id_ed25519_<user>,readonly
      --workdir /home/rstudio/<repo>
      <image>
    ```
+   The `GIT_SSH_COMMAND` value comes from `Get-ContainerGitSshCommand`.
+   After start, `docker exec` (as root) runs the command from
+   `Get-ContainerSshSetupCommand`: it copies the key to
+   `/home/rstudio/.ssh/` (CR characters stripped, mode 600), writes
+   github.com's host keys to `/home/rstudio/.ssh/known_hosts` with
+   `ssh-keyscan` inside the container, and chowns `.ssh` to `<uid>:<gid>`.
+   The host's `known_hosts` is not mounted, so `git pull` in RStudio works
+   even when the host has never connected to github.com.
 8. **Metadata**: write remote metadata JSON, update UI state
 
 ### Phase 8 — Container Stop & Data Sync

@@ -1291,15 +1291,13 @@ function Show-ContainerManager {
             }
         }
 
-        # Use a writable path for the SSH key inside the container so permissions can be fixed for the rstudio user
-        $containerKeyPath = "/home/rstudio/.ssh/id_ed25519_$($State.UserName)"
         $dockerArgs = @('run','-d','--rm','--name',$State.ContainerName,
             '-e',"PASSWORD=$($State.Password)",
             '-e','DISABLE_AUTH=false',
             '-e',"USERID=$containerUid",'-e',"GROUPID=$containerGid",
             '-e',"CONTAINER_REPO_NAME=$($State.SelectedRepo)",
             '-e','SYNC_ENABLED=false',
-            '-e',"GIT_SSH_COMMAND=ssh -i $containerKeyPath -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/ssh/ssh_known_hosts -o StrictHostKeyChecking=yes",
+            '-e',"GIT_SSH_COMMAND=$(Get-ContainerGitSshCommand -UserName $State.UserName)",
             '--mount',"type=bind,source=$repoMountSource,target=/home/rstudio/$($State.SelectedRepo)",
             '-p',($(if($portOverride){$portOverride}else{'8787'}) + ':8787')
         )
@@ -1310,10 +1308,8 @@ function Show-ContainerManager {
 
         if ($State.ContainerLocation -eq 'LOCAL') {
             $sshKeyPath = $State.Paths.SshPrivate
-            $knownHostsPath = "$HOME/.ssh/known_hosts"
         } else {
             $sshKeyPath = "/home/$($State.RemoteUser)/.ssh/id_ed25519_$($State.UserName)"
-            $knownHostsPath = "/home/$($State.RemoteUser)/.ssh/known_hosts"
         }
 
         if ($useVolumes) {
@@ -1369,8 +1365,9 @@ function Show-ContainerManager {
             $dockerArgs += @('--cpus','32','-m','384g')
         }
 
+        # Only the private key comes from the host. github.com's host key is
+        # written inside the container below (Get-ContainerSshSetupCommand).
         $dockerArgs += @('--mount',"type=bind,source=$sshKeyPath,target=/keys/id_ed25519_$($State.UserName),readonly",
-                         '--mount',"type=bind,source=$knownHostsPath,target=/etc/ssh/ssh_known_hosts,readonly",
                          '--workdir',"/home/rstudio/$($State.SelectedRepo)",
                          $imageName)
 
@@ -1393,10 +1390,13 @@ function Show-ContainerManager {
             return
         }
 
-        # Copy the SSH key from the readonly bind mount to a writable location with correct ownership.
-        # The bind mount preserves host-side ownership (e.g. php-workstation), but inside the container
-        # the rstudio user needs to own the private key for SSH to accept it.
-        $fixKeyCmd = "mkdir -p /home/rstudio/.ssh && cp /keys/id_ed25519_$($State.UserName) $containerKeyPath && chmod 600 $containerKeyPath && chown ${containerUid}:${containerGid} $containerKeyPath && cp /etc/ssh/ssh_known_hosts /home/rstudio/.ssh/known_hosts 2>/dev/null; chmod 644 /home/rstudio/.ssh/known_hosts 2>/dev/null; chown ${containerUid}:${containerGid} /home/rstudio/.ssh/known_hosts 2>/dev/null; echo KEY_FIXED"
+        # Prepare SSH for git inside the container:
+        #  - copy the key from the readonly bind mount to ~rstudio/.ssh with
+        #    mode 600 and rstudio ownership (the bind mount keeps host ownership);
+        #  - write github.com's host key to ~rstudio/.ssh/known_hosts with
+        #    ssh-keyscan inside the container, so 'git pull' does not depend on
+        #    the host's known_hosts having a github.com entry.
+        $fixKeyCmd = Get-ContainerSshSetupCommand -UserName $State.UserName -ContainerUid $containerUid -ContainerGid $containerGid
         $fixCtx = (Get-DockerContextArgs -State $State) + @('exec', $State.ContainerName, 'sh', '-c', $fixKeyCmd)
         try {
             $fixOut = & docker $fixCtx 2>&1
