@@ -318,9 +318,12 @@ function Test-RemoteSSHKeyFiles {
 }
 
 function Write-RemoteContainerMetadata {
+    # The RStudio password is deliberately NOT stored here (F40). Everybody on the
+    # workstation uses the same Unix account, so a file in /tmp is readable by all
+    # colleagues. When the GUI is reopened, the password is read back from the
+    # running container itself (Get-ContainerRuntimeInfo), so it is not needed here.
     param(
         [pscustomobject]$State,
-        [string]$Password,
         [string]$Port,
         [bool]$UseVolumes
     )
@@ -333,16 +336,22 @@ function Write-RemoteContainerMetadata {
         container = $State.ContainerName
         repo      = $State.SelectedRepo
         user      = $State.UserName
-        password  = $Password
         port      = $Port
         useVolumes= $UseVolumes
         timestamp = (Get-Date).ToString('s')
     } | ConvertTo-Json -Compress
-    Write-Log ("Metadata payload (masked): container={0} repo={1} port={2} useVolumes={3}" -f $State.ContainerName, $State.SelectedRepo, $Port, $UseVolumes) 'Debug'
+    Write-Log ("Metadata payload: container={0} repo={1} port={2} useVolumes={3}" -f $State.ContainerName, $State.SelectedRepo, $Port, $UseVolumes) 'Debug'
     $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload))
     try {
-        & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "mkdir -p /tmp/impactncd && umask 177 && echo $b64 | base64 -d > '$metaPath'" 2>$null
-        Write-Log 'Remote metadata saved.' 'Info'
+        # 'umask' now comes before 'mkdir' so the folder is also created private (it used to be
+        # created with default permissions first).
+        & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "umask 077 && mkdir -p /tmp/impactncd && echo $b64 | base64 -d > '$metaPath'" 2>$null
+        # Only claim success when ssh really succeeded (it used to log 'saved' even on failure).
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log 'Remote metadata saved.' 'Info'
+        } else {
+            Write-Log "Remote metadata could not be saved (ssh exit $LASTEXITCODE). Not critical: the container itself stores the same details." 'Warn'
+        }
     } catch {
         Write-Log "Remote metadata SSH write failed: $($_.Exception.Message)" 'Warn'
     }
@@ -473,17 +482,29 @@ function Ensure-RemoteDockerLogin {
 
 function Get-ContainerRuntimeInfo {
     param([pscustomobject]$State)
-    $info = @{ Password = $null; Port = $null }
+    # Besides password and port, this now also recovers how the container was started
+    # (volume mode, result folders, volume names), so a session resumed after
+    # reopening the GUI can still copy results back at Stop (F01/F04).
+    # UseVolumes stays $null when it could not be found out (for example because
+    # docker inspect failed), so callers can tell "unknown" apart from "no volumes".
+    $info = @{ Password = $null; Port = $null; UseVolumes = $null; OutputDir = $null; SynthpopDir = $null; VolumeOutput = $null; VolumeSynthpop = $null }
     $cmdEnv = @('inspect','-f','{{range .Config.Env}}{{println .}}{{end}}',$State.ContainerName)
     $cmdPort= @('inspect','-f','{{range $p, $c := .NetworkSettings.Ports}}{{if eq $p "8787/tcp"}}{{range $c}}{{println .HostPort}}{{end}}{{end}}{{end}}',$State.ContainerName)
+    # Labels and mounts in one call, separated by a TAB. A TAB can never appear inside
+    # the JSON itself (JSON escapes it as \t), so splitting on it is safe.
+    $cmdMeta= @('inspect','-f',('{{json .Config.Labels}}' + "`t" + '{{json .Mounts}}'),$State.ContainerName)
     $ctxArgs = Get-DockerContextArgs -State $State
     $cmdEnv = $ctxArgs + $cmdEnv
     $cmdPort= $ctxArgs + $cmdPort
+    $cmdMeta= $ctxArgs + $cmdMeta
     Write-Log "Inspecting container $($State.ContainerName) for runtime info." 'Info'
     try {
         $envLines = & docker @cmdEnv 2>$null
         $portLine = & docker @cmdPort 2>$null
-        Write-Log "Inspect env output: $envLines" 'Debug'
+        # Log only the variable NAMES: the values include the RStudio password, and
+        # Debug lines are always written to the log file on disk.
+        $envNames = @($envLines -split "`n" | Where-Object { $_ -match '=' } | ForEach-Object { ($_ -split '=', 2)[0] })
+        Write-Log "Inspect env variable names: $($envNames -join ',')" 'Debug'
         Write-Log "Inspect port output: $portLine" 'Debug'
         if ($envLines) {
             foreach ($line in ($envLines -split "`n")) { if ($line -like 'PASSWORD=*') { $info.Password = $line.Substring(9) } }
@@ -491,7 +512,38 @@ function Get-ContainerRuntimeInfo {
         if ($portLine) {
             $info.Port = (($portLine -split "`n|`r") | Where-Object { $_ -match '\S' } | Select-Object -First 1).Trim()
         }
-        Write-Log "Recovered runtime info -> PasswordPresent=$([bool]$info.Password) Port=$($info.Port)" 'Debug'
+
+        $metaRaw = (@(& docker @cmdMeta 2>$null) -join '')
+        if ($LASTEXITCODE -eq 0 -and $metaRaw -match "`t") {
+            $metaParts = $metaRaw -split "`t", 2
+            # -AsHashtable copes with image labels whose names differ only in case,
+            # which would make the default ConvertFrom-Json throw.
+            $labels = $metaParts[0] | ConvertFrom-Json -AsHashtable
+            if (-not $labels) { $labels = @{} }
+            $mounts = @($metaParts[1] | ConvertFrom-Json -AsHashtable)
+
+            # 1) Look at the volumes that are really mounted. This also works for
+            #    containers started by older versions of this tool, which had no labels.
+            foreach ($mnt in $mounts) {
+                if ($mnt -isnot [System.Collections.IDictionary]) { continue }
+                if ($mnt['Type'] -ne 'volume' -or -not $mnt['Name']) { continue }
+                $dest = [string]$mnt['Destination']
+                if ($dest -like '*/outputs') { $info.VolumeOutput = [string]$mnt['Name'] }
+                elseif ($dest -like '*/inputs/synthpop') { $info.VolumeSynthpop = [string]$mnt['Name'] }
+            }
+
+            # 2) Labels written by Get-ImpactContainerLabelArgs when the container was started.
+            if ($labels['impact.use_volumes']) {
+                $info.UseVolumes = ([string]$labels['impact.use_volumes'] -eq 'true')
+            } else {
+                $info.UseVolumes = [bool]($info.VolumeOutput -or $info.VolumeSynthpop)
+            }
+            if ($labels['impact.output_dir'])   { $info.OutputDir   = [string]$labels['impact.output_dir'] }
+            if ($labels['impact.synthpop_dir']) { $info.SynthpopDir = [string]$labels['impact.synthpop_dir'] }
+            if (-not $info.VolumeOutput -and $labels['impact.volume_output'])     { $info.VolumeOutput   = [string]$labels['impact.volume_output'] }
+            if (-not $info.VolumeSynthpop -and $labels['impact.volume_synthpop']) { $info.VolumeSynthpop = [string]$labels['impact.volume_synthpop'] }
+        }
+        Write-Log "Recovered runtime info -> PasswordPresent=$([bool]$info.Password) Port=$($info.Port) UseVolumes=$($info.UseVolumes) OutputDir=$($info.OutputDir) SynthpopDir=$($info.SynthpopDir) Volumes=$($info.VolumeOutput),$($info.VolumeSynthpop)" 'Debug'
     } catch {
         Write-Log "Failed to inspect container runtime info: $($_.Exception.Message)" 'Debug'
     }
@@ -569,8 +621,12 @@ function Get-UsedPorts {
         $all = & docker @psCmd 2>$null
         if ($LASTEXITCODE -eq 0 -and $all) {
             foreach ($line in ($all -split "`n")) {
-                if ($line -match '0\.0\.0\.0:(\d{4,5})->8787/tcp') {
-                    $port = $matches[1]
+                # Accept any host address in front of the port: 0.0.0.0 and [::] (all
+                # interfaces, used on the workstation) and 127.0.0.1 (LOCAL containers
+                # are now published on this machine only, F13). Matches() also finds a
+                # second mapping on the same line.
+                foreach ($m in [regex]::Matches($line, ':(\d{4,5})->8787/tcp')) {
+                    $port = $m.Groups[1].Value
                     if ($portUsers -notcontains $port) { $portUsers += $port }
                 }
             }
@@ -1808,6 +1864,10 @@ function Build-DockerRunCommand {
 
     $repoMountSource = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $ProjectRoot } else { $ProjectRoot }
     $containerKeyPath = "/home/rstudio/.ssh/id_ed25519_$($State.UserName)"
+    # Same port rule as the GUI's Start handler (F13): LOCAL containers are only
+    # reachable from this computer (127.0.0.1); on the workstation RStudio must stay
+    # reachable from the colleague's PC, so it is published on all interfaces.
+    $publishSpec = if ($State.ContainerLocation -eq 'LOCAL') { "127.0.0.1:${Port}:8787" } else { "${Port}:8787" }
 
     $dockerArgs = @('run','-d','--rm','--name',$State.ContainerName,
         '-e',"PASSWORD=$($State.Password)",
@@ -1817,14 +1877,21 @@ function Build-DockerRunCommand {
         '-e','SYNC_ENABLED=false',
         '-e',"GIT_SSH_COMMAND=ssh -i $containerKeyPath -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/ssh/ssh_known_hosts -o StrictHostKeyChecking=yes",
         '--mount',"type=bind,source=$repoMountSource,target=/home/rstudio/$($State.SelectedRepo)",
-        '-p',"${Port}:8787"
+        '-p',$publishSpec
     )
 
-    if ($CustomParams) { $dockerArgs += ($CustomParams -split '\s+') }
+    # Tokenise like a shell (quotes keep a value with spaces together, no empty
+    # arguments), see Split-DockerCustomParams (F102).
+    if ($CustomParams) { $dockerArgs += @(Split-DockerCustomParams -Text $CustomParams) }
 
+    $volOut = ''
+    $volSyn = ''
     if ($UseVolumes) {
-        $volOut = "impactncd_germany_output_$($State.UserName)" -replace '[^a-zA-Z0-9_]','_'
-        $volSyn = "impactncd_germany_synthpop_$($State.UserName)" -replace '[^a-zA-Z0-9_]','_'
+        # Volume names include the container name (repo + user), so two repos of the
+        # same user no longer share one volume (F48).
+        $volNames = Get-ImpactVolumeNames -ContainerName $State.ContainerName
+        $volOut = $volNames.Output
+        $volSyn = $volNames.Synthpop
         $dockerArgs += @('-v',"$($volOut):/home/rstudio/$($State.SelectedRepo)/outputs",
                          '-v',"$($volSyn):/home/rstudio/$($State.SelectedRepo)/inputs/synthpop")
     } else {
@@ -1838,12 +1905,208 @@ function Build-DockerRunCommand {
         $dockerArgs += @('--cpus','32','-m','384g')
     }
 
+    # Labels that let a reopened GUI find out how this container was started (F01/F04).
+    $dockerArgs += @(Get-ImpactContainerLabelArgs -UseVolumes $UseVolumes -OutputDir $OutputDir -SynthpopDir $SynthpopDir -VolumeOutput $volOut -VolumeSynthpop $volSyn)
+
     $dockerArgs += @('--mount',"type=bind,source=$SshKeyPath,target=/keys/id_ed25519_$($State.UserName),readonly",
                      '--mount',"type=bind,source=$KnownHostsPath,target=/etc/ssh/ssh_known_hosts,readonly",
                      '--workdir',"/home/rstudio/$($State.SelectedRepo)",
                      $ImageName)
 
     return $dockerArgs
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Docker volume helpers (used by the Start and Stop buttons of the GUI)
+# ══════════════════════════════════════════════════════════════════════════════
+
+<#
+.SYNOPSIS Names of the two Docker volumes used in 'Use Docker Volumes' mode.
+.DESCRIPTION The names contain the container name, which is "<repo>_<user>". Older
+             versions used only the user name, so two repositories of the same user
+             shared (and mixed) one pair of volumes (F48). Characters Docker does not
+             allow in volume names are replaced by '_'.
+#>
+function Get-ImpactVolumeNames {
+    param([string]$ContainerName)
+    $safe = $ContainerName -replace '[^a-zA-Z0-9_.-]','_'
+    return [pscustomobject]@{
+        Output   = "impactncd_output_$safe"
+        Synthpop = "impactncd_synthpop_$safe"
+    }
+}
+
+<#
+.SYNOPSIS Splits the 'Custom Params' text box into separate docker arguments.
+.DESCRIPTION Works like a simple shell: whitespace separates arguments, and text in
+             single or double quotes stays together (the quotes are removed). Empty
+             arguments are never produced. Backslashes are kept as they are, so
+             Windows paths survive. Splitting on spaces alone (the old behaviour)
+             produced empty arguments, which docker then took as the image name, and
+             cut quoted values in half (F102).
+#>
+function Split-DockerCustomParams {
+    param([string]$Text)
+    $tokens = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace($Text)) { return }
+    $current = New-Object System.Text.StringBuilder
+    $inToken = $false
+    $quote = [char]0
+    foreach ($ch in $Text.ToCharArray()) {
+        if ($quote -ne [char]0) {
+            # Inside quotes: everything up to the matching quote belongs to the token.
+            if ($ch -eq $quote) { $quote = [char]0 } else { [void]$current.Append($ch) }
+            continue
+        }
+        if ($ch -eq [char]'"' -or $ch -eq [char]"'") { $quote = $ch; $inToken = $true; continue }
+        if ([char]::IsWhiteSpace($ch)) {
+            if ($inToken) { $tokens.Add($current.ToString()); [void]$current.Clear(); $inToken = $false }
+            continue
+        }
+        [void]$current.Append($ch)
+        $inToken = $true
+    }
+    # A missing closing quote is forgiven: the rest of the text becomes the last token.
+    if ($inToken) { $tokens.Add($current.ToString()) }
+    return $tokens.ToArray()
+}
+
+<#
+.SYNOPSIS The '--label' arguments that record how a container was started.
+.DESCRIPTION Docker keeps labels with the container, so they can be read back with
+             'docker inspect' after the GUI was closed and reopened, both for LOCAL
+             and REMOTE containers. Get-ContainerRuntimeInfo reads them. Without them
+             a resumed session did not know where to copy results back to, and Stop
+             deleted the volumes anyway (F01/F04).
+#>
+function Get-ImpactContainerLabelArgs {
+    param(
+        [bool]$UseVolumes,
+        [string]$OutputDir,
+        [string]$SynthpopDir,
+        [string]$VolumeOutput,
+        [string]$VolumeSynthpop
+    )
+    $labelArgs = @('--label', ("impact.use_volumes=" + $(if ($UseVolumes) { 'true' } else { 'false' })))
+    if ($OutputDir)   { $labelArgs += @('--label', "impact.output_dir=$OutputDir") }
+    if ($SynthpopDir) { $labelArgs += @('--label', "impact.synthpop_dir=$SynthpopDir") }
+    if ($UseVolumes -and $VolumeOutput)   { $labelArgs += @('--label', "impact.volume_output=$VolumeOutput") }
+    if ($UseVolumes -and $VolumeSynthpop) { $labelArgs += @('--label', "impact.volume_synthpop=$VolumeSynthpop") }
+    return $labelArgs
+}
+
+<#
+.SYNOPSIS Looks up one Docker volume.
+.OUTPUTS  Object with Exists ($true, $false, or $null when Docker could not be asked),
+          TargetDir (host folder recorded when the volume was created, may be $null),
+          UsedBy (names of containers, running or stopped, that still use it) and Error.
+#>
+function Get-ImpactVolumeInfo {
+    param([pscustomobject]$State, [string]$VolumeName)
+    $result = [pscustomobject]@{ Name = $VolumeName; Exists = $null; TargetDir = $null; UsedBy = @(); Error = '' }
+    $ctx = Get-DockerContextArgs -State $State
+    try {
+        $out = & docker @ctx @('volume','inspect','--format','{{json .Labels}}',$VolumeName) 2>&1
+        $code = $LASTEXITCODE
+        $text = (@($out) | ForEach-Object { "$_" }) -join ' '
+        if ($code -ne 0) {
+            # "No such volume" is the normal answer for a volume that does not exist.
+            # Anything else (Docker not running, ssh dropped) means we do not know.
+            if ($text -match '(?i)no such volume') { $result.Exists = $false }
+            else { $result.Error = $text }
+            return $result
+        }
+        $result.Exists = $true
+        $json = (@($out) | Where-Object { $_ -is [string] }) -join ''
+        if ($json -and $json.Trim() -ne 'null') {
+            $labels = $json | ConvertFrom-Json -AsHashtable
+            if ($labels -and $labels['impact.target_dir']) { $result.TargetDir = [string]$labels['impact.target_dir'] }
+        }
+        $users = & docker @ctx @('ps','-a','--filter',"volume=$VolumeName",'--format','{{.Names}}') 2>$null
+        $result.UsedBy = @($users | Where-Object { $_ -match '\S' } | ForEach-Object { "$_".Trim() })
+    } catch {
+        $result.Exists = $null
+        $result.Error = $_.Exception.Message
+    }
+    return $result
+}
+
+<#
+.SYNOPSIS Makes sure the small 'rsync-alpine' helper image exists (builds it if not).
+.DESCRIPTION The image is used to copy results out of the Docker volumes. Returns
+             $true only when the image really exists afterwards: the old code never
+             checked the build, so a failed download only showed up hours later at
+             Stop (F17). The Dockerfile is passed on stdin with '-' as build context,
+             so no local folder is uploaded (over ssh in remote mode).
+#>
+function Initialize-RsyncHelperImage {
+    param([pscustomobject]$State)
+    $ctx = Get-DockerContextArgs -State $State
+    & docker @ctx @('image','inspect','rsync-alpine') 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { return $true }
+    Write-Log 'rsync-alpine helper image not found; building it (needs internet access to Docker Hub).' 'Info'
+    $dockerfileInline = "FROM alpine:latest`nRUN apk add --no-cache rsync"
+    try {
+        $buildOut = $dockerfileInline | & docker @ctx @('build','-t','rsync-alpine','-') 2>&1
+        Write-Log ("rsync-alpine build finished (exit {0}): {1}" -f $LASTEXITCODE, ((@($buildOut) | Select-Object -Last 5) -join ' | ')) 'Debug'
+    } catch {
+        Write-Log "rsync-alpine build failed: $($_.Exception.Message)" 'Warn'
+    }
+    # Check again instead of trusting the build's exit code alone.
+    & docker @ctx @('image','inspect','rsync-alpine') 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
+}
+
+<#
+.SYNOPSIS Copies the contents of one Docker volume into a host folder with rsync.
+.DESCRIPTION Returns an object with Success, Missing (the volume does not exist, so
+             there was nothing to copy) and Message. It never deletes anything; the
+             caller removes a volume only after Success is $true for it (F01). An empty
+             target folder is refused, because docker would otherwise get an invalid
+             mount like ':/backup' (this is what happened in resumed sessions).
+#>
+function Sync-ImpactVolumeToHost {
+    param([pscustomobject]$State, [string]$VolumeName, [string]$HostDir)
+    $result = [pscustomobject]@{ Success = $false; Missing = $false; Message = '' }
+    if ([string]::IsNullOrWhiteSpace($VolumeName) -or [string]::IsNullOrWhiteSpace($HostDir)) {
+        $result.Message = "Cannot copy volume '$VolumeName': the folder to copy it to is unknown."
+        return $result
+    }
+    $vol = Get-ImpactVolumeInfo -State $State -VolumeName $VolumeName
+    if ($vol.Exists -eq $false) {
+        $result.Success = $true
+        $result.Missing = $true
+        $result.Message = "Volume '$VolumeName' does not exist; nothing to copy."
+        return $result
+    }
+    if ($null -eq $vol.Exists) {
+        $result.Message = "Could not check volume '$VolumeName': $($vol.Error)"
+        return $result
+    }
+    if (-not (Initialize-RsyncHelperImage -State $State)) {
+        $result.Message = "The rsync-alpine helper image is missing and could not be built (no internet access to Docker Hub?)."
+        return $result
+    }
+    $ctx = Get-DockerContextArgs -State $State
+    $backup = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $HostDir } else { $HostDir }
+    Write-Log "Copying volume $VolumeName back to $backup" 'Info'
+    try {
+        # Same rsync options as before; only '-v' was dropped to keep the log small.
+        $out = & docker @ctx @('run','--rm','-v',"$($VolumeName):/volume",'-v',"$($backup):/backup",'rsync-alpine','rsync','-ac','--no-owner','--no-group','--no-times','--no-perms','--chmod=ugo=rwX','/volume/','/backup/') 2>&1
+        $code = $LASTEXITCODE
+    } catch {
+        $out = $_.Exception.Message
+        $code = -1
+    }
+    if ($code -eq 0) {
+        $result.Success = $true
+        $result.Message = "Copied volume '$VolumeName' to $HostDir."
+    } else {
+        $tail = (@($out) | ForEach-Object { "$_" } | Select-Object -Last 5) -join ' '
+        $result.Message = "Copying volume '$VolumeName' to $HostDir failed (exit $code): $tail"
+        Write-Log $result.Message 'Error'
+    }
+    return $result
 }
 
 <#
@@ -2031,6 +2294,13 @@ Export-ModuleMember -Function @(
     'Select-Location'
     # Container lifecycle (extracted)
     'Build-DockerRunCommand'
+    # Docker volume helpers
+    'Get-ImpactVolumeNames'
+    'Split-DockerCustomParams'
+    'Get-ImpactContainerLabelArgs'
+    'Get-ImpactVolumeInfo'
+    'Initialize-RsyncHelperImage'
+    'Sync-ImpactVolumeToHost'
     'Test-DockerDaemonReady'
     'Start-DockerDesktopIfNeeded'
     # GitHub SSH key API
