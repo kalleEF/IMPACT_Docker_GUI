@@ -2142,12 +2142,39 @@ function Show-CredentialDialog {
 # ══════════════════════════════════════════════════════════════════════════════
 #  SSH agent + config helpers
 # ══════════════════════════════════════════════════════════════════════════════
+function Test-SshAgentHasKey {
+    <#
+    .SYNOPSIS Is the key already loaded in the ssh-agent? (pure logic, unit tested)
+    .PARAMETER AgentList   The output of 'ssh-add -l': one line per key, in the form
+                           '<bits> <fingerprint> <comment> (<type>)'.
+    .PARAMETER Fingerprint The fingerprint of the IMPACT key ('SHA256:...'), read from the
+                           key file with 'ssh-keygen -l -f'. May be empty.
+    .PARAMETER KeyPath     The private key file.
+    .NOTES    The comment that 'ssh-add -l' shows is the comment stored IN the key. For an
+              IMPACT key that is 'IMPACT_<user>', not the file path, so a test on the path
+              alone never matched and the key was added again on every start. The
+              fingerprint is the reliable test; the path tests are kept for keys whose
+              comment really is the file path (older key formats).
+    #>
+    param([string[]]$AgentList, [string]$Fingerprint, [string]$KeyPath)
+    $text = (@($AgentList) | ForEach-Object { "$_" }) -join "`n"
+    if (-not $text) { return $false }
+    if ($Fingerprint -and $text -match "(?m)^\s*\d+\s+$([regex]::Escape($Fingerprint))(\s|$)") { return $true }
+    if ($KeyPath) {
+        if ($text -match [regex]::Escape($KeyPath)) { return $true }
+        if ($text -match [regex]::Escape((Split-Path $KeyPath -Leaf).Replace('.','_'))) { return $true }
+    }
+    return $false
+}
+
 function Ensure-SshAgentRunning {
     param([string]$SshKeyPath)
-    # The ssh-agent is OPTIONAL for IMPACT: every ssh, docker and git call that IMPACT makes
-    # passes the key file directly (-i <key> -o IdentitiesOnly=yes), and the IMPACT key has
-    # no passphrase. So this function only helps when the agent can be used without fuss,
-    # and it must never stop or delay the workflow (F66).
+    # The ssh-agent is OPTIONAL for IMPACT: IMPACT's own ssh and git calls pass the key file
+    # directly (-i <key> -o IdentitiesOnly=yes), and Docker over ssh (which starts a plain
+    # 'ssh' without -i) gets the key from the IMPACT entry in ~/.ssh/config (see
+    # Ensure-SshConfigEntry). The IMPACT key has no passphrase. So this function only helps
+    # when the agent can be used without fuss, and it must never stop or delay the
+    # workflow (F66).
     Write-Log 'Checking the optional ssh-agent service (IMPACT also works without it).' 'Debug'
 
     # Get-Service only exists on Windows. Without this check the function threw on other
@@ -2173,12 +2200,15 @@ function Ensure-SshAgentRunning {
             Start-Service ssh-agent -ErrorAction Stop
             Write-Log 'ssh-agent service started (no elevation needed).' 'Info'
         } catch {
-            Write-Log "The optional ssh-agent service is not running and could not be started without administrator rights ($($_.Exception.Message)). This is fine: IMPACT gives ssh the key file directly. (An administrator can enable it with: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent)" 'Info'
+            Write-Log "The optional ssh-agent service is not running and could not be started without administrator rights ($($_.Exception.Message)). This is fine: IMPACT does not need the agent (it gives ssh the key file directly or through its ~/.ssh/config entry). (An administrator can enable it with: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent)" 'Info'
             return
         }
     }
 
-    # Stale key cleanup
+    # Stale key cleanup. Note: this only finds agent entries whose comment is a file path
+    # (keys in older formats). IMPACT keys are listed as 'IMPACT_<user>', so a deleted
+    # IMPACT key is not found here. That is harmless: IMPACT always names its key file
+    # (IdentitiesOnly), so ssh never offers an unrelated key from the agent.
     $sshAgentService = Get-Service ssh-agent -ErrorAction SilentlyContinue
     if ($sshAgentService -and $sshAgentService.Status -eq 'Running') {
         try {
@@ -2213,7 +2243,19 @@ function Ensure-SshAgentRunning {
             # Join the lines first: '-notmatch' on an ARRAY filters it instead of returning
             # true/false, so with several keys loaded the old check always "re-added" the key.
             $loadedKeys = (@(& ssh-add -l 2>&1) | ForEach-Object { "$_" }) -join "`n"
-            if ($loadedKeys -notmatch [regex]::Escape($SshKeyPath) -and $loadedKeys -notmatch [regex]::Escape((Split-Path $SshKeyPath -Leaf).Replace('.','_'))) {
+            # 'ssh-add -l' shows the comment stored in the key ('IMPACT_<user>'), not the
+            # file path, so the path test alone never matched. Compare the key's fingerprint
+            # (the second field of 'ssh-keygen -l -f <key>.pub') instead; see
+            # Test-SshAgentHasKey. If the fingerprint cannot be read, the key is simply
+            # added again, which is harmless (ssh-add replaces the same key).
+            $fingerprint = $null
+            $fingerprintSource = if (Test-Path -LiteralPath "$SshKeyPath.pub") { "$SshKeyPath.pub" } else { $SshKeyPath }
+            $fingerprintRead = Invoke-ImpactSshKeygen -Arguments @('-l', '-f', $fingerprintSource)
+            if ($fingerprintRead.ExitCode -eq 0) {
+                $fingerprintLine = @($fingerprintRead.Output | Where-Object { $_ -match '^\s*\d+\s+\S+:\S+' }) | Select-Object -First 1
+                if ($fingerprintLine) { $fingerprint = (([string]$fingerprintLine).Trim() -split '\s+')[1] }
+            }
+            if (-not (Test-SshAgentHasKey -AgentList $loadedKeys -Fingerprint $fingerprint -KeyPath $SshKeyPath)) {
                 # Empty input on stdin: if ssh-add ever asked a question, it gets "no answer"
                 # and stops instead of waiting for input in a hidden console. The exit code is
                 # checked so a failure is not reported as success (F66).
@@ -2221,7 +2263,7 @@ function Ensure-SshAgentRunning {
                 if ($LASTEXITCODE -eq 0) {
                     Write-Log "SSH key added to ssh-agent: $SshKeyPath" 'Info'
                 } else {
-                    Write-Log "ssh-add could not add the key (exit $LASTEXITCODE): $((@($addOut) | ForEach-Object { "$_" }) -join ' '). Not a problem: IMPACT passes the key file directly." 'Debug'
+                    Write-Log "ssh-add could not add the key (exit $LASTEXITCODE): $((@($addOut) | ForEach-Object { "$_" }) -join ' '). Not a problem: IMPACT does not need the agent." 'Debug'
                 }
             } else {
                 Write-Log 'SSH key already loaded in ssh-agent.' 'Debug'
@@ -2306,6 +2348,120 @@ function Remove-SshConfigHostBlock {
     return $removed
 }
 
+function Backup-SshConfigFile {
+    <#
+    .SYNOPSIS Saves a copy of the ssh config before IMPACT changes lines the user wrote.
+    .OUTPUTS  The path of the copy, or $null when no copy could be made.
+    .NOTES    First choice is next to the file (config.impact-backup-<time>). If that fails
+              (for example the .ssh folder does not allow new files), the copy goes to
+              ~/.impact_gui/ssh-config-backups, the folder IMPACT also uses for its logs.
+              A number is added when a copy with the same time already exists, so two
+              changes in the same second never overwrite the first copy.
+    #>
+    param([Parameter(Mandatory)][string]$ConfigPath)
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $leaf = Split-Path -Leaf $ConfigPath
+    $folders = @(
+        (Split-Path -Parent $ConfigPath),
+        (Join-Path (Join-Path $HOME '.impact_gui') 'ssh-config-backups')
+    )
+    foreach ($folder in $folders) {
+        try {
+            if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop | Out-Null }
+            $destination = Join-Path $folder "$leaf.impact-backup-$stamp"
+            $n = 2
+            while (Test-Path -LiteralPath $destination) { $destination = Join-Path $folder "$leaf.impact-backup-$stamp-$n"; $n++ }
+            Copy-Item -LiteralPath $ConfigPath -Destination $destination -ErrorAction Stop
+            return $destination
+        } catch {
+            Write-Log "Could not save a copy of $ConfigPath in $folder ($($_.Exception.Message))." 'Debug'
+        }
+    }
+    return $null
+}
+
+function Repair-SshConfigIdentityFileQuoting {
+    <#
+    .SYNOPSIS Puts double quotes around every unquoted IdentityFile path in the ssh config
+              that contains a space, in ALL sections of the file.
+    .OUTPUTS  [int] the number of lines that were repaired.
+    .NOTES    One unquoted path with a space (older IMPACT versions wrote
+              'IdentityFile C:/Users/Max Mustermann/.ssh/...') makes OpenSSH reject the
+              WHOLE file ("garbage at end of line"), so every ssh call fails: remote Docker,
+              the GitHub key check and git push. Ensure-SshConfigEntry only looks at the
+              section of the workstation that is being connected to, so an old entry for
+              another IP (an earlier or mistyped address) stayed broken. This helper is
+              called at the start of Ensure-SshConfigEntry and from Ensure-GitKeySetup, so
+              it also runs for colleagues who only use LOCAL mode.
+              - Sections written by IMPACT (marker comment '# IMPACT Docker GUI' above the
+                Host line) are repaired directly. If a line the user wrote is repaired, a
+                copy of the file is saved first; if no copy can be made, only IMPACT's own
+                lines are repaired and the user is told how to fix the others.
+              - Values that contain a quote, a '#' or a backslash before a space are left
+                alone: newer OpenSSH versions read those as written (comment or escaped
+                space), and adding quotes would change their meaning.
+              - Never throws: the caller's workflow must not stop because of this repair.
+    #>
+    param([string]$ConfigPath)
+    try {
+        if (-not $ConfigPath) { $ConfigPath = Join-Path (Join-Path $HOME '.ssh') 'config' }
+        if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return 0 }
+        # @(...): a single-line file would otherwise be one string (see Remove-SshConfigHostBlock).
+        $lines = @(Get-Content -LiteralPath $ConfigPath -ErrorAction SilentlyContinue)
+        if ($lines.Count -eq 0) { return 0 }
+
+        $repairs = [System.Collections.Generic.List[object]]::new()
+        $inImpactSection = $false
+        $lastNonEmptyLine = ''
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $line = [string]$lines[$i]
+            if ($line -match '^\s*(Host|Match)(\s|=)') {
+                # Same rule as Ensure-SshConfigEntry: the section is IMPACT's when the
+                # marker comment is the last non-empty line above its Host line.
+                $inImpactSection = ($lastNonEmptyLine -match '^\s*#.*IMPACT Docker GUI')
+            } elseif ($line -match '^\s*Include(\s|=)') {
+                $inImpactSection = $false
+            } elseif ($line -match '^(\s*IdentityFile(?:\s*=\s*|\s+))(.*?)\s*$') {
+                $prefix = $Matches[1]
+                $value = $Matches[2]
+                if ($value -match '\s') {
+                    if ($value -match '["#]' -or $value -match '\\\s') {
+                        Write-Log "Line $($i + 1) of $ConfigPath has an IdentityFile value with a space that IMPACT does not change automatically: $value" 'Debug'
+                    } else {
+                        $repairs.Add([pscustomobject]@{ Index = $i; NewLine = "$prefix`"$value`""; Ours = $inImpactSection; Value = $value })
+                    }
+                }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($line)) { $lastNonEmptyLine = $line }
+        }
+        if ($repairs.Count -eq 0) { return 0 }
+
+        $userRepairs = @($repairs | Where-Object { -not $_.Ours })
+        if ($userRepairs.Count -gt 0) {
+            $backupPath = Backup-SshConfigFile -ConfigPath $ConfigPath
+            if ($backupPath) {
+                Write-Log "Your ssh config $ConfigPath has IdentityFile paths with a space but without quotes, which makes ssh reject the whole file. IMPACT adds the quotes; a copy of the previous file was saved as $backupPath." 'Warn'
+            } else {
+                foreach ($r in $userRepairs) {
+                    Write-Log "Line $($r.Index + 1) of $ConfigPath ('IdentityFile $($r.Value)') needs double quotes around the path, otherwise ssh rejects the whole file and remote Docker and git fail. IMPACT could not save a copy of the file, so it does not change your line. Please open the file in a text editor and change the line to: IdentityFile `"$($r.Value)`"" 'Error'
+                }
+                $repairs = [System.Collections.Generic.List[object]]::new([object[]]@($repairs | Where-Object { $_.Ours }))
+                if ($repairs.Count -eq 0) { return 0 }
+            }
+        }
+
+        foreach ($r in $repairs) { $lines[$r.Index] = $r.NewLine }
+        Set-Content -LiteralPath $ConfigPath -Value $lines -Encoding UTF8 -ErrorAction Stop
+        foreach ($r in $repairs) {
+            Write-Log "Added quotes around the IdentityFile path on line $($r.Index + 1) of $ConfigPath ($($r.Value)); without them ssh rejects the whole file." 'Warn'
+        }
+        return $repairs.Count
+    } catch {
+        Write-Log "Could not check or repair the IdentityFile lines in the ssh config ($($_.Exception.Message))." 'Warn'
+        return 0
+    }
+}
+
 function Ensure-SshConfigEntry {
     param(
         [string]$RemoteHostIp,
@@ -2331,6 +2487,12 @@ function Ensure-SshConfigEntry {
     if (-not (Test-Path -LiteralPath $sshDir)) {
         New-Item -Path $sshDir -ItemType Directory -Force | Out-Null
     }
+
+    # First repair unquoted IdentityFile paths with a space in EVERY section of the file,
+    # not only in the section for this IP: a single broken line (for example from an old
+    # entry for another workstation address) makes ssh reject the whole file, including the
+    # entry written below. '$null =' keeps the returned count out of this function's output.
+    $null = Repair-SshConfigIdentityFileQuoting -ConfigPath $configPath
 
     $identityNorm = $IdentityFile -replace '\\','/'
 
@@ -2402,15 +2564,17 @@ function Ensure-SshConfigEntry {
             if (-not $blockIsOurs) {
                 # F67: this Host block was written by the user or an admin and may hold
                 # settings IMPACT does not know about (Port, ProxyJump, ...). Keep a copy of
-                # the whole file before the block is replaced, and say where it is. If the
-                # copy cannot be made, leave the file alone: IMPACT's own ssh calls pass the
-                # key directly, so they also work without this entry.
-                $backupPath = "$configPath.impact-backup-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-                try {
-                    Copy-Item -LiteralPath $configPath -Destination $backupPath -ErrorAction Stop
+                # the whole file before the block is replaced, and say where it is
+                # (Backup-SshConfigFile also tries a second folder). If no copy can be made,
+                # the user's block is left alone. IMPACT's own ssh and git calls pass the key
+                # directly, but Docker over ssh starts a plain 'ssh' and gets the IMPACT key
+                # ONLY from this entry, so remote Docker can then fail: say so clearly and
+                # explain the manual fix.
+                $backupPath = Backup-SshConfigFile -ConfigPath $configPath
+                if ($backupPath) {
                     Write-Log "Your own 'Host $RemoteHostIp' entry in $configPath is replaced by the IMPACT entry. A copy of the previous file was saved as $backupPath." 'Warn'
-                } catch {
-                    Write-Log "Could not back up $configPath ($($_.Exception.Message)); leaving your 'Host $RemoteHostIp' entry unchanged." 'Warn'
+                } else {
+                    Write-Log "Could not save a copy of $configPath, so IMPACT leaves your own 'Host $RemoteHostIp' entry unchanged. Remote Docker may fail, because Docker finds the IMPACT key only through this entry. To fix it, open $configPath in a text editor and make the 'Host $RemoteHostIp' section contain these lines (or delete the section and start IMPACT again): User $RemoteUser / IdentityFile `"$identityNorm`" / IdentitiesOnly yes" 'Error'
                     return
                 }
             }
@@ -2605,21 +2769,42 @@ function Get-GitHubSshAuthStatus {
     .OUTPUTS  [pscustomobject] @{ Status; Account } where Status is
                 'Authenticated'  GitHub accepted the key (Account = the GitHub name of the
                                  account the key belongs to),
+                'KeyUnusable'    ssh could not use the key file itself (for example "bad
+                                 permissions" or "invalid format"), so GitHub never saw it,
                 'NotRegistered'  GitHub refused the key: it is not added to a GitHub account,
                 'HostKeyProblem' the github.com host key stored on this PC does not match,
                 'Unreachable'    github.com could not be reached (offline, VPN, firewall),
                 'Unknown'        anything else (for example a broken ~/.ssh/config).
+    .PARAMETER KeyPath  Optional: the key that was tested. When given, 'KeyUnusable' is only
+              reported when ssh's complaint names THIS key file, not another key that the
+              user's own ~/.ssh/config adds (that one does not matter for IMPACT).
     .NOTES    GitHub never opens a shell, so even a SUCCESSFUL login ends with exit code 1
               and the text "Hi <name>! You've successfully authenticated, but GitHub does
               not provide shell access." Exit code 1 together with that text means "OK".
     #>
-    param([string[]]$Output, [int]$ExitCode)
+    param([string[]]$Output, [int]$ExitCode, [string]$KeyPath)
     $text = (@($Output) | ForEach-Object { "$_" }) -join "`n"
     $account = $null
     if ($text -match 'Hi ([^!\s]+)!') { $account = $Matches[1] }
+
+    # When ssh cannot load the key file (on Windows mostly because other users may read it:
+    # "UNPROTECTED PRIVATE KEY FILE!" / 'Load key "...": bad permissions'), it still ends
+    # with "Permission denied (publickey)". Telling the user to add the key to GitHub would
+    # then be wrong, and 'Check again' could never succeed. ssh names the file in
+    # 'Load key "<file>": <reason>' and in "Permissions for '<file>' are too open".
+    $keyUnusable = $false
+    $keyLeaf = if ($KeyPath) { [System.IO.Path]::GetFileName(($KeyPath -replace '\\+', '/')) } else { $null }
+    foreach ($m in [regex]::Matches($text, 'Load key "([^"]+)"\s*:|Permissions (?:\S+ )?for ''([^'']+)'' are too open')) {
+        $complainedFile = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
+        $complainedLeaf = [System.IO.Path]::GetFileName(($complainedFile -replace '\\+', '/'))
+        if (-not $keyLeaf -or $complainedLeaf -eq $keyLeaf) { $keyUnusable = $true }
+    }
+
     $status = 'Unknown'
     if (($ExitCode -eq 1 -or $ExitCode -eq 0) -and $text -match 'successfully authenticated') {
         $status = 'Authenticated'
+    } elseif ($keyUnusable) {
+        $status = 'KeyUnusable'
     } elseif ($text -match 'Permission denied \(publickey') {
         $status = 'NotRegistered'
     } elseif ($text -match 'REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed') {
@@ -2659,7 +2844,7 @@ function Test-GitHubSshKeyAuth {
         $out = @("ssh could not be run: $($_.Exception.Message)")
         $exitCode = -1
     }
-    $parsed = Get-GitHubSshAuthStatus -Output $out -ExitCode $exitCode
+    $parsed = Get-GitHubSshAuthStatus -Output $out -ExitCode $exitCode -KeyPath $KeyPath
     return [pscustomobject]@{ Status = $parsed.Status; Account = $parsed.Account; Output = $out; ExitCode = $exitCode }
 }
 
@@ -2750,13 +2935,31 @@ function Confirm-GitHubKeyRegistered {
               key is not registered, the user sees the key and where to add it, and can
               check again or continue. Never blocks the workflow: when GitHub cannot be
               reached (offline, port 22 blocked), the result is only written to the log.
-    .OUTPUTS  The last status ('Authenticated', 'NotRegistered', 'Unreachable',
-              'HostKeyProblem', 'Unknown'), or 'Skipped' in NonInteractive mode.
+    .OUTPUTS  The last status ('Authenticated', 'NotRegistered', 'KeyUnusable',
+              'Unreachable', 'HostKeyProblem', 'Unknown'), or 'Skipped' in NonInteractive
+              mode.
+    .NOTES    The result is remembered for the session in $State.Metadata['GitHubKeyCheck']
+              (key path + status). 'Back' in the location dialog runs the key setup again;
+              without this memory every Back repeated the check (up to about 10 seconds
+              when port 22 is blocked) and showed the key dialog again to a user who had
+              already chosen 'Continue anyway'. A different key (another GitHub user name
+              entered after Back) is checked again.
     #>
     param([pscustomobject]$State, [string]$KeyPath, [string]$PublicKey)
     if ($script:NonInteractive) {
         Write-Log 'NonInteractive: skipping the GitHub SSH key check.' 'Debug'
         return 'Skipped'
+    }
+    # Read the session memory carefully: under StrictMode, reading a property or key that
+    # does not exist with dot notation throws (tests also pass a State without Metadata).
+    $sessionMemory = $null
+    if ($State -and $State.PSObject.Properties['Metadata'] -and $State.Metadata -is [System.Collections.IDictionary]) {
+        $sessionMemory = $State.Metadata
+        $previous = if ($sessionMemory.Contains('GitHubKeyCheck')) { $sessionMemory['GitHubKeyCheck'] } else { $null }
+        if ($previous -is [System.Collections.IDictionary] -and $previous['KeyPath'] -eq $KeyPath -and $previous['Status']) {
+            Write-Log "The GitHub SSH key check was already done in this session (result: $($previous['Status'])); not repeating it." 'Info'
+            return [string]$previous['Status']
+        }
     }
     while ($true) {
         Write-Host 'Checking that GitHub accepts your IMPACT SSH key...'
@@ -2770,23 +2973,33 @@ function Confirm-GitHubKeyRegistered {
             } else {
                 Write-Log 'GitHub accepts the IMPACT SSH key.' 'Info'
             }
+            if ($null -ne $sessionMemory) { $sessionMemory['GitHubKeyCheck'] = @{ KeyPath = $KeyPath; Status = 'Authenticated' } }
             return 'Authenticated'
         }
         if ($check.Status -ne 'NotRegistered') {
             # No dialog here: a blocked port 22 or a missing internet connection says
             # nothing about the key, and nagging on every start would only confuse.
+            # 'if': Split-Path throws on an empty path, and this check must never stop the workflow.
+            $keyLeaf = if ($KeyPath) { Split-Path -Leaf $KeyPath } else { 'the key file' }
+            $userForIcacls = if ($env:USERNAME) { $env:USERNAME } else { '<your Windows user name>' }
             $hint = switch ($check.Status) {
                 'Unreachable'    { 'github.com could not be reached on port 22 (no internet, VPN or firewall).' }
                 'HostKeyProblem' { "The github.com host key stored on this PC does not match. If GitHub really changed its key, run 'ssh-keygen -R github.com' once." }
+                # The key file itself cannot be used (see Get-GitHubSshAuthStatus). Adding it
+                # to GitHub would not help, so the registration dialog is not shown.
+                'KeyUnusable'    { "ssh could not use the key file $KeyPath itself, so GitHub never saw the key (adding it to GitHub does not help). On Windows this usually means that other users may read the file ('bad permissions'). To fix it, run in PowerShell: icacls `"$KeyPath`" /inheritance:r /grant:r `"$($userForIcacls):F`"  Or rename both files $keyLeaf and $keyLeaf.pub and start IMPACT again: it then creates a new key, which you add to GitHub (and the workstation asks for its password once)." }
                 default          { 'Unexpected answer.' }
             }
             Write-Log "Could not check whether GitHub accepts the IMPACT SSH key: $hint Details: $details" 'Warn'
+            if ($null -ne $sessionMemory) { $sessionMemory['GitHubKeyCheck'] = @{ KeyPath = $KeyPath; Status = [string]$check.Status } }
             return $check.Status
         }
         Write-Log "GitHub does not accept the IMPACT SSH key yet ($details)." 'Warn'
         $choice = Show-GitHubKeyRegistrationDialog -PublicKey $PublicKey -UserName $State.UserName
         if ($choice -ne 'retry') {
             Write-Log 'Continuing without the SSH key on GitHub: git pull and push will fail until the key is added at https://github.com/settings/keys.' 'Warn'
+            # Remembered, so the dialog does not come back after 'Back' in this session.
+            if ($null -ne $sessionMemory) { $sessionMemory['GitHubKeyCheck'] = @{ KeyPath = $KeyPath; Status = 'NotRegistered' } }
             return 'NotRegistered'
         }
     }
@@ -2826,6 +3039,12 @@ function Ensure-GitKeySetup {
         }
         return $false
     }
+
+    # Repair unquoted IdentityFile paths with a space in ~/.ssh/config (written by older
+    # IMPACT versions). One such line makes ssh reject the whole file, which breaks the
+    # GitHub check below and the local git push. Done here (and not only in the remote
+    # preparation) so it also runs for colleagues who only use LOCAL mode.
+    $null = Repair-SshConfigIdentityFileQuoting
 
     if (-not $keyResult.Generated) {
         Write-Log "Using existing SSH key at $sshKeyPath" 'Info'

@@ -2481,3 +2481,351 @@ Describe 'C3 module startup and GitHub checks' -Tag Unit {
         }
     }
 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  C3 review R1: unquoted IdentityFile paths with a space are repaired in EVERY section
+#  of the ssh config, not only in the section of the IP being connected to. All tests
+#  use a temporary config file, never the developer's real ~/.ssh/config.
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Repair-SshConfigIdentityFileQuoting (all sections of the ssh config)' -Tag Unit {
+    BeforeEach {
+        $c3rDir = Join-Path ([System.IO.Path]::GetTempPath()) "impact_c3r_cfg_$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        $c3rKeyDir = Join-Path $c3rDir 'Max Mustermann'
+        New-Item -ItemType Directory -Path $c3rKeyDir -Force | Out-Null
+        $c3rKey = Join-Path $c3rKeyDir 'id_ed25519_max'
+        Set-Content -Path $c3rKey -Value 'dummy-key-content'
+        $c3rKeyNorm = $c3rKey -replace '\\', '/'
+        $c3rConfig = Join-Path $c3rDir 'config'
+    }
+
+    AfterEach {
+        Remove-Item -Recurse -Force -Path $c3rDir -ErrorAction SilentlyContinue
+    }
+
+    It 'Repairs the broken IMPACT entry of ANOTHER workstation IP when connecting to a new one' {
+        # Two IMPACT entries: an old, broken one for 10.0.0.5 (unquoted path with a space,
+        # as older versions wrote it) and a correct one for 10.0.0.9, which is the one
+        # being connected to now.
+        Set-Content -Path $c3rConfig -Value @(
+            '# IMPACT Docker GUI - auto-generated entry for remote workstation'
+            'Host 10.0.0.5'
+            '    User php-workstation'
+            "    IdentityFile $c3rKeyNorm"
+            '    IdentitiesOnly yes'
+            ''
+            '# IMPACT Docker GUI - auto-generated entry for remote workstation'
+            'Host 10.0.0.9'
+            '    User php-workstation'
+            "    IdentityFile `"$c3rKeyNorm`""
+            '    IdentitiesOnly yes'
+        )
+        Ensure-SshConfigEntry -RemoteHostIp '10.0.0.9' -RemoteUser 'php-workstation' -IdentityFile $c3rKey -ConfigPath $c3rConfig
+        $lines = @(Get-Content -Path $c3rConfig)
+        $lines | Should -Not -Contain "    IdentityFile $c3rKeyNorm"
+        @($lines | Where-Object { $_ -eq "    IdentityFile `"$c3rKeyNorm`"" }).Count | Should -Be 2
+        @($lines | Where-Object { $_ -match '^Host 10\.0\.0\.5$' }).Count | Should -Be 1
+        @($lines | Where-Object { $_ -match '^Host 10\.0\.0\.9$' }).Count | Should -Be 1
+        # Only IMPACT's own lines were changed, so no backup copy is needed.
+        @(Get-ChildItem -Path $c3rDir -Filter 'config.impact-backup-*').Count | Should -Be 0
+    }
+
+    It 'Saves a copy of the file before quoting a line in a section the user wrote' {
+        Set-Content -Path $c3rConfig -Value @(
+            'Host myserver'
+            '    HostName myserver.example.org'
+            "    IdentityFile=$c3rKeyNorm"
+        )
+        $count = InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ C = $c3rConfig } { param($C) Repair-SshConfigIdentityFileQuoting -ConfigPath $C }
+        $count | Should -Be 1
+        (Get-Content -Path $c3rConfig) | Should -Contain "    IdentityFile=`"$c3rKeyNorm`""
+        $backups = @(Get-ChildItem -Path $c3rDir -Filter 'config.impact-backup-*')
+        $backups.Count | Should -Be 1
+        (Get-Content -LiteralPath $backups[0].FullName) | Should -Contain "    IdentityFile=$c3rKeyNorm"
+    }
+
+    It 'Repairs only IMPACT lines when no copy of the file can be made' {
+        Set-Content -Path $c3rConfig -Value @(
+            'Host myserver'
+            "    IdentityFile $c3rKeyNorm"
+            ''
+            '# IMPACT Docker GUI - auto-generated entry for remote workstation'
+            'Host 10.0.0.5'
+            "    IdentityFile $c3rKeyNorm"
+        )
+        Mock Backup-SshConfigFile { $null } -ModuleName 'IMPACT_Docker_GUI'
+        $count = InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ C = $c3rConfig } { param($C) Repair-SshConfigIdentityFileQuoting -ConfigPath $C }
+        $count | Should -Be 1
+        $lines = @(Get-Content -Path $c3rConfig)
+        $lines[1] | Should -Be "    IdentityFile $c3rKeyNorm"
+        $lines[5] | Should -Be "    IdentityFile `"$c3rKeyNorm`""
+    }
+
+    It 'Leaves quoted values, comments and escaped spaces alone' {
+        $original = @(
+            'Host a'
+            "    IdentityFile `"$c3rKeyNorm`""
+            'Host b'
+            '    IdentityFile ~/.ssh/id_b # my comment'
+            'Host c'
+            '    IdentityFile C:/Users/Max\ Mustermann/.ssh/id_c'
+            'Host d'
+            '    IdentityFile ~/.ssh/id_d'
+        )
+        Set-Content -Path $c3rConfig -Value $original
+        $count = InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ C = $c3rConfig } { param($C) Repair-SshConfigIdentityFileQuoting -ConfigPath $C }
+        $count | Should -Be 0
+        (Get-Content -Path $c3rConfig) | Should -Be $original
+        @(Get-ChildItem -Path $c3rDir -Filter 'config.impact-backup-*').Count | Should -Be 0
+    }
+
+    It 'Returns 0 for a missing config file' {
+        InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ C = (Join-Path $c3rDir 'no-such-config') } { param($C) Repair-SshConfigIdentityFileQuoting -ConfigPath $C } | Should -Be 0
+    }
+
+    It 'Backup-SshConfigFile never overwrites an earlier copy made in the same second' {
+        Set-Content -Path $c3rConfig -Value 'Host x'
+        $first, $second = InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ C = $c3rConfig } {
+            param($C)
+            Backup-SshConfigFile -ConfigPath $C
+            Backup-SshConfigFile -ConfigPath $C
+        }
+        $first | Should -Not -BeNullOrEmpty
+        $second | Should -Not -BeNullOrEmpty
+        $second | Should -Not -Be $first
+        @(Get-ChildItem -Path $c3rDir -Filter 'config.impact-backup-*').Count | Should -Be 2
+    }
+
+    It 'Ensure-GitKeySetup calls the repair before every GitHub check (source check, runs everywhere)' {
+        $modulePath = Join-Path $PSScriptRoot '..' 'current_version' 'IMPACT_Docker_GUI.psm1'
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $modulePath), [ref]$null, [ref]$null)
+        $fn = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Ensure-GitKeySetup' }, $true) | Select-Object -First 1
+        $calls = @($fn.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+        $repair = @($calls | Where-Object { $_.GetCommandName() -eq 'Repair-SshConfigIdentityFileQuoting' })
+        $github = @($calls | Where-Object { $_.GetCommandName() -eq 'Confirm-GitHubKeyRegistered' })
+        $repair.Count | Should -Be 1
+        $github.Count | Should -BeGreaterThan 0
+        foreach ($g in $github) { $g.Extent.StartOffset | Should -BeGreaterThan $repair[0].Extent.StartOffset }
+    }
+
+    It 'Ensure-GitKeySetup runs the repair before the GitHub check (so LOCAL mode gets it too)' {
+        # Ensure-GitKeySetup contains WinForms code. Where System.Drawing is missing (Linux),
+        # PowerShell cannot even start the function, so this behaviour test runs on Windows only.
+        if (-not $IsWindows) { Set-ItResult -Skipped -Because 'Ensure-GitKeySetup needs WinForms / System.Drawing (Windows only)'; return }
+        $global:C3rOrder = [System.Collections.Generic.List[string]]::new()
+        $c3rUser = "c3rtest$([guid]::NewGuid().ToString('N').Substring(0,6))"
+        Mock Initialize-ImpactSshKeyPair { [pscustomobject]@{ Success = $true; Generated = $false; Status = 'Ready'; Message = ''; Details = '' } } -ModuleName 'IMPACT_Docker_GUI'
+        Mock Get-Content { 'ssh-ed25519 AAAAC3NzaTEST IMPACT_c3r' } -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$LiteralPath$Path" -like '*id_ed25519_c3rtest*.pub' }
+        Mock Repair-SshConfigIdentityFileQuoting { $global:C3rOrder.Add('repair'); 0 } -ModuleName 'IMPACT_Docker_GUI'
+        Mock Ensure-SshAgentRunning { } -ModuleName 'IMPACT_Docker_GUI'
+        Mock Confirm-GitHubKeyRegistered { $global:C3rOrder.Add('github'); 'Authenticated' } -ModuleName 'IMPACT_Docker_GUI'
+        try {
+            $state = New-SessionState
+            $state.UserName = $c3rUser
+            $state.ContainerLocation = 'LOCAL'
+            Ensure-GitKeySetup -State $state | Should -BeTrue
+            Should -Invoke Repair-SshConfigIdentityFileQuoting -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly
+            ($global:C3rOrder -join ',') | Should -Be 'repair,github'
+        } finally { Remove-Variable -Name C3rOrder -Scope Global -ErrorAction SilentlyContinue }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  C3 review R2 + R3: a key file ssh cannot use is not reported as "not on GitHub", and
+#  the GitHub key check runs once per key and session (Back must not repeat it).
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'GitHub SSH key check: unusable key file and session memory' -Tag Unit {
+    BeforeAll {
+        $script:c3rBadPerms = @(
+            '@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@'
+            '@         WARNING: UNPROTECTED PRIVATE KEY FILE!          @'
+            '@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@'
+            "Permissions for 'C:\\Users\\Max Mustermann\\.ssh\\id_ed25519_jdoe' are too open."
+            'It is required that your private key files are NOT accessible by others.'
+            'This private key will be ignored.'
+            'Load key "C:\\Users\\Max Mustermann\\.ssh\\id_ed25519_jdoe": bad permissions'
+            'git@github.com: Permission denied (publickey).'
+        )
+    }
+
+    AfterEach {
+        Remove-Variable -Name C3rAuthCalls -Scope Global -ErrorAction SilentlyContinue
+        Disable-NonInteractiveMode
+    }
+
+    It 'Reports KeyUnusable (not NotRegistered) when ssh cannot load the IMPACT key file' {
+        InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ O = $script:c3rBadPerms } {
+            param($O)
+            (Get-GitHubSshAuthStatus -Output $O -ExitCode 255 -KeyPath 'C:/Users/Max Mustermann/.ssh/id_ed25519_jdoe').Status | Should -Be 'KeyUnusable'
+            (Get-GitHubSshAuthStatus -Output $O -ExitCode 255).Status | Should -Be 'KeyUnusable'
+            (Get-GitHubSshAuthStatus -Output @('Load key "/home/x/.ssh/id_ed25519_jdoe": invalid format', 'git@github.com: Permission denied (publickey).') -ExitCode 255 -KeyPath '/home/x/.ssh/id_ed25519_jdoe').Status | Should -Be 'KeyUnusable'
+        }
+    }
+
+    It 'Still reports NotRegistered when ssh only complains about ANOTHER key from the user''s config' {
+        InModuleScope 'IMPACT_Docker_GUI' {
+            $o = @('Load key "C:\\Users\\x\\.ssh\\id_rsa_old": bad permissions', 'git@github.com: Permission denied (publickey).')
+            (Get-GitHubSshAuthStatus -Output $o -ExitCode 255 -KeyPath 'C:/Users/x/.ssh/id_ed25519_jdoe').Status | Should -Be 'NotRegistered'
+        }
+    }
+
+    It 'Does not show the registration dialog for an unusable key file' {
+        Mock Test-GitHubSshKeyAuth { [pscustomobject]@{ Status = 'KeyUnusable'; Account = $null; Output = @('Load key "k": bad permissions'); ExitCode = 255 } } -ModuleName 'IMPACT_Docker_GUI'
+        Mock Show-GitHubKeyRegistrationDialog { 'retry' } -ModuleName 'IMPACT_Docker_GUI'
+        $r = InModuleScope 'IMPACT_Docker_GUI' { Confirm-GitHubKeyRegistered -State ([pscustomobject]@{ UserName = 'jdoe' }) -KeyPath 'C:/Users/x/.ssh/id_ed25519_jdoe' -PublicKey 'ssh-ed25519 AAAA' }
+        $r | Should -Be 'KeyUnusable'
+        Should -Invoke Show-GitHubKeyRegistrationDialog -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly
+    }
+
+    It 'Does not ask again after Continue anyway when the key setup runs again (Back)' {
+        $global:C3rAuthCalls = 0
+        Mock Test-GitHubSshKeyAuth { $global:C3rAuthCalls++; [pscustomobject]@{ Status = 'NotRegistered'; Account = $null; Output = @('Permission denied (publickey).'); ExitCode = 255 } } -ModuleName 'IMPACT_Docker_GUI'
+        Mock Show-GitHubKeyRegistrationDialog { 'continue' } -ModuleName 'IMPACT_Docker_GUI'
+        $state = [pscustomobject]@{ UserName = 'jdoe'; Metadata = @{} }
+        $first = InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ S = $state } { param($S) Confirm-GitHubKeyRegistered -State $S -KeyPath 'k1' -PublicKey 'ssh-ed25519 AAAA' }
+        $second = InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ S = $state } { param($S) Confirm-GitHubKeyRegistered -State $S -KeyPath 'k1' -PublicKey 'ssh-ed25519 AAAA' }
+        $first | Should -Be 'NotRegistered'
+        $second | Should -Be 'NotRegistered'
+        $global:C3rAuthCalls | Should -Be 1
+        Should -Invoke Show-GitHubKeyRegistrationDialog -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly
+    }
+
+    It 'Remembers a successful check, but checks a different key (another user name) again' {
+        $global:C3rAuthCalls = 0
+        Mock Test-GitHubSshKeyAuth { $global:C3rAuthCalls++; [pscustomobject]@{ Status = 'Authenticated'; Account = 'jdoe'; Output = @('Hi jdoe!'); ExitCode = 1 } } -ModuleName 'IMPACT_Docker_GUI'
+        $state = [pscustomobject]@{ UserName = 'jdoe'; Metadata = @{} }
+        InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ S = $state } {
+            param($S)
+            Confirm-GitHubKeyRegistered -State $S -KeyPath 'k1' -PublicKey 'x' | Should -Be 'Authenticated'
+            Confirm-GitHubKeyRegistered -State $S -KeyPath 'k1' -PublicKey 'x' | Should -Be 'Authenticated'
+            Confirm-GitHubKeyRegistered -State $S -KeyPath 'k2' -PublicKey 'x' | Should -Be 'Authenticated'
+        }
+        $global:C3rAuthCalls | Should -Be 2
+        $state.Metadata['GitHubKeyCheck']['KeyPath'] | Should -Be 'k2'
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  C3 review R5: the ssh-agent check compares fingerprints, because 'ssh-add -l' shows
+#  the key's comment (IMPACT_<user>), not its file path.
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Ensure-SshAgentRunning finds an already loaded key by its fingerprint' -Tag Unit {
+    BeforeAll {
+        # Get-Service, Start-Service and ssh-add do not exist on Linux, and Pester can only
+        # mock commands that exist, so add small stand-ins where they are missing.
+        $script:c3rStubs = @()
+        if (-not (Get-Command Get-Service -ErrorAction SilentlyContinue)) {
+            function global:Get-Service { [CmdletBinding()] param([Parameter(Position = 0)][string[]]$Name) }
+            $script:c3rStubs += 'Get-Service'
+        }
+        if (-not (Get-Command Start-Service -ErrorAction SilentlyContinue)) {
+            function global:Start-Service { [CmdletBinding()] param([Parameter(Position = 0)][string[]]$Name) }
+            $script:c3rStubs += 'Start-Service'
+        }
+        if (-not (Get-Command ssh-add -ErrorAction SilentlyContinue)) {
+            function global:ssh-add { throw 'ssh-add stub: this call should have been mocked' }
+            $script:c3rStubs += 'ssh-add'
+        }
+        $script:c3rKey = Join-Path ([System.IO.Path]::GetTempPath()) 'impact_c3r_agent_no_such_key'
+    }
+
+    AfterAll {
+        foreach ($s in $script:c3rStubs) { Remove-Item -Path "Function:\$s" -ErrorAction SilentlyContinue }
+    }
+
+    AfterEach {
+        Remove-Variable -Name C3rAgentList, C3rAdds -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'Test-SshAgentHasKey matches the fingerprint, not the comment' {
+        InModuleScope 'IMPACT_Docker_GUI' {
+            $list = @('256 SHA256:abcDEF123+/xyz IMPACT_jdoe (ED25519)', '3072 SHA256:other0000 me@laptop (RSA)')
+            Test-SshAgentHasKey -AgentList $list -Fingerprint 'SHA256:abcDEF123+/xyz' -KeyPath 'C:/Users/x/.ssh/id_ed25519_jdoe' | Should -BeTrue
+            Test-SshAgentHasKey -AgentList $list -Fingerprint 'SHA256:notloaded' -KeyPath 'C:/Users/x/.ssh/id_ed25519_jdoe' | Should -BeFalse
+            # Without a fingerprint the old path test still works for keys listed by path.
+            Test-SshAgentHasKey -AgentList @('256 SHA256:zzz C:/Users/x/.ssh/id_ed25519_jdoe (ED25519)') -Fingerprint $null -KeyPath 'C:/Users/x/.ssh/id_ed25519_jdoe' | Should -BeTrue
+            Test-SshAgentHasKey -AgentList @('The agent has no identities.') -Fingerprint 'SHA256:abc' -KeyPath 'k' | Should -BeFalse
+            Test-SshAgentHasKey -AgentList @() -Fingerprint 'SHA256:abc' -KeyPath 'k' | Should -BeFalse
+        }
+    }
+
+    It 'Does not add the key again when the agent already holds it' {
+        $global:C3rAgentList = @('256 SHA256:abcDEF123+/xyz IMPACT_jdoe (ED25519)')
+        $global:C3rAdds = 0
+        Mock Get-Service { [pscustomobject]@{ Status = 'Running' } } -ModuleName 'IMPACT_Docker_GUI'
+        Mock Invoke-ImpactSshKeygen { [pscustomobject]@{ ExitCode = 0; Output = @('256 SHA256:abcDEF123+/xyz IMPACT_jdoe (ED25519)') } } -ModuleName 'IMPACT_Docker_GUI'
+        Mock ssh-add {
+            $global:LASTEXITCODE = 0
+            if (@($args) -contains '-l') { return $global:C3rAgentList }
+            $global:C3rAdds++
+            'Identity added'
+        } -ModuleName 'IMPACT_Docker_GUI'
+        Ensure-SshAgentRunning -SshKeyPath $script:c3rKey
+        $global:C3rAdds | Should -Be 0
+    }
+
+    It 'Adds the key when the agent holds only other keys' {
+        $global:C3rAgentList = @('3072 SHA256:other0000 me@laptop (RSA)')
+        $global:C3rAdds = 0
+        Mock Get-Service { [pscustomobject]@{ Status = 'Running' } } -ModuleName 'IMPACT_Docker_GUI'
+        Mock Invoke-ImpactSshKeygen { [pscustomobject]@{ ExitCode = 0; Output = @('256 SHA256:abcDEF123+/xyz IMPACT_jdoe (ED25519)') } } -ModuleName 'IMPACT_Docker_GUI'
+        Mock ssh-add {
+            $global:LASTEXITCODE = 0
+            if (@($args) -contains '-l') { return $global:C3rAgentList }
+            $global:C3rAdds++
+            'Identity added'
+        } -ModuleName 'IMPACT_Docker_GUI'
+        Ensure-SshAgentRunning -SshKeyPath $script:c3rKey
+        $global:C3rAdds | Should -Be 1
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  C3 review R4: when no copy of the ssh config can be made, the user's own Host block
+#  is kept and the user is told that remote Docker may fail (Docker over ssh gets the
+#  IMPACT key only from this entry). The copy first tries a second folder.
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Ensure-SshConfigEntry when the ssh config cannot be backed up' -Tag Unit {
+    BeforeEach {
+        $c3rDir = Join-Path ([System.IO.Path]::GetTempPath()) "impact_c3r_bak_$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        New-Item -ItemType Directory -Path $c3rDir -Force | Out-Null
+        $c3rKey = Join-Path $c3rDir 'id_ed25519_max'
+        Set-Content -Path $c3rKey -Value 'dummy-key-content'
+        $c3rConfig = Join-Path $c3rDir 'config'
+    }
+
+    AfterEach {
+        Remove-Item -Recurse -Force -Path $c3rDir -ErrorAction SilentlyContinue
+        Remove-Variable -Name C3rCopyTargets -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'Keeps the user''s Host block and logs an error that explains the manual fix' {
+        $original = @(
+            'Host 198.51.100.77'
+            '    User php-workstation'
+            '    ProxyJump jumphost.example.org'
+            '    IdentityFile /does/not/exist/id_other'
+        )
+        Set-Content -Path $c3rConfig -Value $original
+        Mock Backup-SshConfigFile { $null } -ModuleName 'IMPACT_Docker_GUI'
+        Mock Write-Log { } -ModuleName 'IMPACT_Docker_GUI'
+        $out = @(Ensure-SshConfigEntry -RemoteHostIp '198.51.100.77' -RemoteUser 'php-workstation' -IdentityFile $c3rKey -ConfigPath $c3rConfig)
+        $out.Count | Should -Be 0
+        (Get-Content -Path $c3rConfig) | Should -Be $original
+        Should -Invoke Write-Log -ModuleName 'IMPACT_Docker_GUI' -Times 1 -ParameterFilter { $Level -eq 'Error' -and $Message -match 'Remote Docker may fail' -and $Message -match 'IdentitiesOnly yes' }
+    }
+
+    It 'Backup-SshConfigFile tries ~/.impact_gui/ssh-config-backups when the .ssh folder refuses the copy' {
+        Set-Content -Path $c3rConfig -Value 'Host x'
+        $global:C3rCopyTargets = [System.Collections.Generic.List[string]]::new()
+        # The second folder is in the real home folder, so creating it and copying there are
+        # only recorded, never done.
+        Mock New-Item { } -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like '*ssh-config-backups*' }
+        Mock Copy-Item { $global:C3rCopyTargets.Add("$Destination"); throw 'Access to the path is denied.' } -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Destination" -notlike '*ssh-config-backups*' }
+        Mock Copy-Item { $global:C3rCopyTargets.Add("$Destination") } -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Destination" -like '*ssh-config-backups*' }
+        $r = InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ C = $c3rConfig } { param($C) Backup-SshConfigFile -ConfigPath $C }
+        $global:C3rCopyTargets.Count | Should -Be 2
+        $global:C3rCopyTargets[0] | Should -BeLike "$c3rDir*config.impact-backup-*"
+        $r | Should -Be $global:C3rCopyTargets[1]
+        $r | Should -BeLike '*.impact_gui*ssh-config-backups*config.impact-backup-*'
+    }
+}
