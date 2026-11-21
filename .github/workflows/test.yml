@@ -118,6 +118,11 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────
   #  Docker SSH tests - Ubuntu (needs Linux containers for SSHD)
   #  Tests the module's SSH functions against a real SSHD container.
+  #  It also runs the production in-container SSH setup command
+  #  (Get-ContainerSshSetupCommand) in a real container built from the SSHD
+  #  image and checks the key, known_hosts and a strict host-key check
+  #  against github.com, without a GitHub token (F74). This used to happen
+  #  only in the weekly E2E jobs.
   # ─────────────────────────────────────────────────────────────────────────
   docker-ssh-tests:
     name: Docker SSH Tests (Ubuntu)
@@ -292,6 +297,13 @@ jobs:
       || github.event_name == 'schedule'
     needs: [docker-ssh-tests]
     timeout-minutes: 60
+    # Set for the whole job (not only for the test step), so the Preflight step can
+    # also find and check this key (F109: it used to look only in another folder).
+    env:
+      IMPACT_REMOTE_E2E_SSH_HOST: localhost
+      IMPACT_REMOTE_E2E_SSH_PORT: '2222'
+      IMPACT_REMOTE_E2E_SSH_USER: testuser
+      IMPACT_REMOTE_E2E_SSH_KEY: /tmp/remote_e2e_ssh/id_test
     steps:
       - uses: actions/checkout@v4
 
@@ -357,11 +369,7 @@ jobs:
         run: |
           Import-Module Pester -MinimumVersion 5.0.0
 
-          $env:IMPACT_REMOTE_E2E_SSH_HOST = 'localhost'
-          $env:IMPACT_REMOTE_E2E_SSH_PORT = '2222'
-          $env:IMPACT_REMOTE_E2E_SSH_USER = 'testuser'
-          $env:IMPACT_REMOTE_E2E_SSH_KEY  = '/tmp/remote_e2e_ssh/id_test'
-
+          # IMPACT_REMOTE_E2E_SSH_* come from the job-level 'env:' above.
           $config = New-PesterConfiguration
           $config.Run.Path = './tests/RemoteE2E.Tests.ps1'
           $config.Filter.Tag = @('RemoteE2E')

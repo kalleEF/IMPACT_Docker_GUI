@@ -7,6 +7,11 @@
 #>
 
 BeforeAll {
+    # Many tests build temp paths from $env:TEMP, which exists on Windows only. On Linux
+    # it is empty, so Join-Path failed before the test could check anything. Use the
+    # system temp folder there instead.
+    if (-not $env:TEMP) { $env:TEMP = [System.IO.Path]::GetTempPath() }
+
     # Import the module under test
     $modulePath = Join-Path $PSScriptRoot '..' 'current_version' 'IMPACT_Docker_GUI.psm1'
     Import-Module $modulePath -Force -DisableNameChecking
@@ -101,29 +106,107 @@ Describe 'Test-StartupPrerequisites in NonInteractive mode' -Tag Integration {
 #  NonInteractive Ensure-GitKeySetup (with existing key)
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Ensure-GitKeySetup in NonInteractive mode' -Tag Integration {
+    # (F72) The old test passed a fixture key in $state.Paths, but Ensure-GitKeySetup
+    # always builds the key path from $HOME/.ssh and overwrote it. So the test really
+    # GENERATED a key in the developer's real ~/.ssh, copied it to the clipboard and
+    # started ssh-agent (possibly with a UAC prompt), and it never tested the
+    # "key already exists" path it was named after. Now:
+    #  - Join-Path is mocked for the "$HOME/.ssh" call inside the module, so the
+    #    function looks at a temp folder;
+    #  - guard mocks make any write below the real ~/.ssh fail loudly;
+    #  - ssh-keygen, Set-Clipboard and Ensure-SshAgentRunning are mocked, and the
+    #    tests check which of them ran.
+    BeforeAll {
+        $script:realSshDir = Join-Path $HOME '.ssh'
+        # Pester can only mock commands that exist. On machines without OpenSSH (for
+        # example a Linux CI container) define a stand-in that is removed in AfterAll.
+        $script:keygenStubAdded = $false
+        if (-not (Get-Command ssh-keygen -ErrorAction SilentlyContinue)) {
+            function global:ssh-keygen { throw 'ssh-keygen stub called without a mock' }
+            $script:keygenStubAdded = $true
+        }
+    }
+
+    AfterAll {
+        if ($script:keygenStubAdded) { Remove-Item Function:\ssh-keygen -ErrorAction SilentlyContinue }
+    }
+
     BeforeEach {
         Enable-NonInteractiveMode
+
+        $script:fakeSshDir = Join-Path ([System.IO.Path]::GetTempPath()) "impact_gitkey_$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        New-Item -ItemType Directory -Path $script:fakeSshDir -Force | Out-Null
+
+        Mock Join-Path -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { $Path -eq $HOME -and $ChildPath -eq '.ssh' } { $script:fakeSshDir }
+        Mock Add-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path" }
+        Mock Set-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path" }
+        Mock New-Item    -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like "$($script:realSshDir)*" } { throw "Test tried to create something in the real SSH folder: $Path" }
+
+        Mock Set-Clipboard -ModuleName 'IMPACT_Docker_GUI' { }
+        Mock Ensure-SshAgentRunning -ModuleName 'IMPACT_Docker_GUI' { }
+        # Stand-in for ssh-keygen:
+        #  - '-t ... -f <path>' (generate): writes a dummy key pair at <path>
+        #  - '-y -f <path>' (print the public key, also used to check that a key has
+        #    no passphrase): prints the .pub content
+        # It always reports success through $LASTEXITCODE, like the real program.
+        Mock ssh-keygen -ModuleName 'IMPACT_Docker_GUI' {
+            $all = @($args)
+            $fIndex = [array]::IndexOf($all, '-f')
+            $keyFile = if ($fIndex -ge 0 -and $fIndex + 1 -lt $all.Count) { [string]$all[$fIndex + 1] } else { $null }
+            if ($all -contains '-t' -and $keyFile) {
+                Set-Content -LiteralPath $keyFile -Value 'dummy-private-key'
+                Set-Content -LiteralPath "$keyFile.pub" -Value 'ssh-ed25519 AAAAgeneratedTestKey IMPACT_gitgen'
+            } elseif ($all -contains '-y' -and $keyFile -and (Test-Path -LiteralPath "$keyFile.pub")) {
+                Get-Content -LiteralPath "$keyFile.pub"
+            }
+            $global:LASTEXITCODE = 0
+        }
     }
+
     AfterEach {
         Disable-NonInteractiveMode
+        Remove-Item -Recurse -Force -LiteralPath $script:fakeSshDir -ErrorAction SilentlyContinue
     }
 
-    It 'Succeeds when SSH key pair already exists' {
-        $keyInfo = New-DummySshKeyPair -Label 'gitsetup'
-        try {
-            $state = New-TestSessionState -UserName 'gitsetup'
-            $state.Paths.SshPrivate = $keyInfo.Private
-            $state.Paths.SshPublic  = $keyInfo.Public
+    # Both tests need Windows: Ensure-GitKeySetup contains WinForms/System.Drawing types
+    # (for the key dialog), and PowerShell cannot even compile it where System.Drawing
+    # is not supported (Linux). The GUI itself only runs on Windows.
+    It 'Succeeds when SSH key pair already exists (reuses it, generates nothing)' -Skip:(-not $IsWindows) {
+        # Plain text files are enough: this path only reads the public key.
+        $fixturePub = 'ssh-ed25519 AAAAexistingFixtureKey IMPACT_gitsetup'
+        Set-Content -LiteralPath (Join-Path $script:fakeSshDir 'id_ed25519_gitsetup') -Value 'dummy-private-key'
+        Set-Content -LiteralPath (Join-Path $script:fakeSshDir 'id_ed25519_gitsetup.pub') -Value $fixturePub
 
-            # Pre-create the key files so Ensure-GitKeySetup finds them
-            # They were already created by New-DummySshKeyPair
+        $state = New-TestSessionState -UserName 'gitsetup'
+        $result = Ensure-GitKeySetup -State $state
 
-            $result = Ensure-GitKeySetup -State $state
-            $result | Should -BeTrue
-            $state.Metadata.PublicKey | Should -Not -BeNullOrEmpty
-        } finally {
-            Remove-TestArtifacts -Paths @($keyInfo.Dir)
+        $result | Should -BeTrue
+        # The fixture (not some other key) was used ...
+        $state.Paths.SshPrivate | Should -Be (Join-Path $script:fakeSshDir 'id_ed25519_gitsetup')
+        $state.Metadata.PublicKey | Should -Be $fixturePub
+        # ... and nothing was generated or copied to the clipboard.
+        Should -Invoke ssh-keygen -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly -ParameterFilter { $args -contains '-t' }
+        Should -Invoke Set-Clipboard -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly
+        Should -Invoke Ensure-SshAgentRunning -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly
+    }
+
+    It 'Generates a new key with an EMPTY passphrase when none exists (temp folder only)' -Skip:(-not $IsWindows) {
+        $state = New-TestSessionState -UserName 'gitgen'
+        $result = Ensure-GitKeySetup -State $state
+
+        $result | Should -BeTrue
+        $expectedKey = Join-Path $script:fakeSshDir 'id_ed25519_gitgen'
+        $state.Paths.SshPrivate | Should -Be $expectedKey
+        Test-Path -LiteralPath "$expectedKey.pub" | Should -BeTrue
+        $state.Metadata.PublicKey | Should -Be 'ssh-ed25519 AAAAgeneratedTestKey IMPACT_gitgen'
+        # ssh-keygen got '-N' followed by an empty string. Older PowerShell versions
+        # dropped the empty argument, and '-q' then became the passphrase (F14).
+        Should -Invoke ssh-keygen -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly -ParameterFilter {
+            $all = @($args); $n = [array]::IndexOf($all, '-N')
+            ($all -contains '-t') -and $n -ge 0 -and $n + 1 -lt $all.Count -and $all[$n + 1] -eq ''
         }
+        Should -Invoke Set-Clipboard -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly
+        Should -Invoke Ensure-SshAgentRunning -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly
     }
 }
 
@@ -131,17 +214,33 @@ Describe 'Ensure-GitKeySetup in NonInteractive mode' -Tag Integration {
 #  Test-DockerDaemonReady (mocked)
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Test-DockerDaemonReady' -Tag Integration {
-    It 'Returns true when docker info succeeds' {
-        # Only run if Docker is actually present
-        $dockerPresent = [bool](Get-Command docker -ErrorAction SilentlyContinue)
-        if (-not $dockerPresent) {
-            Set-ItResult -Skipped -Because 'Docker CLI not installed'
+    # (F109) The old test only checked that the result was a [bool], so it also passed if
+    # the function always returned $false. docker is now mocked, so each answer is known.
+    BeforeAll {
+        $script:dockerStubAdded = $false
+        if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+            function global:docker { throw 'docker stub called without a mock' }
+            $script:dockerStubAdded = $true
         }
+    }
+    AfterAll {
+        if ($script:dockerStubAdded) { Remove-Item Function:\docker -ErrorAction SilentlyContinue }
+    }
 
-        # If Docker daemon is running, it should return true
-        # If Docker daemon is NOT running, it should return false (still a valid test)
-        $result = Test-DockerDaemonReady
-        $result | Should -BeOfType [bool]
+    It 'Returns true when docker info succeeds' {
+        Mock docker -ModuleName 'IMPACT_Docker_GUI' { $global:LASTEXITCODE = 0; 'Server Version: 27.0.0' }
+        Test-DockerDaemonReady | Should -BeTrue
+        Should -Invoke docker -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly -ParameterFilter { $args -contains 'info' }
+    }
+
+    It 'Returns false when docker info fails (daemon not running)' {
+        Mock docker -ModuleName 'IMPACT_Docker_GUI' { $global:LASTEXITCODE = 1; 'Cannot connect to the Docker daemon' }
+        Test-DockerDaemonReady | Should -BeFalse
+    }
+
+    It 'Returns false (does not throw) when docker cannot be started at all' {
+        Mock docker -ModuleName 'IMPACT_Docker_GUI' { throw 'The term docker is not recognized' }
+        Test-DockerDaemonReady | Should -BeFalse
     }
 }
 
@@ -180,10 +279,78 @@ Describe 'Get-ContainerRuntimeInfo with mock' -Tag Integration {
 #  Ensure-SshAgentRunning
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Ensure-SshAgentRunning' -Tag Integration {
-    It 'Does not throw when called with a dummy key path' {
-        # This test verifies that the function handles missing keys gracefully
-        $dummyPath = Join-Path $env:TEMP 'impact_test_nonexistent_key'
-        { Ensure-SshAgentRunning -SshKeyPath $dummyPath } | Should -Not -Throw
+    # (F109) The old test only checked "does not throw" with a real Windows service and a
+    # real ssh-add, so it passed whatever the function did (and could start a UAC
+    # prompt). The service and ssh-add are now mocked and the tests check what happens.
+    BeforeAll {
+        # Get-Service/Start-Service exist only on Windows, ssh-add only with OpenSSH.
+        # Pester can only mock existing commands, so add stand-ins where they are
+        # missing; AfterAll removes them again.
+        $script:agentStubs = @()
+        foreach ($name in 'Get-Service', 'Start-Service', 'ssh-add') {
+            if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
+                Set-Item -Path "Function:\global:$name" -Value ([scriptblock]::Create("throw '$name stub called without a mock'"))
+                $script:agentStubs += $name
+            }
+        }
+        $script:agentKey = Join-Path ([System.IO.Path]::GetTempPath()) 'impact_agent_test/id_ed25519_agenttest'
+    }
+    AfterAll {
+        foreach ($name in $script:agentStubs) { Remove-Item "Function:\$name" -ErrorAction SilentlyContinue }
+    }
+
+    BeforeEach {
+        # Never start or change a real service, and never elevate.
+        Mock Start-Service -ModuleName 'IMPACT_Docker_GUI' { }
+        Mock Start-Process -ModuleName 'IMPACT_Docker_GUI' { throw 'Ensure-SshAgentRunning tried to start an elevated process' }
+    }
+
+    It 'Adds the key to a running agent that does not have it yet' {
+        Mock Get-Service -ModuleName 'IMPACT_Docker_GUI' { [pscustomobject]@{ Name = 'ssh-agent'; Status = 'Running' } }
+        Mock ssh-add -ModuleName 'IMPACT_Docker_GUI' {
+            if (@($args) -contains '-l') { $global:LASTEXITCODE = 1; 'The agent has no identities.' } else { $global:LASTEXITCODE = 0 }
+        }
+
+        Ensure-SshAgentRunning -SshKeyPath $script:agentKey
+
+        Should -Invoke ssh-add -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly -ParameterFilter { @($args) -contains $script:agentKey }
+        Should -Invoke Start-Service -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly
+    }
+
+    It 'Does not add the key again when the agent already has it' {
+        Mock Get-Service -ModuleName 'IMPACT_Docker_GUI' { [pscustomobject]@{ Name = 'ssh-agent'; Status = 'Running' } }
+        $keyPath = $script:agentKey
+        Mock ssh-add -ModuleName 'IMPACT_Docker_GUI' {
+            if (@($args) -contains '-l') { $global:LASTEXITCODE = 0; "256 SHA256:abcdef $keyPath (ED25519)" } else { $global:LASTEXITCODE = 0 }
+        }
+
+        Ensure-SshAgentRunning -SshKeyPath $script:agentKey
+
+        Should -Invoke ssh-add -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly -ParameterFilter { @($args) -contains $script:agentKey }
+    }
+
+    It 'Starts a stopped agent service before adding the key' {
+        $script:agentStatus = 'Stopped'
+        Mock Get-Service -ModuleName 'IMPACT_Docker_GUI' { [pscustomobject]@{ Name = 'ssh-agent'; Status = $script:agentStatus } }
+        Mock Start-Service -ModuleName 'IMPACT_Docker_GUI' { $script:agentStatus = 'Running' }
+        Mock ssh-add -ModuleName 'IMPACT_Docker_GUI' {
+            if (@($args) -contains '-l') { $global:LASTEXITCODE = 1; 'The agent has no identities.' } else { $global:LASTEXITCODE = 0 }
+        }
+
+        Ensure-SshAgentRunning -SshKeyPath $script:agentKey
+
+        Should -Invoke Start-Service -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly
+        Should -Invoke ssh-add -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly -ParameterFilter { @($args) -contains $script:agentKey }
+    }
+
+    It 'Returns quietly without calling ssh-add when the ssh-agent service does not exist' {
+        Mock Get-Service -ModuleName 'IMPACT_Docker_GUI' { $null }
+        Mock ssh-add -ModuleName 'IMPACT_Docker_GUI' { $global:LASTEXITCODE = 0 }
+
+        { Ensure-SshAgentRunning -SshKeyPath $script:agentKey } | Should -Not -Throw
+
+        Should -Invoke ssh-add -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly
+        Should -Invoke Start-Service -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly
     }
 }
 
@@ -478,20 +645,73 @@ Describe 'Ensure-Prerequisites in NonInteractive mode' -Tag Integration {
 #  Write-Log (verify no crashes under various levels)
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Write-Log' -Tag Integration {
-    It 'Writes Info level without error' {
-        { Write-Log 'Test info message' 'Info' } | Should -Not -Throw
+    # (F109) The old tests only checked "does not throw", which also passes when nothing
+    # is logged at all. They now point the module's log file at a temp file and check what
+    # arrives there and on the console.
+    # Documented behaviour: every level, Debug included, is written to the log FILE;
+    # Debug lines appear on the CONSOLE only when Debug Mode is switched on.
+    BeforeAll {
+        $script:wlFile = Join-Path ([System.IO.Path]::GetTempPath()) "impact_writelog_$([guid]::NewGuid().ToString('N').Substring(0,8)).log"
+        # Remember the module's own log settings and restore them in AfterAll, so the
+        # other tests keep logging as before.
+        $script:wlSaved = InModuleScope 'IMPACT_Docker_GUI' { @{ LogFile = $script:LogFile; LogInit = $script:LogInit; Debug = $script:GlobalDebugFlag } }
+        InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ File = $script:wlFile } {
+            param($File)
+            $script:LogFile = $File
+            $script:LogInit = $true   # skip Initialize-Logging: it would pick the default log path
+        }
+    }
+    AfterAll {
+        InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ Saved = $script:wlSaved } {
+            param($Saved)
+            $script:LogFile = $Saved.LogFile
+            $script:LogInit = $Saved.LogInit
+            $script:GlobalDebugFlag = $Saved.Debug
+        }
+        Remove-Item -LiteralPath $script:wlFile -Force -ErrorAction SilentlyContinue
     }
 
-    It 'Writes Warn level without error' {
-        { Write-Log 'Test warn message' 'Warn' } | Should -Not -Throw
+    BeforeEach {
+        Mock Write-Host -ModuleName 'IMPACT_Docker_GUI' { }
     }
 
-    It 'Writes Error level without error' {
-        { Write-Log 'Test error message' 'Error' } | Should -Not -Throw
+    It 'Writes Info, Warn and Error lines with their level to the log file and the console' {
+        $tag = [guid]::NewGuid().ToString('N')
+        Write-Log "info-$tag" 'Info'
+        Write-Log "warn-$tag" 'Warn'
+        Write-Log "error-$tag" 'Error'
+
+        $content = Get-Content -LiteralPath $script:wlFile -Raw
+        $content | Should -Match "\[Info\] info-$tag"
+        $content | Should -Match "\[Warn\] warn-$tag"
+        $content | Should -Match "\[Error\] error-$tag"
+        Should -Invoke Write-Host -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly -ParameterFilter { "$Object" -eq "[INFO]  info-$tag" }
+        Should -Invoke Write-Host -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly -ParameterFilter { "$Object" -eq "[WARN]  warn-$tag" }
+        Should -Invoke Write-Host -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly -ParameterFilter { "$Object" -eq "[ERROR] error-$tag" }
     }
 
-    It 'Writes Debug level without error (suppressed when debug off)' {
-        { Write-Log 'Test debug message' 'Debug' } | Should -Not -Throw
+    It 'Writes Debug lines to the file but not to the console when Debug Mode is off' {
+        InModuleScope 'IMPACT_Docker_GUI' { $script:GlobalDebugFlag = $false }
+        $tag = [guid]::NewGuid().ToString('N')
+        Write-Log "debug-$tag" 'Debug'
+
+        Get-Content -LiteralPath $script:wlFile -Raw | Should -Match "\[Debug\] debug-$tag"
+        Should -Invoke Write-Host -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly -ParameterFilter { "$Object" -like "*debug-$tag*" }
+    }
+
+    It 'Shows Debug lines on the console when Debug Mode is on' {
+        InModuleScope 'IMPACT_Docker_GUI' { $script:GlobalDebugFlag = $true }
+        try {
+            $tag = [guid]::NewGuid().ToString('N')
+            Write-Log "debug-$tag" 'Debug'
+            Should -Invoke Write-Host -ModuleName 'IMPACT_Docker_GUI' -Times 1 -Exactly -ParameterFilter { "$Object" -eq "[DEBUG] debug-$tag" }
+        } finally {
+            InModuleScope 'IMPACT_Docker_GUI' { $script:GlobalDebugFlag = $false }
+        }
+    }
+
+    It 'Rejects an unknown level instead of logging it silently' {
+        { Write-Log 'x' 'Verbose' } | Should -Throw
     }
 }
 
@@ -882,6 +1102,22 @@ Describe 'Test-RemoteSSHKeyFiles (mocked SSH)' -Tag Integration {
 #  Start-DockerDesktopIfNeeded (mocked)
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Start-DockerDesktopIfNeeded (mocked)' -Tag Integration {
+    # Start-Service only exists on Windows and docker only where it is installed. Pester
+    # can only mock existing commands, so add stand-ins where they are missing (they are
+    # always mocked below and removed again in AfterAll).
+    BeforeAll {
+        $script:ddStubs = @()
+        foreach ($name in 'Start-Service', 'docker') {
+            if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
+                Set-Item -Path "Function:\global:$name" -Value ([scriptblock]::Create("throw '$name stub called without a mock'"))
+                $script:ddStubs += $name
+            }
+        }
+    }
+    AfterAll {
+        foreach ($name in $script:ddStubs) { Remove-Item "Function:\$name" -ErrorAction SilentlyContinue }
+    }
+
     It 'Returns true immediately when Docker daemon is already running' {
         Mock docker {
             # Simulate "docker info" succeeding

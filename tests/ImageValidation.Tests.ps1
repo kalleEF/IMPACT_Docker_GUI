@@ -204,10 +204,14 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
         # The SSH part is the exact command the GUI runs in production, so this
         # suite exercises the real key / known_hosts setup.
         $fixCmd = "chown -R 1000:1000 /home/rstudio/$($script:REPO_NAME) && " + (Get-ContainerSshSetupCommand -UserName $script:TEST_USER)
-        $fixArgs = @('exec', $script:CONTAINER_NAME, 'sh', '-c', $fixCmd)
+        # '--user root' as in production (the GUI runs this step as root explicitly).
+        $fixArgs = @('exec', '--user', 'root', $script:CONTAINER_NAME, 'sh', '-c', $fixCmd)
         $fixOut = docker @fixArgs 2>&1
-        if (($fixOut -join '') -notmatch 'KEY_FIXED') {
-            Write-Host "[ImageVal][Diag] SSH key fix may have failed: $($fixOut -join ' ')" -ForegroundColor Yellow
+        # (F74) Kept for its own test below. Before, a missing KEY_FIXED only printed a
+        # console warning, so a broken setup command did not fail any test.
+        $script:KeySetupOutput = ($fixOut | ForEach-Object { "$_" }) -join "`n"
+        if ($script:KeySetupOutput -notmatch 'KEY_FIXED') {
+            Write-Host "[ImageVal][Diag] SSH key fix may have failed: $($script:KeySetupOutput)" -ForegroundColor Yellow
         }
 
         # ── 8. Wait for RStudio Server ──────────────────────────────────────
@@ -368,11 +372,51 @@ tryCatch({
         ($r.Output -join '').Trim() | Should -Be '600'
     }
 
+    It 'The production SSH setup command finished inside the container (KEY_FIXED)' {
+        if (-not (Assert-PreflightPassed)) { return }
+        $script:KeySetupOutput | Should -Match 'KEY_FIXED' -Because 'Get-ContainerSshSetupCommand must run to the end inside the container'
+    }
+
     It 'Known hosts file contains github.com' {
         if (-not (Assert-PreflightPassed)) { return }
+        # ssh-keygen -F parses the file like ssh does; a plain text search would also
+        # accept a broken or commented-out line.
         $r = Invoke-DockerExecSafe -ContainerName $script:CONTAINER_NAME -User 'rstudio' `
-            -Command @('cat', '/home/rstudio/.ssh/known_hosts')
-        ($r.Output -join "`n") | Should -Match 'github\.com'
+            -Command @('ssh-keygen', '-F', 'github.com', '-f', '/home/rstudio/.ssh/known_hosts')
+        $r.ExitCode | Should -Be 0 -Because "github.com must be listed in rstudio's known_hosts. Output: $($r.Output -join ' ')"
+    }
+
+    # (F74) Works without a GitHub token: GitHub checks its host key BEFORE it looks at
+    # the user's key. With StrictHostKeyChecking=yes (not the accept-new of
+    # GIT_SSH_COMMAND) ssh refuses to continue unless the setup command really stored
+    # github.com's host key, so "Permission denied (publickey)" (key not registered) or
+    # "successfully authenticated" (token run) both prove the host key was verified.
+    It 'github.com host key is verified before authentication (no token needed)' {
+        if (-not (Assert-PreflightPassed)) { return }
+        $r = Invoke-DockerExecSafe -ContainerName $script:CONTAINER_NAME -User 'rstudio' `
+            -Command @('ssh',
+                '-i', "/home/rstudio/.ssh/id_ed25519_$($script:TEST_USER)",
+                '-o', 'IdentitiesOnly=yes',
+                '-o', 'UserKnownHostsFile=/home/rstudio/.ssh/known_hosts',
+                '-o', 'StrictHostKeyChecking=yes',
+                '-o', 'BatchMode=yes',
+                '-o', 'ConnectTimeout=15',
+                '-T', 'git@github.com')
+        $text = $r.Output -join "`n"
+        $text | Should -Not -Match 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED'
+        $text | Should -Match 'Permission denied \(publickey\)|successfully authenticated'
+    }
+
+    # (F87) RStudio's R sessions (rsession) do NOT inherit the container environment the
+    # way 'docker exec' does; they only see variables written to R's Renviron.site.
+    # A login shell started with 'su -' also starts with a clean environment, so an R
+    # process started from it sees GIT_SSH_COMMAND only through that same route, just
+    # like the Git pane and the Terminal in RStudio.
+    It 'GIT_SSH_COMMAND reaches an R session started with a clean environment (as in RStudio)' {
+        if (-not (Assert-PreflightPassed)) { return }
+        $r = Invoke-DockerExecSafe -ContainerName $script:CONTAINER_NAME `
+            -Command @('su', '-', 'rstudio', '-c', 'Rscript -e "cat(Sys.getenv(''GIT_SSH_COMMAND''))"')
+        ($r.Output -join '') | Should -Match "id_ed25519_$($script:TEST_USER)" -Because 'without it, Pull/Push in the RStudio Git pane cannot find the IMPACT key'
     }
 
     It 'GIT_SSH_COMMAND environment variable is set correctly' {
