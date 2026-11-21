@@ -2038,3 +2038,134 @@ Describe 'Get-GitPushFailureHint for a detached HEAD' -Tag Unit {
         $hint | Should -Not -Match 'Switch to a branch'
     }
 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  C2: port box input, repository label, network folders, safe shell quoting
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Test-PortValue with non-ASCII digits (B6a-R4)' -Tag Unit {
+    It 'Rejects full-width digits without throwing' {
+        # U+FF18 U+FF17 U+FF18 U+FF17 = full-width '8787', as typed with an IME.
+        $fullWidth = -join ([char[]](0xFF18, 0xFF17, 0xFF18, 0xFF17))
+        { Test-PortValue -Port $fullWidth } | Should -Not -Throw
+        $r = Test-PortValue -Port $fullWidth
+        $r.Valid | Should -BeFalse
+        $r.ErrorMessage | Should -Be 'Port must be a number.'
+    }
+
+    It 'Rejects Arabic-Indic digits without throwing' {
+        $arabic = -join ([char[]](0x0668, 0x0667, 0x0668, 0x0667))
+        { Test-PortValue -Port $arabic } | Should -Not -Throw
+        (Test-PortValue -Port $arabic).Valid | Should -BeFalse
+    }
+
+    It 'Still accepts a normal port in the range' {
+        (Test-PortValue -Port '8790').Valid | Should -BeTrue
+    }
+}
+
+Describe 'Repository folder label impact.repo_path (F84)' -Tag Unit {
+    It 'Get-ImpactContainerLabelArgs adds the label when -RepoPath is given' {
+        $l = Get-ImpactContainerLabelArgs -UseVolumes $false -OutputDir '/o' -SynthpopDir '/s' -RepoPath 'C:\Users\Max Mustermann\IMPACTncd_Germany'
+        $l | Should -Contain 'impact.repo_path=C:\Users\Max Mustermann\IMPACTncd_Germany'
+        # every value is still preceded by --label
+        for ($i = 0; $i -lt $l.Count; $i += 2) { $l[$i] | Should -Be '--label' }
+    }
+
+    It 'Get-ImpactContainerLabelArgs leaves the label out without -RepoPath (older callers)' {
+        $l = Get-ImpactContainerLabelArgs -UseVolumes $false
+        ($l -join ' ') | Should -Not -Match 'impact\.repo_path'
+    }
+
+    It 'Build-DockerRunCommand records the project root and keeps the image name last' {
+        $state = New-TestSessionState -UserName 'alice'
+        $a = Build-DockerRunCommand -State $state -ImageName 'img' -ProjectRoot 'C:\r\IMPACTncd_Germany' -OutputDir 'C:\r\o' -SynthpopDir 'C:\r\s' -SshKeyPath 'C:\k'
+        $a | Should -Contain 'impact.repo_path=C:\r\IMPACTncd_Germany'
+        $a[-1] | Should -Be 'img'
+    }
+}
+
+Describe 'Test-AndCreateDirectory: network folders and remote quoting (F36, B4-R6, B4-R7)' -Tag Unit {
+    BeforeAll {
+        # Same ssh stub as in the other Test-AndCreateDirectory tests, for machines without ssh.
+        $script:c2DirSshStubAdded = $false
+        if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+            function global:ssh { throw 'ssh stub: this call should have been mocked' }
+            $script:c2DirSshStubAdded = $true
+        }
+    }
+
+    AfterAll {
+        if ($script:c2DirSshStubAdded) { Remove-Item -Path Function:\ssh -ErrorAction SilentlyContinue }
+    }
+
+    It 'Reports NetworkPathInLocalMode for a UNC path in the //server/share form Get-YamlPathValue returns' {
+        $why = $null
+        Test-AndCreateDirectory -State (New-TestSessionState -Location 'LOCAL') -Path '//fileserver/share/outputs' -PathKey 'output_dir' -Reason ([ref]$why) | Should -BeFalse
+        # Not 'PosixPathInLocalMode': that message would wrongly advise a Windows path.
+        $why | Should -Be 'NetworkPathInLocalMode'
+    }
+
+    It 'Reports NetworkPathInLocalMode for a UNC path with backslashes' {
+        $why = $null
+        Test-AndCreateDirectory -State (New-TestSessionState -Location 'LOCAL') -Path '\\fileserver\share\outputs' -PathKey 'output_dir' -Reason ([ref]$why) | Should -BeFalse
+        $why | Should -Be 'NetworkPathInLocalMode'
+    }
+
+    It 'Accepts a normal local folder, also one with [ ] in its name' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) "impact_c2 [v2] $([guid]::NewGuid().ToString('N').Substring(0,6))"
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        try {
+            Test-AndCreateDirectory -State (New-TestSessionState -Location 'LOCAL') -Path $dir -PathKey 'output_dir' | Should -BeTrue
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Does not apply the network check in REMOTE mode' {
+        Mock ssh { 'EXISTS' } -ModuleName 'IMPACT_Docker_GUI'
+        Test-AndCreateDirectory -State (New-TestSessionState -Location 'REMOTE@10.0.0.5') -Path '//data/outputs' -PathKey 'output_dir' | Should -BeTrue
+    }
+
+    It 'Quotes a remote path that contains a single quote safely for the shell' {
+        $script:c2LastSshCmd = $null
+        Mock ssh { $script:c2LastSshCmd = $args[-1]; 'EXISTS' } -ModuleName 'IMPACT_Docker_GUI'
+        Test-AndCreateDirectory -State (New-TestSessionState -Location 'REMOTE@10.0.0.5') -Path "/mnt/it's/out" -PathKey 'output_dir' | Should -BeTrue
+        $script:c2LastSshCmd | Should -BeExactly "test -d '/mnt/it'\''s/out' && echo EXISTS || echo MISSING"
+    }
+}
+
+Describe 'Get-YamlPathValue: brackets and quotes in paths (B2-R3, B4-R7)' -Tag Unit {
+    BeforeAll {
+        $script:c2YamlSshStubAdded = $false
+        if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+            function global:ssh { throw 'ssh stub: this call should have been mocked' }
+            $script:c2YamlSshStubAdded = $true
+        }
+    }
+
+    AfterAll {
+        if ($script:c2YamlSshStubAdded) { Remove-Item -Path Function:\ssh -ErrorAction SilentlyContinue }
+    }
+
+    It 'Reads a local YAML file in a folder whose name contains [ ]' {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) "impact_c2 [v2] $([guid]::NewGuid().ToString('N').Substring(0,6))"
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        try {
+            $yaml = Join-Path $dir 'sim_design_local.yaml'
+            Set-Content -LiteralPath $yaml -Value "output_dir: ./outputs`nsynthpop_dir: ./inputs/synthpop"
+            $v = Get-YamlPathValue -State (New-TestSessionState -Location 'LOCAL') -YamlPath $yaml -Key 'synthpop_dir' -BaseDir ($dir -replace '\\', '/')
+            $v | Should -Not -BeNullOrEmpty
+            $v | Should -BeLike '*inputs/synthpop'
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Quotes a remote YAML path that contains a single quote safely for the shell' {
+        $script:c2YamlCmd = $null
+        Mock ssh { $script:c2YamlCmd = $args[-1]; return 'output_dir: /mnt/out' } -ModuleName 'IMPACT_Docker_GUI'
+        $v = Get-YamlPathValue -State (New-TestSessionState -Location 'REMOTE@10.0.0.1') -YamlPath "/home/u/it's/sim_design.yaml" -Key 'output_dir' -BaseDir '/home/u'
+        $v | Should -Be '/mnt/out'
+        $script:c2YamlCmd | Should -BeExactly "if [ -f '/home/u/it'\''s/sim_design.yaml' ]; then cat '/home/u/it'\''s/sim_design.yaml'; else echo __IMPACT_YAML_MISSING__; fi"
+    }
+}
