@@ -510,6 +510,12 @@ function Write-RemoteContainerMetadata {
     # workstation uses the same Unix account, so a file in /tmp is readable by all
     # colleagues. When the GUI is reopened, the password is read back from the
     # running container itself (Get-ContainerRuntimeInfo), so it is not needed here.
+    # The file still gets a "password" key, but its value is always empty (''). This
+    # stores no secret. The key is there only for OLDER IMPACT versions: they read
+    # '$meta.password' under StrictMode, which throws when the key is missing, so an
+    # older version that reconnected to a container started by this version used to
+    # stop with a fatal error. With an empty value it reads the password from the
+    # container instead. This version never reads the password from this file.
     param(
         [pscustomobject]$State,
         [string]$Port,
@@ -527,6 +533,9 @@ function Write-RemoteContainerMetadata {
         port      = $Port
         useVolumes= $UseVolumes
         timestamp = (Get-Date).ToString('s')
+        # Always empty, see the comment at the top of this function. The clean-up below
+        # only changes non-empty passwords, so it leaves this value alone.
+        password  = ''
     } | ConvertTo-Json -Compress
     Write-Log ("Metadata payload: container={0} repo={1} port={2} useVolumes={3}" -f $State.ContainerName, $State.SelectedRepo, $Port, $UseVolumes) 'Debug'
     $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload))
@@ -1543,9 +1552,15 @@ function Invoke-GitPushWithImpactKey {
 
     if ($IsRemote) {
         # The user name becomes part of a file name in a shell command below, so we
-        # only accept what GitHub allows in user names (letters, digits, hyphens).
+        # only accept letters, digits, hyphens and underscores. This is the same rule
+        # as the username check in the first dialog (Resolve-GitHubUsernameInput).
+        # Underscores must be allowed here too: company-managed GitHub accounts
+        # (for example 'jdoe_acme') use them, and before this change such a user
+        # could log in, but every push from the workstation was refused here.
+        # An underscore is not a special character for the shell, so the key path
+        # '~/.ssh/id_ed25519_<user>' stays safe.
         $user = [string]$State.UserName
-        if ($user -notmatch '^[A-Za-z0-9][A-Za-z0-9-]*$') {
+        if ($user -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]*$') {
             return [pscustomobject]@{ Success = $false; Output = "fatal: '$user' is not a valid GitHub user name, so the IMPACT key cannot be found." }
         }
         # The key lives in the shared account's ~/.ssh on the workstation. The ssh
@@ -1707,10 +1722,14 @@ function Invoke-GitChangeDetection {
             # shared workstation account's identity (or failed with "Author identity
             # unknown"), and a local commit depended on Windows git being configured.
             # 'git -c' applies it to this one command and changes no config file.
-            # GitHub user names only contain letters, digits and hyphens; we check that
-            # before the name goes into a command line.
+            # We check the name before it goes into a command line: only letters,
+            # digits, hyphens and underscores. This is the same rule as the username
+            # check in the first dialog (Resolve-GitHubUsernameInput), which allows
+            # underscores because company-managed GitHub accounts use them. With the
+            # older rule (no underscores) such a user's commit silently lost the
+            # IMPACT identity. An underscore is not a special character for the shell.
             $gitUser = [string]$State.UserName
-            $useIdentity = $gitUser -match '^[A-Za-z0-9][A-Za-z0-9-]*$'
+            $useIdentity = $gitUser -match '^[A-Za-z0-9][A-Za-z0-9_-]*$'
             if (-not $useIdentity) { Write-Log "'$gitUser' is not a valid GitHub user name; committing with git's own identity settings." 'Warn' }
             $gitEmail = "$gitUser@users.noreply.github.com"
             $nothingToCommit = $false
@@ -2109,7 +2128,8 @@ function Resolve-GitHubUsernameInput {
     # This check also keeps characters such as ? # / $ or quotes out of the file paths,
     # container names and shell commands that are built from the username later on.
     if ($name -notmatch '^[a-z0-9][a-z0-9_-]{0,38}$') {
-        return [pscustomobject]@{ UserName = $null; Problem = "'$name' is not a valid GitHub username. GitHub usernames contain only letters, digits and hyphens (at most 39 characters)." }
+        # The message names underscores too, because the check above accepts them.
+        return [pscustomobject]@{ UserName = $null; Problem = "'$name' is not a valid GitHub username. GitHub usernames contain only letters, digits, hyphens and underscores (at most 39 characters)." }
     }
     return [pscustomobject]@{ UserName = $name; Problem = $null }
 }

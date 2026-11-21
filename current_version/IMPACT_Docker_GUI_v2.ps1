@@ -99,7 +99,11 @@ function Ensure-RemotePreparation {
             return $false
         }
         if ($probeFailure -eq 'HostKeyChanged') {
-            $msg = "The workstation at $remoteIp identified itself with a different SSH host key than the one this PC remembers.`n`nThis is expected after the workstation was reinstalled, but it can also mean that the connection is being intercepted. For your safety IMPACT will not send your password.`n`nAsk the workstation admin whether the workstation was reinstalled. If it was, run this command in PowerShell and then start IMPACT again:`n  ssh-keygen -R $remoteIp`n`nIf IMPACT asked you for the workstation password before (it then used the Posh-SSH module), also run:`n  Remove-SSHTrustedHost -HostName $remoteIp`n(older Posh-SSH versions: Remove-SSHTrustedHost -SSHHost $remoteIp)"
+            $msg = "The workstation at $remoteIp identified itself with a different SSH host key than the one this PC remembers.`n`nThis is expected after the workstation was reinstalled, but it can also mean that the connection is being intercepted. For your safety IMPACT will not send your password.`n`nAsk the workstation admin whether the workstation was reinstalled. If it was, run this command in PowerShell and then start IMPACT again:`n  ssh-keygen -R $remoteIp`n`nIf IMPACT asked you for the workstation password before (it then used the Posh-SSH module), also run this command in PowerShell 7 (pwsh):`n  Remove-SSHTrustedHost -HostName $remoteIp`n(older Posh-SSH versions: Remove-SSHTrustedHost -SSHHost $remoteIp)"
+            # 'PowerShell 7 (pwsh)': IMPACT installs Posh-SSH from PowerShell 7 into its own
+            # module folder. The older Windows PowerShell 5.1, which opens when people type
+            # "PowerShell" in the Start menu, does not look in that folder, so there
+            # Remove-SSHTrustedHost is "not recognized". ssh-keygen works in either one.
             # The second form is for Posh-SSH 2.x, which names the parameter -SSHHost
             # (-HostName exists only from 3.x on); the Posh-SSH message further down lists
             # both forms the same way.
@@ -348,7 +352,10 @@ echo SSH_KEY_COPIED
         if (-not $keyAuthorized -and $poshSshUsed) {
             $poshFailure = Get-SshFailureKind -Output $poshSshErrorText
             if ($poshSshHostKeyRejected) {
-                $msg = "Posh-SSH did not accept the identity (SSH host key) of the workstation at $remoteIp. This usually means the workstation was reinstalled, but it can also mean that the connection is being intercepted. For your safety IMPACT did not log in.`n`nAsk the workstation admin whether the workstation was reinstalled. If it was, run this command in PowerShell and then start IMPACT again:`n  Remove-SSHTrustedHost -HostName $remoteIp`n(older Posh-SSH versions: Remove-SSHTrustedHost -SSHHost $remoteIp)`n`nDetails: $poshSshErrorText"
+                $msg = "Posh-SSH did not accept the identity (SSH host key) of the workstation at $remoteIp. This usually means the workstation was reinstalled, but it can also mean that the connection is being intercepted. For your safety IMPACT did not log in.`n`nAsk the workstation admin whether the workstation was reinstalled. If it was, run this command in PowerShell 7 (pwsh) and then start IMPACT again:`n  Remove-SSHTrustedHost -HostName $remoteIp`n(older Posh-SSH versions: Remove-SSHTrustedHost -SSHHost $remoteIp)`n`nDetails: $poshSshErrorText"
+                # 'PowerShell 7 (pwsh)': Posh-SSH was installed from PowerShell 7, and the older
+                # Windows PowerShell 5.1 does not find modules installed there (see the
+                # 'Workstation identity changed' message near the top of this function).
                 Write-Log $msg 'Error'
                 [System.Windows.Forms.MessageBox]::Show($msg, 'Workstation identity changed', 'OK', 'Warning') | Out-Null
                 return $false
@@ -1421,8 +1428,13 @@ function Get-ContainerStatus {
     # container name, so '_jo' also matched '..._john' (a colleague's container on the
     # shared workstation) and caused a false "Other containers are running" warning.
     # The trailing '$' anchors it to the END of the name ("<repo>_<user>"); Escape makes
-    # the user name match literally. GitHub user names cannot contain '_', so
-    # '_<user>' at the end can only be this user's own containers.
+    # the user name match literally.
+    # Note: user names may contain '_' (company-managed GitHub accounts such as
+    # 'jdoe_acme' use it, and Resolve-GitHubUsernameInput accepts it). So '_<user>'
+    # at the end can also match a colleague whose user name ends in '_<user>': for
+    # user 'acme' the filter also finds 'IMPACTncd_Germany_jdoe_acme'. This only
+    # matters for the "Other containers are running" question at Start (the running
+    # check below uses the exact container name), so we accept it.
     $pattern = "_$([regex]::Escape([string]$State.UserName))$"
     # Use raw format (no table header/padding) so parsing stays reliable
     $psAll = $ctxArgs + @('ps','-a','--filter',"name=$pattern",'--format','{{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}')
@@ -1490,8 +1502,17 @@ function Get-ContainerStatus {
                 } else {
                     $rmError = (($rmOutput | ForEach-Object { "$_" }) -join "`n").Trim()
                     Write-Log "Could not remove container '$($State.ContainerName)': $rmError" 'Warn'
+                    # The advice depends on where the container is. A LOCAL container is in
+                    # Docker Desktop on this PC, so its Containers list shows it. A REMOTE
+                    # container is on the workstation's Docker Engine, which Docker Desktop
+                    # on this PC does not show, so the workstation admin has to remove it.
+                    $removeHint = if ($State.ContainerLocation -eq 'LOCAL') {
+                        'You can remove it in Docker Desktop (Containers list) and then click Start.'
+                    } else {
+                        "Ask the workstation admin to remove it (docker rm $($State.ContainerName)) and then click Start."
+                    }
                     [System.Windows.Forms.MessageBox]::Show(
-                        "The old container could not be removed.`n`nDocker said:`n$rmError`n`nYou can remove it in Docker Desktop (Containers list) and then click Start.",
+                        "The old container could not be removed.`n`nDocker said:`n$rmError`n`n$removeHint",
                         'Remove Failed', 'OK', 'Warning') | Out-Null
                 }
             } else {
@@ -1845,7 +1866,7 @@ function Show-ContainerManager {
         $portDisplay = if ($State.Metadata.ActivePort) { $State.Metadata.ActivePort } elseif ($State.Metadata.Recovered.Port) { ($State.Metadata.Recovered.Port -split '\s+')[0] } else { '8787' }
         $hostDisplay = if ($State.ContainerLocation -eq 'LOCAL') { "http://localhost:$portDisplay" } else { "http://$($State.RemoteHostIp):$portDisplay" }
 
-        # Status indicator — large and prominent
+        # Status indicator - large and prominent
         $info.SelectionFont = New-Object System.Drawing.Font('Segoe UI Semibold',11,[System.Drawing.FontStyle]::Bold)
         if ($Status -eq 'RUNNING') {
             $info.SelectionColor = $palette.Success
@@ -2045,6 +2066,9 @@ function Show-ContainerManager {
 
         # This user's other running containers, from the fresh 'docker ps' above (names end
         # with "_<user>", see Get-ContainerStatus). @() keeps .Count safe under StrictMode.
+        # Because user names may contain '_', this can also list a colleague whose user
+        # name ends in "_<user>" (see the note in Get-ContainerStatus). It is only a
+        # question, so the user can answer Yes and go on.
         $userSuffix = "_$($State.UserName)"
         $otherRunning = @($runningNow | Where-Object { $_ -ne $State.ContainerName -and $_.EndsWith($userSuffix, [System.StringComparison]::OrdinalIgnoreCase) })
         if ($otherRunning.Count -gt 0) {
@@ -2416,7 +2440,20 @@ function Show-ContainerManager {
                     Set-ManagerBusy -Busy $true -Message 'Fallback: building the prerequisite image. Progress: see the console window.'
                     $prereqDockerfile = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup 'Dockerfile.prerequisite.IMPACTncdGER' } else { "$dockerSetup/Dockerfile.prerequisite.IMPACTncdGER" }
                     $prereqContext = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup '.' } else { "$dockerSetup" }
-                    $preSuccess = Invoke-StartImageBuild -Dockerfile $prereqDockerfile -Tag "$imageName-prerequisite" -Context $prereqContext -WithRepoArg $false
+                    # The name (tag) of the prerequisite image. The main Dockerfile of the model
+                    # repository (docker_setup/Dockerfile.IMPACTncdGER) starts with the line
+                    #     FROM kalleef/prerequisite.impactncdger:latest
+                    # 'docker build' uses a LOCAL image of exactly that name when one exists. So the
+                    # prerequisite image must be built under that same name; only then does the
+                    # second main build below use the image we just built. It used to be tagged
+                    # '<image>-prerequisite', a name the main Dockerfile never uses, so the second
+                    # main build ran on the same (broken or missing) base image as the build that
+                    # had just failed, and the user waited another 30-60 minutes for nothing.
+                    # Keep this name in sync with the FROM line of Dockerfile.IMPACTncdGER.
+                    # On the workstation this local image is shared by the whole account, so
+                    # colleagues' later builds also use it (until someone pulls that name again).
+                    $prereqTag = 'kalleef/prerequisite.impactncdger:latest'
+                    $preSuccess = Invoke-StartImageBuild -Dockerfile $prereqDockerfile -Tag $prereqTag -Context $prereqContext -WithRepoArg $false
 
                     if (-not $preSuccess) {
                         [System.Windows.Forms.MessageBox]::Show('Docker build failed (including prerequisite fallback).','Build failed','OK','Error') | Out-Null
@@ -3070,18 +3107,19 @@ function Show-ImpactUnexpectedError {
 # Coordinator: orchestrates all steps with clear sequencing and early validation.
 function Invoke-ImpactGui {
     Write-Log 'Starting IMPACT Docker GUI workflow.' 'Info'
-    try {
-        Ensure-PowerShell7 -PS7RequestedFlag:$PS7Requested.IsPresent
-    } catch {
-        # B6a-R2: Ensure-PowerShell7 shows its own clear message box (PowerShell too old, or
-        # missing) right before each of these deliberate stops. Mark the error as "the user
-        # has already been told", so the fatal-error handler at the bottom of this script
-        # does not show a second, confusing box. Other, unexpected errors are not marked.
-        if ($_.Exception.Message -match 'PowerShell 7|relaunch under pwsh') {
-            try { $_.Exception.Data['ImpactUserNotified'] = $true } catch { }
-        }
-        throw
-    }
+    # B6a-R2: Ensure-PowerShell7 shows its own clear message box (PowerShell too old, or
+    # missing) right before each of its deliberate stops. It throws the error through
+    # New-ImpactNotifiedException, which marks the error as "the user has already been
+    # told" (Data['ImpactUserNotified']) ONLY when that box was really shown. The
+    # fatal-error handler at the bottom of this script reads that mark: with it, no
+    # second box appears; without it (for example the box could not be shown), the
+    # handler shows its own box or keeps the console open so the user can read the error.
+    # There used to be a try/catch here that set the mark for every error whose text
+    # matched 'PowerShell 7|relaunch under pwsh'. All three of Ensure-PowerShell7's own
+    # messages match that text, so the mark was set even when no box had been shown,
+    # and the window could close with only a console line. The error now simply passes
+    # through unchanged (the mark set by the module stays on it).
+    Ensure-PowerShell7 -PS7RequestedFlag:$PS7Requested.IsPresent
     $state = New-SessionState
 
     $state.Metadata.BuildInfo = Get-BuildInfo
@@ -3092,7 +3130,7 @@ function Invoke-ImpactGui {
     $step = 1
     while ($step -le 6) {
         switch ($step) {
-            1 { # Prerequisites (automated — no back)
+            1 { # Prerequisites (automated - no back)
                 # A failed step sets exit code 1 (see the entry point at the end of this
                 # script), so IMPACT.bat keeps its window open and the user can read the
                 # console messages. Cancel in a dialog still ends normally with exit code 0.
@@ -3102,9 +3140,9 @@ function Invoke-ImpactGui {
             2 { # Credentials dialog
                 $r = Show-CredentialDialog -State $state
                 if ($r -eq 'next') { $step++ }
-                else { return } # cancel or failure — exit
+                else { return } # cancel or failure - exit
             }
-            3 { # SSH key setup (automated — no back)
+            3 { # SSH key setup (automated - no back)
                 if (-not (Ensure-GitKeySetup -State $state)) { $script:ImpactExitCode = 1; return }
                 $step++
             }
@@ -3112,7 +3150,7 @@ function Invoke-ImpactGui {
                 $r = Select-Location -State $state
                 if ($r -eq 'next') { $step++ }
                 elseif ($r -eq 'back') { $step = 2 } # back to credentials
-                else { return } # cancel — exit
+                else { return } # cancel - exit
             }
             5 { # Preparation (local/remote)
                 $prepOk = $false
@@ -3126,7 +3164,7 @@ function Invoke-ImpactGui {
                     return
                 }
                 if ($prepOk) { $step++ }
-                else { $step = 4 } # cancelled/failed — back to location
+                else { $step = 4 } # cancelled/failed - back to location
             }
             6 { # Container manager
                 # F83: discard the returned state object. Uncaptured, PowerShell printed the
@@ -3134,7 +3172,7 @@ function Invoke-ImpactGui {
                 $null = Get-ContainerStatus -State $state
                 $mgr = Show-ContainerManager -State $state
                 if ($mgr -eq 'back') { $step = 4 } # back to location selection
-                else { $step++ } # close — exit loop
+                else { $step++ } # close - exit loop
             }
         }
     }

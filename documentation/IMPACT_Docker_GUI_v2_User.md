@@ -104,12 +104,19 @@ Set-Service ssh-agent -StartupType Automatic
 Start-Service ssh-agent
 ```
 
-As your normal user (no admin):
+As your normal user (no admin), in any PowerShell window:
 
 ```powershell
 ssh-add $HOME\.ssh\id_ed25519_<username>
+```
+
+In **PowerShell 7** (not as admin; Start menu: **PowerShell 7 (x64)**, or type `pwsh` in a Command Prompt window):
+
+```powershell
 Install-Module -Name Posh-SSH -Scope CurrentUser -Force
 ```
+
+IMPACT runs in PowerShell 7 and only finds Posh-SSH when it was installed from PowerShell 7. The older "Windows PowerShell", which opens when you type "PowerShell" in the Start menu, keeps its modules in a different folder.
 
 ### The SSH config entry
 
@@ -159,7 +166,7 @@ Before IMPACT changes a line or a block that you (or an admin) wrote, that is, o
 
 `IMPACT.bat`:
 
-- checks that the IMPACT files are next to it (do **not** copy `IMPACT.bat` alone to the Desktop; use the shortcut instead),
+- checks that the IMPACT files are next to it (`IMPACT.bat` must stay in the IMPACT folder; for a Desktop icon use the shortcut made by `Create-Shortcut.bat`),
 - looks for PowerShell 7 (on PATH, then in `C:\Program Files\PowerShell\7`),
 - explains how to install or update PowerShell 7 if it is missing or older than 7.3,
 - starts the GUI,
@@ -175,7 +182,7 @@ The dialog **Remote Access - IMPACT NCD Germany** asks for two things:
 
 | Field | What to enter | Rules |
 |---|---|---|
-| **GitHub username** | Your GitHub **username**, not your e-mail address. | Spaces are removed and it is changed to lowercase. You may also paste your profile link (`https://github.com/<name>`) or `@name`. Only letters, digits, `-` and `_` (up to 39 characters). |
+| **GitHub username** | Your GitHub **username** (the name on your github.com profile; an e-mail address does not work). | Spaces are removed and it is changed to lowercase. You may also paste your profile link (`https://github.com/<name>`) or `@name`. Only letters, digits, `-` and `_` (up to 39 characters). |
 | **RStudio password** | A **new** password, used to log in to RStudio in your browser. | At least 8 characters, not the same as your username, and not a very common password such as `12345678` or `password`. |
 
 > **Do not use your GitHub password, or any password you use elsewhere.** On the shared workstation, colleagues who use the same account can read the RStudio password of a running container.
@@ -261,12 +268,12 @@ If anything in this step fails or you cancel, IMPACT returns to **Step 4**.
 
 1. **Key login test.** IMPACT tries to log in to the workstation account `php-workstation` with your key.
    - **Workstation not reachable**: check the network or VPN, that the workstation is on and that the IP is right. No password is asked in this case.
-   - **Workstation identity changed**: the workstation presented a different SSH host key than last time. This is normal after a reinstall, but could also mean someone is intercepting the connection, so IMPACT will not send your password. Ask the admin. If the workstation was reinstalled, run `ssh-keygen -R <ip>` in PowerShell and start IMPACT again. If you logged in with the workstation password before, also run `Remove-SSHTrustedHost -HostName <ip>` (older Posh-SSH versions: `Remove-SSHTrustedHost -SSHHost <ip>`); the message shows both commands with the right address.
+   - **Workstation identity changed**: the workstation presented a different SSH host key than last time. This is normal after a reinstall, but could also mean someone is intercepting the connection, so IMPACT will not send your password. Ask the admin. If the workstation was reinstalled, run `ssh-keygen -R <ip>` in PowerShell and start IMPACT again. If you logged in with the workstation password before, also run `Remove-SSHTrustedHost -HostName <ip>` in **PowerShell 7** (Start menu: **PowerShell 7 (x64)**, or type `pwsh` in a Command Prompt window); older Posh-SSH versions use `Remove-SSHTrustedHost -SSHHost <ip>`. The message shows both commands with the right address.
 2. **First time only: password.** If your key is not yet accepted, the window **Enter remote password** asks for the password of `php-workstation@<ip>` (ask the admin). IMPACT uses it once to install your public key on the workstation:
    - It uses the **Posh-SSH** module and offers to install it if it is missing (click **Yes**).
    - **Wrong password**: the message appears and the password window comes back. Cancel stops.
    - **Password login not allowed**: the workstation does not accept password logins at all (the admin switched them off), so typing the password again will not help. Send your **public** key file `C:\Users\<you>\.ssh\id_ed25519_<username>.pub` (safe to share) to the admin and ask them to add it to the `php-workstation` account. Then start IMPACT again.
-   - **Workstation identity changed** can also appear here: Posh-SSH keeps its own list of trusted workstations and refused the workstation's key. The message shows the `Remove-SSHTrustedHost` command to run if the workstation was reinstalled.
+   - **Workstation identity changed** can also appear here: Posh-SSH keeps its own list of trusted workstations and refused the workstation's key. The message shows the `Remove-SSHTrustedHost` command to run in PowerShell 7 if the workstation was reinstalled.
    - PuTTY's `plink.exe` (version 0.77 or newer) is used only if Posh-SSH is not available.
    - Afterwards IMPACT checks that the key login works. If not: **SSH key setup failed** with details; contact the admin.
 3. **Key copy.** IMPACT copies your private key to `~/.ssh/id_ed25519_<username>` in the shared account (needed by git inside the container and for pushing at Stop). See [Your GitHub key on the shared workstation](#your-github-key-on-the-shared-workstation).
@@ -283,7 +290,7 @@ If anything in this step fails or you cancel, IMPACT returns to **Step 4**.
    - Docker installed but not running: IMPACT offers to start it with `sudo systemctl start docker`. Type the sudo password **in the console window** when asked.
    - A warning if `php-workstation` is not in the `docker` group.
 
-> IMPACT never changes your PC's global Docker setting (the active "Docker context"), in local or in remote mode. It tells Docker which engine to use only for its own commands, so your own `docker` commands and other Docker tools keep using your own setting. If an older IMPACT version left the global setting pointing at a workstation, IMPACT resets it to `default`.
+> IMPACT adds the Docker contexts `local` and `remote-<ip>` and uses them only for its own commands, so your own `docker` commands and other Docker tools keep using your active context. One exception: if your active context points at a workstation (its name starts with `remote-`), IMPACT sets it back to `default`. In remote mode it does this only for the context of the selected workstation.
 
 ### Step 6: The Container Manager
 
@@ -350,7 +357,7 @@ IMPACT checks everything that can be checked quickly **before** the long image b
 12. **Image build** (only if the image does not exist yet, or **Rebuild image** is ticked). The window switches to "busy": the buttons are greyed out, the status line says `Building the Docker image (30+ min). Progress: see the console window.`, and you should not close the IMPACT window. Follow the progress in the console window. Because the build runs on the window's own thread, Windows may show the window as "Not Responding". If Windows asks whether to close IMPACT because it is not responding, choose **Wait**. Closing it stops IMPACT in the middle of the build. If the build fails:
     - remote only: IMPACT logs in to Docker with the credentials from `docker_setup/.env` in the repository (if present) and tries once more;
     - then **Image build failed** asks whether to try a fallback: build the prerequisite image (`Dockerfile.prerequisite.IMPACTncdGER`) and then the main image again. This can take another 30 to 60 minutes. **Yes** (the default) starts it, **No** stops.
-    The retries reuse the parts of the image that were already built, so they are faster than the first build. **Build failed** means all attempts failed (or you chose No); see the console output.
+    The login retry and the second build of the main image can reuse parts that were already built. The prerequisite build always starts from scratch, so the fallback still takes a long time. **Build failed** means all attempts failed (or you chose No); see the console output.
 13. **Start**: the window stays "busy" (status line `Starting the container. Please wait...`) until the container runs. In volume mode the volumes are created and your existing files are copied into them (**Volume copy problem** if that reports errors). If the container cannot start, **Container start failed** explains why in plain words, for example "Port 8790 is already in use" or "Port ... is blocked or reserved by Windows. Choose a different port."
 14. **Setup inside the container**: your SSH key is copied to `/home/rstudio/.ssh` (mode 600), GitHub's host keys are stored in `/home/rstudio/.ssh/known_hosts`, and git gets your name, your e-mail and your IMPACT key (see [Step 7](#step-7-open-rstudio)). If part of this fails, **Container setup incomplete** says what will not work (for example git pull from RStudio). If the container stopped right after starting, **Container stopped** appears with the path of the log file; ticking **Rebuild image** often helps.
 15. The status changes to **RUNNING** and the console prints the URL.
@@ -431,7 +438,7 @@ ssh <workstation-ip> "rm -f ~/.ssh/id_ed25519_<username>"
 
 | Option | Mode | Default | What it does |
 |---|---|---|---|
-| **Use Docker Volumes** | Local and remote | Off (ticked when you resume a container that uses volumes, or when volumes from an earlier session still exist) | Keeps `outputs` and `inputs/synthpop` in Docker volumes instead of your folders while the container runs. Your existing files are copied in at Start and the results are copied back at Stop. See [Docker volumes](#docker-volumes-how-results-get-back-to-your-folders). |
+| **Use Docker Volumes** | Local and remote | Off (ticked when you resume a container that uses volumes, or when volumes from an earlier session still exist) | Keeps `outputs` and `inputs/synthpop` in Docker volumes while the container runs. Your existing files are copied in at Start and the results are copied back at Stop. See [Docker volumes](#docker-volumes-how-results-get-back-to-your-folders). |
 | **Rebuild image** | Local and remote | Off | Builds the image again even if it exists. Use after changes to the Dockerfile. The build starts from scratch (without Docker's build cache), so this takes a long time. |
 | **High computational demand** | Remote only | Off | Adds `--cpus 32 -m 384g` (32 CPU cores, 384 GB RAM limit). Greyed out in local mode. |
 | **Show password** | Both | Off | Shows the RStudio password in the info box. |
@@ -452,7 +459,7 @@ IMPACT reads only two lines of the file: `output_dir:` and `synthpop_dir:`.
 
 ## Docker volumes: how results get back to your folders
 
-With **Use Docker Volumes** ticked, the container writes `outputs` and `inputs/synthpop` into two Docker volumes instead of directly into your folders. This avoids permission problems with folders shared from the host.
+With **Use Docker Volumes** ticked, the container writes `outputs` and `inputs/synthpop` into two Docker volumes. This avoids permission problems with folders shared from the host.
 
 - The volumes are named `impactncd_output_<container>` and `impactncd_synthpop_<container>`, for example `impactncd_output_IMPACTncd_Germany_jdoe`. Every repository and user has its own pair.
 - **At Start**, your existing files are copied into new volumes. If that reports errors, **Volume copy problem** asks whether to start anyway.
@@ -514,6 +521,7 @@ After the container is stopped, IMPACT looks at the repository (on your PC in lo
 | **IMPACT - Unexpected error** | Something unexpected went wrong in a window. Try again; if it keeps happening, send the log file named in the message to the maintainer. |
 | **SSH key problem** | Your IMPACT key has a passphrase, or could not be created or read. Follow the steps in the message, then start IMPACT again. |
 | **Add your SSH key to GitHub** | GitHub does not accept your IMPACT key yet. Click **Open GitHub**, add the key (it is already copied), then click **Check again**. See [Step 3](#step-3-your-ssh-key). |
+| **Copy failed** (in a key window) | The key could not be copied to the clipboard. Select the key text in the window and press Ctrl+C. |
 | Console warning that ssh could not use the key file | The key file's permissions are too open. Run the `icacls` command from the warning, or rename both `id_ed25519_<username>` files and start IMPACT again (then add the new key to GitHub). |
 
 ### Username and password
@@ -533,13 +541,14 @@ After the container is stopped, IMPACT looks at the repository (on your PC in lo
 | **Docker Startup Issue** | Start Docker Desktop from the Start menu, wait until it shows that the engine is running, then click Yes and OK. |
 | **Docker Access Denied** | Your account is not in the `docker-users` group. Ask IT to add it, then sign out and back in. |
 | **Docker Not Reachable** | Docker Desktop stopped or is restarting. Wait until it runs and try again. |
+| **Docker Not Available** / **Docker Check Failed** | IMPACT could not run the `docker` program on this PC. Install Docker Desktop, or start it and wait until it shows that the engine is running. Then choose **Local Container** again. |
 
 ### Remote mode and the workstation
 
 | Problem | What to do |
 |---|---|
 | **Workstation not reachable** | Check the VPN/institute network, that the workstation is on and the IP address. |
-| **Workstation identity changed** | Ask the admin whether the workstation was reinstalled. If yes, run the commands shown in the message in PowerShell (`ssh-keygen -R <ip>`, and `Remove-SSHTrustedHost -HostName <ip>` if you logged in with the password before), then start IMPACT again. |
+| **Workstation identity changed** | Ask the admin whether the workstation was reinstalled. If yes, run the commands shown in the message: `ssh-keygen -R <ip>` in PowerShell and, if you logged in with the password before, `Remove-SSHTrustedHost -HostName <ip>` in **PowerShell 7** (Start menu: **PowerShell 7 (x64)**, or type `pwsh` in a Command Prompt window). Then start IMPACT again. |
 | **Wrong password** | Check the workstation password (Caps Lock?). |
 | **Password login not allowed** | The workstation does not accept passwords. Send your public key file `C:\Users\<you>\.ssh\id_ed25519_<username>.pub` to the admin and ask them to add it to the `php-workstation` account. Then start IMPACT again. |
 | **Password bootstrap unavailable** | Posh-SSH could not be installed. Start IMPACT again and click Yes when it offers Posh-SSH; if the PowerShell Gallery is blocked, ask IT to install Posh-SSH or PuTTY 0.77 or newer. |
@@ -548,6 +557,7 @@ After the container is stopped, IMPACT looks at the repository (on your PC in lo
 | **No repositories found** | Ask the admin to clone the repository into `/home/php-workstation/Schreibtisch/Repositories`. |
 | **Unsupported Folder Name** / **Not a Model Repository** (remote) | Ask the admin to rename the folder (letters, digits, `-`, `_`), or choose the model repository (the folder that contains `docker_setup`). |
 | **Docker Permission Denied (Remote)** | The admin must run `sudo usermod -aG docker php-workstation`. |
+| **Docker Daemon Start Failed** | Docker on the workstation could not be started. Ask the admin to run `sudo systemctl start docker` on the workstation, then choose **Remote Container** again. |
 | **SSH problem** (when clicking Start) | Follow the text: usually "check the VPN", or "close IMPACT and start it again" so the remote setup copies your key again. |
 | **Docker not reachable** (when clicking Start, remote) | IMPACT could log in to the workstation, but Docker there did not answer. Check the network or VPN, wait a minute and click Start again. If it keeps failing, ask the admin to check that Docker runs on the workstation. |
 
@@ -566,16 +576,21 @@ After the container is stopped, IMPACT looks at the repository (on your PC in lo
 | **Already running** | Your container already runs (perhaps started from another window or PC). Click **Back** and continue again to connect to it. |
 | **Image build failed** | Read the console output. **Yes** tries the fallback build (another 30 to 60 minutes), **No** stops. |
 | **Build failed** | Read the console output. Common causes: no internet, Docker Hub download limit, disk full. Try again later or contact the maintainer. |
+| **Volume check failed** / **Volume error** | Docker could not check, create, prepare or remove a Docker volume. Check that Docker runs (in remote mode also the network or VPN) and that the disk is not full, then click Start again. |
+| **Copy failed** (at Start) | The results from an earlier session could not be copied out of the Docker volumes, so the container was not started. Nothing was deleted. Do the same as for **Results still in Docker volumes** below: recreate or reconnect the folder named in the message, then click Start and choose Yes in **Earlier results found**. |
 | **Volume helper missing** | Docker could not download the small Alpine Linux image. Untick **Use Docker Volumes** or check the network. |
 | **Container stopped** right after starting | Tick **Rebuild image** and start again; check the log. |
 | **Container setup incomplete** | Stop and start the container again. If git still does not work in RStudio, check that your key is on GitHub. |
-| A stopped container with the same name exists | Answer Yes in **Old Container Found**, or remove it in Docker Desktop. |
+| A stopped container with the same name exists | Answer Yes in **Old Container Found**. Local mode: you can also remove it in Docker Desktop (Containers). Remote mode: ask the admin to run `docker rm <container name>` on the workstation (or run `docker --context remote-<ip> rm <container name>` in PowerShell on your PC). |
+| **Remove Failed** | The old container could not be removed. Local mode: remove it in Docker Desktop (Containers), then click Start. Remote mode: ask the admin to run `docker rm <container name>` on the workstation, then click Start. |
 
 ### Stopping and git
 
 | Problem | What to do |
 |---|---|
 | **Results still in Docker volumes** | Nothing is lost. If the message says that a folder does not exist, create it again (or reconnect its drive). Then click Start and choose Yes in **Earlier results found**, or ask the maintainer and quote the volume names. |
+| **Stop failed** | Docker did not stop the container. Local mode: check that Docker Desktop runs. Remote mode: check the network or VPN. Then click Stop again. |
+| **Git error** | The commit or push stopped with an unexpected error. Read the message and the log file. Your files stay in the repository folder; next time, check the Git pane in RStudio and commit or push what is left. |
 | **Git push failed** | Your commit is saved but not on GitHub. Follow the hint in the message, then push from the Git pane in RStudio. |
 | **Git: unfinished merge** | Start the container, resolve the conflicts in RStudio and commit there. |
 | **Git: not on a branch** | Start the container, click **New Branch** in the RStudio Git pane, then commit and push there. |
@@ -586,7 +601,7 @@ After the container is stopped, IMPACT looks at the repository (on your PC in lo
 | Problem | What to do |
 |---|---|
 | Dialogs open on the wrong monitor | Move the mouse to the monitor you want before the dialog opens; windows open on the monitor with the mouse pointer. |
-| The window says "Not Responding" during a build | Normal: the build runs on the window's thread. Watch the console window; the window comes back when the build is done. If Windows asks whether to close IMPACT because it is not responding, choose **Wait**. Closing it stops IMPACT in the middle of the build. |
+| The window says "Not Responding" during a build or another long step | Normal: the build, the rest of Start, Stop (with copying results back from Docker volumes) and the git check run on the window's thread. Watch the console window; the window comes back when the step is done. If Windows asks whether to close IMPACT because it is not responding, choose **Wait**. Closing it stops IMPACT in the middle of that step. |
 
 ---
 
@@ -605,7 +620,7 @@ C:\Users\<you>\.impact_gui\logs\impact.log
 
 | Variable | Effect |
 |---|---|
-| `IMPACT_LOG_FILE` | Use this file instead of the default log file. |
+| `IMPACT_LOG_FILE` | Path of the log file (default: `C:\Users\<you>\.impact_gui\logs\impact.log`). |
 | `IMPACT_LOG_DISABLE` | `1`, `true` or `yes` switches the log file off. |
 
 When you report a problem, send the log file and the footer line of the Container Manager (Build / Commit / Built).
@@ -619,7 +634,7 @@ When you report a problem, send the log file and the footer line of the Containe
 - **Ports**: every running container needs its own port from 8787 to 8799. IMPACT suggests the next free one, checks again when you click Start (and enters a free port if yours was taken) and once more right before starting. If all are taken, the status line says so and Start shows **No free port**.
 - **Repository folders** in `/home/php-workstation/Schreibtisch/Repositories` are shared by everyone. If someone else's container uses the same folder, **Repository already in use** warns you. Agree with your colleagues who works where.
 - **Session details** (container, repository, user, port, volume mode; no password) are stored in `/tmp/impactncd/<container>.json` on the workstation and removed at Stop. The container itself also carries this information, so you can reconnect after closing IMPACT. Files written by older IMPACT versions may still contain an RStudio password: whenever IMPACT writes or removes its own file, it blanks the password in those older files. The files themselves are kept, because colleagues who still use an older version need their port and volume mode.
-- **Update together**: do not open a running container with an older IMPACT version than the one that started it, because the older version may fail to reconnect to it. Everyone should switch to a new IMPACT version at the same time (see [Known bugs](KNOWN_BUGS.md)).
+- **Update together**: do not stop a running container with an older IMPACT version than the one that started it. Older versions use other names for the Docker volumes, so with **Use Docker Volumes** they do not copy your results back; the results stay in the volumes until the current version offers to copy them at the next Start (**Earlier results found**). Everyone should switch to a new IMPACT version at the same time (see [Known bugs](KNOWN_BUGS.md)).
 - **Keys and passwords**: see [Your GitHub key on the shared workstation](#your-github-key-on-the-shared-workstation).
 
 ---
@@ -635,7 +650,7 @@ When you report a problem, send the log file and the footer line of the Containe
 
 ## Remote workstation setup (for the admin)
 
-The workstation uses **Docker Engine** (not Docker Desktop), so containers can use all of the machine's memory.
+The workstation uses **Docker Engine**, so containers can use all of the machine's memory.
 
 ### One-time setup
 
@@ -664,8 +679,11 @@ The workstation uses **Docker Engine** (not Docker Desktop), so containers can u
 
 - `~/.ssh/authorized_keys`: one public key per colleague (replaced when that colleague's key changes).
 - `~/.ssh/id_ed25519_<username>`: each colleague's **private** key (see [Your GitHub key on the shared workstation](#your-github-key-on-the-shared-workstation)).
+- `~/.ssh/id_ed25519_<username>.pub`: each colleague's public key.
+- Permissions: the home folder is made not writable by others (`chmod go-w`), `~/.ssh` is set to 700 and `~/.ssh/authorized_keys` to 600.
 - `~/.ssh/known_hosts`: created if missing. The github.com entries are compared with GitHub's published key fingerprints; if none of them matches (for example only GitHub's old RSA key is stored), the github.com lines are replaced by freshly scanned keys that match those fingerprints. Other lines are never changed. If host-side pushes still fail with "REMOTE HOST IDENTIFICATION HAS CHANGED" for github.com, run `ssh-keygen -R github.com` once as `php-workstation` and tell the maintainer (GitHub may have changed its keys, and IMPACT then needs the new fingerprints).
 - `/tmp/impactncd/*.json`: session details of running containers (no passwords). In files written by older IMPACT versions, IMPACT blanks the RStudio password but keeps the file.
+- `~/.docker/config.json`: the registry login from `docker_setup/.env`, if a remote build needed one (see step 7).
 
 ---
 
@@ -683,7 +701,7 @@ The workstation uses **Docker Engine** (not Docker Desktop), so containers can u
 | **SSH** | Secure remote login. Used for the workstation and for git with GitHub. |
 | **SSH key** | A key pair: the private key stays secret, the public key goes to GitHub and the workstation. |
 | **known_hosts** | A file with the host keys of servers you have connected to, so SSH can tell if a server suddenly changes. |
-| **Docker context** | A named setting that tells Docker which engine to talk to (your PC or the workstation). IMPACT chooses it only for its own commands and does not change your global setting. |
+| **Docker context** | A named setting that tells Docker which engine to talk to (your PC or the workstation). IMPACT chooses it only for its own commands; it only switches an active `remote-...` context back to `default`. |
 | **sim_design.yaml** | The model's settings file; IMPACT reads `output_dir` and `synthpop_dir` from it. |
 | **rsync** | A file copy program; used to copy results out of the volumes. |
 | **Posh-SSH** | A PowerShell module used for the first password login to the workstation. |

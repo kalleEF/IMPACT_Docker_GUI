@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Pester 5 integration tests for IMPACT Docker GUI.
-    Uses mocks for Docker CLI and SSH — no real containers or remote hosts required.
+    Uses mocks for Docker CLI and SSH - no real containers or remote hosts required.
 
     Run:  pwsh -File tests/Invoke-Tests.ps1 -Tag Integration
 #>
@@ -12,12 +12,35 @@ BeforeAll {
     # system temp folder there instead.
     if (-not $env:TEMP) { $env:TEMP = [System.IO.Path]::GetTempPath() }
 
+    # Point the IMPACT log at a temp file for this whole test file (TS-1). Without this,
+    # every Write-Log call in the tests was appended to the developer's REAL log file
+    # (~/.impact_gui/logs/impact.log, the file users send to the maintainer), and once
+    # that file was larger than 512 KB, Initialize-Logging rotated it and replaced the
+    # real impact.log.1. The old values are saved here and put back in AfterAll below.
+    # It is set before Import-Module, so even the very first log line goes to the temp
+    # file (the module reads IMPACT_LOG_FILE when it writes its first log line). CI calls
+    # Invoke-Pester directly, so this is done here in the test file and not only in the
+    # runner (Invoke-Tests.ps1).
+    $script:savedImpactLogFile = $env:IMPACT_LOG_FILE
+    $script:savedImpactLogDisable = $env:IMPACT_LOG_DISABLE
+    $script:testRunLogFile = Join-Path ([System.IO.Path]::GetTempPath()) "impact_integration_tests_$([guid]::NewGuid().ToString('N').Substring(0,8)).log"
+    $env:IMPACT_LOG_FILE = $script:testRunLogFile
+
     # Import the module under test
     $modulePath = Join-Path $PSScriptRoot '..' 'current_version' 'IMPACT_Docker_GUI.psm1'
     Import-Module $modulePath -Force -DisableNameChecking
 
     # Import test helpers
     . (Join-Path $PSScriptRoot 'Helpers' 'TestSessionState.ps1')
+}
+
+AfterAll {
+    # Put the IMPACT log settings back as they were before this test file (TS-1), and
+    # remove the temp log file (and its rotated copy, if a test made one).
+    $env:IMPACT_LOG_FILE = $script:savedImpactLogFile
+    $env:IMPACT_LOG_DISABLE = $script:savedImpactLogDisable
+    Remove-Item -LiteralPath $script:testRunLogFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "$($script:testRunLogFile).1" -Force -ErrorAction SilentlyContinue
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -138,9 +161,18 @@ Describe 'Ensure-GitKeySetup in NonInteractive mode' -Tag Integration {
         New-Item -ItemType Directory -Path $script:fakeSshDir -Force | Out-Null
 
         Mock Join-Path -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { $Path -eq $HOME -and $ChildPath -eq '.ssh' } { $script:fakeSshDir }
-        Mock Add-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path" }
-        Mock Set-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path" }
+        # Safety net: never touch the real ~/.ssh, whatever the module does.
+        # The filters look at "$Path$LiteralPath" (TS-2): the module writes the ssh config
+        # with -LiteralPath, and a filter on $Path alone never saw those calls, so the
+        # safety net did not fire for exactly the writes it is meant to catch. Only one of
+        # the two parameters is ever given, so joining them gives the path that was used.
+        # Copy-Item (the config backup) is checked on its -Destination, and Remove-Item
+        # (a stray .pub file is deleted) is guarded too.
+        Mock Add-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path$LiteralPath" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path$LiteralPath" }
+        Mock Set-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path$LiteralPath" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path$LiteralPath" }
         Mock New-Item    -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like "$($script:realSshDir)*" } { throw "Test tried to create something in the real SSH folder: $Path" }
+        Mock Copy-Item   -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Destination" -like "$($script:realSshDir)*" } { throw "Test tried to copy a file into the real SSH folder: $Destination" }
+        Mock Remove-Item -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path$LiteralPath" -like "$($script:realSshDir)*" } { throw "Test tried to delete something in the real SSH folder: $Path$LiteralPath" }
 
         Mock Set-Clipboard -ModuleName 'IMPACT_Docker_GUI' { }
         Mock Ensure-SshAgentRunning -ModuleName 'IMPACT_Docker_GUI' { }
@@ -716,7 +748,7 @@ Describe 'Write-Log' -Tag Integration {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Get-GitRepositoryState — local mode (mocked git)
+#  Get-GitRepositoryState - local mode (mocked git)
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Get-GitRepositoryState (local, mocked)' -Tag Integration {
     It 'Returns HasChanges=$true when git status reports changes' {
@@ -785,7 +817,7 @@ Describe 'Get-GitRepositoryState (local, mocked)' -Tag Integration {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Get-GitRepositoryState — remote mode (mocked SSH)
+#  Get-GitRepositoryState - remote mode (mocked SSH)
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Get-GitRepositoryState (remote, mocked SSH)' -Tag Integration {
     It 'Parses combined SSH output into status/branch/remote' {
@@ -840,7 +872,7 @@ Describe 'Get-GitRepositoryState (remote, mocked SSH)' -Tag Integration {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Invoke-GitChangeDetection (mocked — NonInteractive, no dialog)
+#  Invoke-GitChangeDetection (mocked - NonInteractive, no dialog)
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Invoke-GitChangeDetection in NonInteractive mode' -Tag Integration {
     BeforeEach {
@@ -893,7 +925,7 @@ Describe 'Invoke-GitChangeDetection in NonInteractive mode' -Tag Integration {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Remote container metadata (Write / Read / Remove) — mocked SSH
+#  Remote container metadata (Write / Read / Remove) - mocked SSH
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Remote container metadata lifecycle (mocked SSH)' -Tag Integration {
     BeforeAll {
@@ -922,7 +954,9 @@ Describe 'Remote container metadata lifecycle (mocked SSH)' -Tag Integration {
         # The RStudio password must not be stored in the shared /tmp file (F40)
         $b64 = [regex]::Match($lastCmd, 'echo (\S+) \| base64 -d').Groups[1].Value
         $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
-        $json | Should -Not -Match 'password'
+        # The "password" key is present for older IMPACT versions (they read it under
+        # StrictMode), but its value is always empty: no secret is stored (X-2).
+        ($json | ConvertFrom-Json).password | Should -Be ''
         $json | Should -Not -Match 'MetaPass'
     }
 
@@ -1144,7 +1178,7 @@ Describe 'Start-DockerDesktopIfNeeded (mocked)' -Tag Integration {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Show-CredentialDialog — NonInteractive with GitHub username validation
+#  Show-CredentialDialog - NonInteractive with GitHub username validation
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Show-CredentialDialog NonInteractive with GitHub validation' -Tag Integration {
     BeforeEach {
@@ -2099,7 +2133,11 @@ Describe 'Remote metadata: quoting and clean-up of old password files (B3-R6, mo
         $script:c2MetaCmd | Should -Match 'grep -lZE'
     }
 
-    It 'The clean-up blanks only non-empty passwords and keeps every file and all other entries (runs the real shell snippet)' -Skip:(-not (Get-Command sh -ErrorAction SilentlyContinue) -or -not (Get-Command xargs -ErrorAction SilentlyContinue) -or -not (Get-Command sed -ErrorAction SilentlyContinue)) {
+    # Skipped on Windows (X-3): even where Git's Unix tools put 'sh' on PATH, the test
+    # pastes a Windows temp path (C:\Users\...\Temp\...) into the sh command, and sh
+    # drops the backslashes, so the snippet finds no file and the test fails although
+    # the product code is fine. The snippet itself only ever runs on the Linux workstation.
+    It 'The clean-up blanks only non-empty passwords and keeps every file and all other entries (runs the real shell snippet)' -Skip:($IsWindows -or -not (Get-Command sh -ErrorAction SilentlyContinue) -or -not (Get-Command xargs -ErrorAction SilentlyContinue) -or -not (Get-Command sed -ErrorAction SilentlyContinue)) {
         # Why the files must survive: a colleague still on an OLDER version learns the port
         # and the volume mode of a running container only from this file (B3-R6 review).
         $cleanup = InModuleScope 'IMPACT_Docker_GUI' { Get-RemoteMetadataCleanupCommand }
@@ -2180,5 +2218,95 @@ Describe 'Ensure-RemoteDockerLogin quotes the .env path (B6a-R5, mocked SSH)' -T
 
         $script:c3LoginCalls.Count | Should -Be 1
         [string]$script:c3LoginCalls[0][-1] | Should -BeExactly "cat '/srv/it'\''s repo/docker_setup/.env' 2>/dev/null || true"
+    }
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GitHub user names with an underscore (UG-1, TD-3, X-1)
+#  Resolve-GitHubUsernameInput accepts '_' (company-managed GitHub accounts use it,
+#  for example 'jdoe_acme'). The commit and push code used a stricter rule without
+#  '_', so such a user lost the IMPACT identity on commit, and every push from the
+#  workstation was refused. These tests check that all three places use one rule.
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Git commit and push for a GitHub user name with an underscore' -Tag Integration {
+    BeforeAll {
+        # Pester can only mock commands that exist. Without OpenSSH a throw-away global
+        # 'ssh' function stands in; it is removed again in AfterAll.
+        $script:usSshStubAdded = $false
+        if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+            function global:ssh { throw 'ssh stub called without a mock' }
+            $script:usSshStubAdded = $true
+        }
+    }
+    AfterAll {
+        if ($script:usSshStubAdded) { Remove-Item -Path Function:\ssh -ErrorAction SilentlyContinue }
+    }
+    BeforeEach {
+        Enable-NonInteractiveMode
+        $script:usSshCalls = @()
+        $script:usGitCalls = @()
+        # One changed file on 'main' with an upstream, and a commit message with Push ticked.
+        Mock Get-GitRepositoryState {
+            [pscustomobject]@{ HasChanges = $true; StatusText = ' M f.R'; Branch = 'main'; Remote = 'git@github.com:o/r.git'; Ahead = 0; HasUpstream = $true; Conflicts = @(); OperationInProgress = '' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+        Mock Show-GitCommitDialog { @{ Message = 'Update model'; Push = $true } } -ModuleName 'IMPACT_Docker_GUI'
+    }
+    AfterEach {
+        Disable-NonInteractiveMode
+    }
+
+    It 'The username check in the first dialog accepts the name (lowercased)' {
+        $r = InModuleScope 'IMPACT_Docker_GUI' { Resolve-GitHubUsernameInput -InputText 'JDoe_Acme' }
+        $r.UserName | Should -Be 'jdoe_acme'
+        $r.Problem | Should -BeNullOrEmpty
+    }
+
+    It 'The error text for an invalid name mentions underscores too' {
+        $r = InModuleScope 'IMPACT_Docker_GUI' { Resolve-GitHubUsernameInput -InputText 'j.doe' }
+        $r.UserName | Should -BeNullOrEmpty
+        $r.Problem | Should -Match 'hyphens and underscores'
+    }
+
+    It 'Remote: commits with the IMPACT identity and pushes with ~/.ssh/id_ed25519_jdoe_acme' {
+        Mock ssh { $script:usSshCalls += "$($args[-1])"; $global:LASTEXITCODE = 0; 'ok' } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'jdoe_acme' -Location 'REMOTE@10.0.0.5'
+        $result = Invoke-GitChangeDetection -State $state -RepoPath '/home/php-workstation/repo' -IsRemote $true
+        $result.Outcome | Should -Be 'Pushed'
+        $result.Success | Should -BeTrue
+        $script:usSshCalls.Count | Should -Be 2
+        $script:usSshCalls[0] | Should -Match "-c user\.name='jdoe_acme' -c user\.email='jdoe_acme@users\.noreply\.github\.com'"
+        $script:usSshCalls[1] | Should -Match ([regex]::Escape("GIT_SSH_COMMAND='ssh -i ~/.ssh/id_ed25519_jdoe_acme -o IdentitiesOnly=yes"))
+    }
+
+    It 'Local: commits with the IMPACT identity' {
+        Mock git {
+            $joined = ($args | ForEach-Object { "$_" }) -join ' '
+            $script:usGitCalls += $joined
+            $global:LASTEXITCODE = 0
+            # 'git diff --cached --quiet' exits 1 when something is staged.
+            if ($joined -match 'diff --cached') { $global:LASTEXITCODE = 1; return }
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'jdoe_acme' -Location 'LOCAL'
+        $result = Invoke-GitChangeDetection -State $state -RepoPath $TestDrive -IsRemote $false
+        $result.Outcome | Should -Be 'Pushed'
+        $commit = $script:usGitCalls | Where-Object { $_ -match ' commit ' }
+        $commit | Should -Match 'user\.name=jdoe_acme'
+        $commit | Should -Match 'user\.email=jdoe_acme@users\.noreply\.github\.com'
+    }
+
+    It 'Remote: still refuses a name with shell characters before ssh runs' {
+        Mock ssh { $global:LASTEXITCODE = 0; 'ok' } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'x;rm' -Location 'REMOTE@10.0.0.5'
+        $push = InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ s = $state } {
+            param($s)
+            Invoke-GitPushWithImpactKey -State $s -RepoPath '/home/php-workstation/repo' -IsRemote $true -HasUpstream $true -Branch 'main'
+        }
+        $push.Success | Should -BeFalse
+        $push.Output | Should -Match 'not a valid GitHub user name'
+        Should -Invoke ssh -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly
     }
 }

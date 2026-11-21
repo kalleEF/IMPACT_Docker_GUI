@@ -10,7 +10,7 @@ A Windows tool for building, starting and stopping **IMPACT NCD Germany** RStudi
 - Mounts the repository into the container, so you edit the real files in RStudio in your browser
 - Optional Docker volumes for outputs and synthpop, copied back to your folders when you stop (volumes are deleted only after a successful copy)
 - When you stop, offers to commit and push your changes with your own GitHub identity and key, and tells you in the status line if your changes could not be checked or pushed
-- Leaves your PC's global Docker settings alone: it picks the Docker engine only for its own commands
+- Uses its own Docker contexts (`local` and `remote-<ip>`) for its own commands. It leaves your active Docker context as it is, except that an active context that points at a workstation (`remote-...`) can be set back to `default`
 
 ## Quick start
 
@@ -44,7 +44,7 @@ A Windows tool for building, starting and stopping **IMPACT NCD Germany** RStudi
 
 ## Documentation
 
-- **[User Guide](documentation/IMPACT_Docker_GUI_v2_User.md)**: step-by-step instructions, every dialog and message, options, troubleshooting
+- **[User Guide](documentation/IMPACT_Docker_GUI_v2_User.md)**: step-by-step instructions, the main dialogs and messages, options, troubleshooting
 - **[Technical Documentation](documentation/IMPACT_Docker_GUI_v2_Tech.md)**: architecture, session state, functions, workflow internals, security
 - **[Testing Guide](documentation/TESTING.md)**: test suites, running tests, CI
 - **[Known Bugs](documentation/KNOWN_BUGS.md)**: known problems and design limitations
@@ -64,7 +64,7 @@ pwsh tests/Invoke-Tests.ps1 -Level All
 pwsh tests/Invoke-Tests.ps1 -Level RemoteE2E -GitHubToken ghp_xxx
 ```
 
-Exit code 0 = everything requested ran and passed, 1 = failures, 2 = some suites could not run (for example Docker is not running; add `-AllowSkip` to accept that). See the **[Testing Guide](documentation/TESTING.md)**.
+Exit code 0 = everything requested ran and passed, 1 = failures (or invalid parameters), 2 = some suites could not run (for example Docker is not running; add `-AllowSkip` to accept that). See the **[Testing Guide](documentation/TESTING.md)**.
 
 ## License
 

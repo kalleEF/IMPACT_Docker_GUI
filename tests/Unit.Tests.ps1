@@ -12,12 +12,35 @@ BeforeAll {
     # test could check anything. Use the system temp folder there instead.
     if (-not $env:TEMP) { $env:TEMP = [System.IO.Path]::GetTempPath() }
 
+    # Point the IMPACT log at a temp file for this whole test file (TS-1). Without this,
+    # every Write-Log call in the tests was appended to the developer's REAL log file
+    # (~/.impact_gui/logs/impact.log, the file users send to the maintainer), and once
+    # that file was larger than 512 KB, Initialize-Logging rotated it and replaced the
+    # real impact.log.1. The old values are saved here and put back in AfterAll below.
+    # It is set before Import-Module, so even the very first log line goes to the temp
+    # file (the module reads IMPACT_LOG_FILE when it writes its first log line). CI calls
+    # Invoke-Pester directly, so this is done here in the test file and not only in the
+    # runner (Invoke-Tests.ps1).
+    $script:savedImpactLogFile = $env:IMPACT_LOG_FILE
+    $script:savedImpactLogDisable = $env:IMPACT_LOG_DISABLE
+    $script:testRunLogFile = Join-Path ([System.IO.Path]::GetTempPath()) "impact_unit_tests_$([guid]::NewGuid().ToString('N').Substring(0,8)).log"
+    $env:IMPACT_LOG_FILE = $script:testRunLogFile
+
     # Import the module under test
     $modulePath = Join-Path $PSScriptRoot '..' 'current_version' 'IMPACT_Docker_GUI.psm1'
     Import-Module $modulePath -Force -DisableNameChecking
 
     # Import test helpers
     . (Join-Path $PSScriptRoot 'Helpers' 'TestSessionState.ps1')
+}
+
+AfterAll {
+    # Put the IMPACT log settings back as they were before this test file (TS-1), and
+    # remove the temp log file (and its rotated copy, if a test made one).
+    $env:IMPACT_LOG_FILE = $script:savedImpactLogFile
+    $env:IMPACT_LOG_DISABLE = $script:savedImpactLogDisable
+    Remove-Item -LiteralPath $script:testRunLogFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "$($script:testRunLogFile).1" -Force -ErrorAction SilentlyContinue
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -242,7 +265,7 @@ Host last.host
 Host keep.me
     User keepuser
 
-# IMPACT Docker GUI — auto-generated entry
+# IMPACT Docker GUI - auto-generated entry
 Host 192.168.1.100
     User php-workstation
     IdentityFile ~/.ssh/id_ed25519_user
@@ -257,7 +280,7 @@ Host 192.168.1.100
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Get-YamlPathValue — LOCAL mode (sim_design_local.yaml with Windows paths)
+#  Get-YamlPathValue - LOCAL mode (sim_design_local.yaml with Windows paths)
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Get-YamlPathValue (LOCAL / sim_design_local.yaml)' -Tag Unit {
     BeforeEach {
@@ -309,7 +332,7 @@ Describe 'Get-YamlPathValue (LOCAL / sim_design_local.yaml)' -Tag Unit {
     It 'Resolves relative path against a Windows-style BaseDir' {
         Set-Content -Path $yamlFile -Value "output_dir: ./outputs`nsynthpop_dir: ./inputs/synthpop"
         $state = New-TestSessionState -Location 'LOCAL'
-        # Windows BaseDir (forward-slashed) – result must NOT start with "/" so Test-AndCreateDirectory accepts it
+        # Windows BaseDir (forward-slashed) - result must NOT start with "/" so Test-AndCreateDirectory accepts it
         $baseDir = 'C:/Users/testuser/repos/IMPACTncd_Germany'
         $result = Get-YamlPathValue -State $state -YamlPath $yamlFile -Key 'synthpop_dir' -BaseDir $baseDir
         $result | Should -BeLike 'C:/Users/testuser/repos/IMPACTncd_Germany*inputs/synthpop'
@@ -317,7 +340,10 @@ Describe 'Get-YamlPathValue (LOCAL / sim_design_local.yaml)' -Tag Unit {
         $result | Should -Not -Match '^\/'
     }
 
-    It 'Keeps a Windows absolute path as-is when specified in local YAML' {
+    # Windows only (TS-6): 'C:/...' is an absolute path only under Windows path rules. On
+    # Linux [System.IO.Path]::IsPathRooted('C:/...') is false, so the function joins it to
+    # BaseDir there, which is correct for Linux but not what this test checks.
+    It 'Keeps a Windows absolute path as-is when specified in local YAML' -Skip:(-not $IsWindows) {
         Set-Content -Path $yamlFile -Value "output_dir: C:/Users/testuser/Documents/IMPACTncd_Germany/outputs"
         $state = New-TestSessionState -Location 'LOCAL'
         $result = Get-YamlPathValue -State $state -YamlPath $yamlFile -Key 'output_dir' -BaseDir 'C:/Users/testuser/repos/IMPACTncd_Germany'
@@ -326,10 +352,26 @@ Describe 'Get-YamlPathValue (LOCAL / sim_design_local.yaml)' -Tag Unit {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Get-YamlPathValue — REMOTE mode (sim_design.yaml with POSIX paths)
+#  Get-YamlPathValue - REMOTE mode (sim_design.yaml with POSIX paths)
 #  SSH is mocked so the function reads YAML content without a real connection.
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Get-YamlPathValue (REMOTE / sim_design.yaml)' -Tag Unit {
+    BeforeAll {
+        # Pester can only mock commands that exist (TS-6). On a machine without OpenSSH
+        # (for example a Linux test box) we define a throw-away global 'ssh' function so
+        # the 'Mock ssh' calls below work. It is removed again in AfterAll.
+        $script:remoteYamlSshStubAdded = $false
+        if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+            function global:ssh { throw 'ssh stub: this call should have been mocked' }
+            $script:remoteYamlSshStubAdded = $true
+        }
+    }
+
+    AfterAll {
+        # 'Function:\ssh' really removes the global stub, so later tests see no fake ssh.
+        if ($script:remoteYamlSshStubAdded) { Remove-Item -Path Function:\ssh -ErrorAction SilentlyContinue }
+    }
+
     BeforeEach {
         $testDir = Join-Path $env:TEMP "impact_yaml_test_$([guid]::NewGuid().ToString('N').Substring(0,8))"
         New-Item -ItemType Directory -Path $testDir -Force | Out-Null
@@ -349,7 +391,7 @@ Describe 'Get-YamlPathValue (REMOTE / sim_design.yaml)' -Tag Unit {
         $state = New-TestSessionState -Location 'REMOTE@10.152.14.124'
         $baseDir = '/home/php-workstation/Schreibtisch/Repositories/IMPACTncd_Germany'
         $result = Get-YamlPathValue -State $state -YamlPath $script:remoteYamlFile -Key 'output_dir' -BaseDir $baseDir
-        # Absolute path — returned as-is, NOT joined with BaseDir
+        # Absolute path - returned as-is, NOT joined with BaseDir
         $result | Should -Be '/mnt/Storage_1/IMPACT_Storage/Base/outputs'
     }
 
@@ -671,6 +713,21 @@ Describe 'Set-DockerSSHEnvironment' -Tag Unit {
 #  Test-AndCreateDirectory (local only, no remote SSH)
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Test-AndCreateDirectory' -Tag Unit {
+    BeforeAll {
+        # Pester can only mock commands that exist (TS-6): the REMOTE test below uses
+        # 'Mock ssh'. Without OpenSSH a throw-away global 'ssh' function stands in for it;
+        # it is removed again in AfterAll.
+        $script:dirSshStubAdded = $false
+        if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+            function global:ssh { throw 'ssh stub: this call should have been mocked' }
+            $script:dirSshStubAdded = $true
+        }
+    }
+
+    AfterAll {
+        if ($script:dirSshStubAdded) { Remove-Item -Path Function:\ssh -ErrorAction SilentlyContinue }
+    }
+
     It 'Returns true for an existing local directory' {
         $state = New-TestSessionState -Location 'LOCAL'
         $result = Test-AndCreateDirectory -State $state -Path $env:TEMP -PathKey 'test'
@@ -753,9 +810,17 @@ Describe 'Ensure-SshConfigEntry' -Tag Unit {
         # calls do not match the filter and run normally.
         Mock Join-Path -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { $Path -eq $HOME -and $ChildPath -eq '.ssh' } { $script:fakeSshDir }
         # Safety net: never touch the real ~/.ssh, whatever the module does.
-        Mock Add-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path" }
-        Mock Set-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path" }
+        # The filters look at "$Path$LiteralPath" (TS-2): the module writes the ssh config
+        # with -LiteralPath, and a filter on $Path alone never saw those calls, so the
+        # safety net did not fire for exactly the writes it is meant to catch. Only one of
+        # the two parameters is ever given, so joining them gives the path that was used.
+        # Copy-Item (the config backup) is checked on its -Destination, and Remove-Item
+        # (a stray .pub file is deleted) is guarded too.
+        Mock Add-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path$LiteralPath" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path$LiteralPath" }
+        Mock Set-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path$LiteralPath" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path$LiteralPath" }
         Mock New-Item    -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like "$($script:realSshDir)*" } { throw "Test tried to create something in the real SSH folder: $Path" }
+        Mock Copy-Item   -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Destination" -like "$($script:realSshDir)*" } { throw "Test tried to copy a file into the real SSH folder: $Destination" }
+        Mock Remove-Item -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path$LiteralPath" -like "$($script:realSshDir)*" } { throw "Test tried to delete something in the real SSH folder: $Path$LiteralPath" }
     }
 
     AfterEach {
@@ -781,10 +846,10 @@ Describe 'Ensure-SshConfigEntry' -Tag Unit {
         ([regex]::Matches($content, "(?m)^Host $([regex]::Escape($script:testIp))\s*$")).Count | Should -Be 1
     }
 
-    # Windows only: the function turns '/' into '\' before checking that the key file
-    # exists, so on Linux every existing entry looks like "deleted key" and is rewritten.
-    # The GUI only runs on Windows, where an unchanged entry must be left alone.
-    It 'Leaves a valid entry byte-for-byte unchanged' -Skip:(-not $IsWindows) {
+    # Runs on every platform (X-4): Ensure-SshConfigEntry turns '\' into '/' before it
+    # checks that the key file exists, which works on Linux too. (This test used to be
+    # skipped outside Windows because of an older version of that check.)
+    It 'Leaves a valid entry byte-for-byte unchanged' {
         Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile $script:keyA
         $before = Get-Content -LiteralPath $script:configPath -Raw
         Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile $script:keyA
@@ -863,7 +928,8 @@ Describe 'New-TestSessionState (helper)' -Tag Unit {
         $state.Paths.SshPrivate | Should -Match 'impact_test_ssh'
     }
 
-    It 'New-DummySshKeyPair creates a usable (unencrypted) ed25519 keypair' {
+    # Needs the real ssh-keygen program (TS-6), so it is skipped where OpenSSH is missing.
+    It 'New-DummySshKeyPair creates a usable (unencrypted) ed25519 keypair' -Skip:(-not (Get-Command ssh-keygen -ErrorAction SilentlyContinue)) {
         $kp = New-DummySshKeyPair -Label 'unit'
         Test-Path $kp.Private | Should -BeTrue
         Test-Path $kp.Public  | Should -BeTrue
@@ -1122,7 +1188,7 @@ DOCKERHUB_TOKEN=mytoken
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Initialize-Logging — log directory creation & rotation
+#  Initialize-Logging - log directory creation & rotation
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Initialize-Logging' -Tag Unit {
     BeforeEach {
@@ -1136,9 +1202,13 @@ Describe 'Initialize-Logging' -Tag Unit {
     }
 
     AfterEach {
-        # Clean environment override
-        $env:IMPACT_LOG_FILE = $null
-        $env:IMPACT_LOG_DISABLE = $null
+        # Undo the environment override of each test. The values go back to what the
+        # top-level BeforeAll of this file set (the temp log file, and the developer's
+        # own IMPACT_LOG_DISABLE). Setting them to $null here sent the log lines of later
+        # tests to the real ~/.impact_gui/logs/impact.log and cleared a value that the
+        # developer had set (TS-1).
+        $env:IMPACT_LOG_FILE = $script:testRunLogFile
+        $env:IMPACT_LOG_DISABLE = $script:savedImpactLogDisable
         Remove-Item -Recurse -Force $script:testLogDir -ErrorAction SilentlyContinue
     }
 
@@ -1179,7 +1249,7 @@ Describe 'Initialize-Logging' -Tag Unit {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Ensure-PowerShell7 — guard logic
+#  Ensure-PowerShell7 - guard logic
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Ensure-PowerShell7' -Tag Unit {
     # (F109) These tests used to check only "does not throw", which also passes when the
@@ -1223,7 +1293,7 @@ Describe 'Ensure-PowerShell7' -Tag Unit {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Test-GitHubUsername — GitHub API validation
+#  Test-GitHubUsername - GitHub API validation
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Test-GitHubUsername' -Tag Unit {
     It 'Returns true when GitHub API responds with 200 (user exists)' {

@@ -24,7 +24,8 @@
 
     Exit codes:
         0  every requested suite ran and passed
-        1  at least one test failed, or a test file / BeforeAll / AfterAll block failed
+        1  at least one test failed, a test file / BeforeAll / AfterAll block failed, or the
+           parameters are invalid (for example -Tag with -Level, or an unknown -Level)
         2  nothing failed, but at least one requested suite was NOT RUN (for example
            Docker is not running). Use -AllowSkip to get 0 in that case.
 #>
@@ -342,6 +343,8 @@ function Add-NotRunResult {
         Passed     = 0
         Failed     = 0
         Skipped    = 0
+        # Same property as in the results of suites that ran (see BlockFailures below).
+        BlockFailures = 0
         Time       = '-'
         Status     = 'NOT RUN'
         Reason     = $Reason
@@ -418,7 +421,16 @@ foreach ($name in $suitesToRun) {
     $config.TestResult.OutputFormat  = 'NUnitXml'
     $config.TestResult.OutputPath    = "$PSScriptRoot/TestResults-$name.xml"
     if ($ExcludeTag) { $config.Filter.ExcludeTag = $ExcludeTag }
-    if ($CodeCoverage) { $config.CodeCoverage.Enabled = $true }
+    if ($CodeCoverage) {
+        $config.CodeCoverage.Enabled = $true
+        # TS-4: say WHAT to measure. Without a Path, Pester measures the folder of the
+        # test file (tests/, so the runner and the helpers) and never the module. The
+        # GUI script (IMPACT_Docker_GUI_v2.ps1) is not measured: the tests do not run it.
+        $config.CodeCoverage.Path = @(Join-Path $repoRoot 'current_version' 'IMPACT_Docker_GUI.psm1')
+        # One report per suite in tests/ (git-ignored). Without this, every suite wrote
+        # the same ./coverage.xml in the current folder and overwrote the previous one.
+        $config.CodeCoverage.OutputPath = "$PSScriptRoot/coverage-$name.xml"
+    }
 
     $r = Invoke-Pester -Configuration $config
     $sw.Stop()
@@ -453,6 +465,10 @@ foreach ($name in $suitesToRun) {
         Passed     = $r.PassedCount
         Failed     = $r.FailedCount
         Skipped    = $r.SkippedCount
+        # TS-3: kept so that the artifact step below also saves the results of a suite
+        # that FAILED only because a test file could not be loaded or a BeforeAll/AfterAll
+        # block failed. Those cases have Failed = 0 and Skipped = 0.
+        BlockFailures = $blockFailures
         Time       = $sw.Elapsed.ToString('mm\:ss\.ff')
         Status     = $status
         Reason     = $reason
@@ -518,10 +534,14 @@ foreach ($res in $results) {
     if ($suiteContainers.ContainsKey($res.Suite)) { $containers = $suiteContainers[$res.Suite] }
 
     try {
+        # TS-3: count failed blocks and test files as failures too. Save-TestArtifacts
+        # skips saving when both counts are 0 ("all tests passed"), so a suite that FAILED
+        # only because of a broken test file or a failing BeforeAll/AfterAll used to keep
+        # no result XML and no container logs, and the console said "all tests passed".
         Save-TestArtifacts -Suite $artifactName `
             -ExtraFiles $extraFiles `
             -ContainerNames $containers `
-            -FailedCount $res.Failed `
+            -FailedCount ($res.Failed + $res.BlockFailures) `
             -SkippedCount $res.Skipped
     } catch {
         Write-Warning "Failed to persist artifacts for $($res.Suite): $($_.Exception.Message)"
@@ -529,7 +549,7 @@ foreach ($res in $results) {
 }
 
 # ── Clean up XML result files from tests/ root ────────────────────────────────
-# These are transient build outputs — the artifacts folder preserves them on failure.
+# These are transient build outputs; the artifacts folder preserves them on failure.
 $xmlFiles = Get-ChildItem -Path "$PSScriptRoot/TestResults-*.xml" -ErrorAction SilentlyContinue
 foreach ($f in $xmlFiles) {
     Remove-Item -Path $f.FullName -Force -ErrorAction SilentlyContinue

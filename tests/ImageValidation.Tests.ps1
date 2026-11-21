@@ -49,7 +49,7 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
         $script:TEST_USER       = 'imgvaltest'
         $script:TEST_PASSWORD   = 'ImgValTestPass!'
 
-        # ── Preflight state (NEVER throw in BeforeAll — use flags) ──────────
+        # ── Preflight state (NEVER throw in BeforeAll - use flags) ──────────
         $script:PreflightFailed = $false
         $script:PreflightMessages = @()
 
@@ -125,7 +125,9 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
                     if (Test-Path $prereqDockerfile) {
                         Write-Host '[ImageVal] Trying prerequisite build ...' -ForegroundColor Yellow
                         Set-Location (Join-Path $script:repoDir 'docker_setup')
-                        docker build -f $prereqDockerfile -t "$($script:IMAGE_NAME)-prerequisite" --progress=plain . 2>&1 | Write-Host
+                        # Tag it with the name in the FROM line of Dockerfile.IMPACTncdGER, as
+                        # the GUI does: only then does the retry below use this new image.
+                        docker build -f $prereqDockerfile -t 'kalleef/prerequisite.impactncdger:latest' --progress=plain . 2>&1 | Write-Host
                         Set-Location $script:repoDir
                         docker build --build-arg "REPO_NAME=$($script:REPO_NAME)" `
                             -f $dockerfilePath -t $script:IMAGE_NAME --progress=plain . 2>&1 | Write-Host
@@ -444,7 +446,7 @@ tryCatch({
 
     It 'Can execute git pull from inside the container' -Skip:(-not $env:IMPACT_E2E_GITHUB_TOKEN) {
         if (-not (Assert-PreflightPassed)) { return }
-        # Bind-mounted repos have different host/container ownership — mark as safe
+        # Bind-mounted repos have different host/container ownership - mark as safe
         Invoke-DockerExecSafe -ContainerName $script:CONTAINER_NAME -User 'rstudio' `
             -Command @('git', 'config', '--global', '--add', 'safe.directory',
                         "/home/rstudio/$($script:REPO_NAME)") | Out-Null
