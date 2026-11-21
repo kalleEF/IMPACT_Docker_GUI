@@ -1540,3 +1540,213 @@ Describe 'Get-ImpactVolumeInfo (mocked docker)' -Tag Integration {
         $vi.TargetDir | Should -BeNullOrEmpty
     }
 }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Git check on Stop (C1 follow-ups): git missing, detached HEAD, never-pushed
+#  branch, readable file names, honest "Unavailable" result, push after Skip
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Get-GitRepositoryState: git missing, detached HEAD, never-pushed branch, readable names' -Tag Integration {
+    BeforeAll {
+        # Pester can only mock a command that exists. Some CI machines have no
+        # ssh client, so add a throw-away global stub that the mocks replace.
+        $script:c1AddedSshStub = $false
+        if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+            function global:ssh { throw 'ssh stub called without a mock' }
+            $script:c1AddedSshStub = $true
+        }
+    }
+    AfterAll {
+        # 'Function:\ssh' (not 'function:global:ssh', which silently removes nothing).
+        if ($script:c1AddedSshStub) { Remove-Item -Path Function:\ssh -ErrorAction SilentlyContinue }
+    }
+
+    It 'Local: returns null with reason GitMissing when git is not installed' {
+        Mock Get-Command { return $null } -ParameterFilter { $Name -eq 'git' } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'LOCAL'
+        $why = $null
+        $result = Get-GitRepositoryState -State $state -RepoPath $TestDrive -IsRemote $false -Reason ([ref]$why)
+        $result | Should -BeNullOrEmpty
+        $why | Should -Be 'GitMissing'
+    }
+
+    It 'Local: still works without the -Reason parameter' {
+        Mock git { $global:LASTEXITCODE = 0; return '' } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'LOCAL'
+        { Get-GitRepositoryState -State $state -RepoPath $TestDrive -IsRemote $false } | Should -Not -Throw
+    }
+
+    It 'Local: asks git for file names with umlauts as they are (core.quotePath=false)' {
+        $script:c1GitCalls = @()
+        Mock git {
+            $joined = ($args | ForEach-Object { "$_" }) -join ' '
+            $script:c1GitCalls += $joined
+            $global:LASTEXITCODE = 0
+            if ($joined -match 'status --porcelain') { return @('?? Ergebnisse.csv') }
+            if ($joined -match 'rev-parse --abbrev-ref') { return 'main' }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'LOCAL'
+        $null = Get-GitRepositoryState -State $state -RepoPath $TestDrive -IsRemote $false
+        ($script:c1GitCalls | Where-Object { $_ -match 'status --porcelain' }) | Should -Match '^-c core\.quotePath=false status --porcelain=v1$'
+    }
+
+    It 'Local: reports a detached HEAD (rev-parse says HEAD and symbolic-ref names no branch)' {
+        Mock git {
+            $joined = ($args | ForEach-Object { "$_" }) -join ' '
+            $global:LASTEXITCODE = 0
+            if ($joined -match 'status --porcelain') { return @(' M a.R') }
+            if ($joined -match 'rev-parse --abbrev-ref') { return 'HEAD' }
+            if ($joined -match 'symbolic-ref') { $global:LASTEXITCODE = 1; return $null }
+            if ($joined -match 'rev-list') { $global:LASTEXITCODE = 128; return $null }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Get-GitRepositoryState -State $state -RepoPath $TestDrive -IsRemote $false
+        $result.Detached | Should -BeTrue
+        $result.Branch | Should -Be 'HEAD'
+        $result.Ahead | Should -Be 0
+    }
+
+    It 'Local: a new repository without commits is not taken for a detached HEAD' {
+        Mock git {
+            $joined = ($args | ForEach-Object { "$_" }) -join ' '
+            $global:LASTEXITCODE = 0
+            if ($joined -match 'status --porcelain') { return @('?? a.R') }
+            if ($joined -match 'rev-parse --abbrev-ref') { $global:LASTEXITCODE = 128; return 'HEAD' }
+            if ($joined -match 'symbolic-ref') { return 'main' }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Get-GitRepositoryState -State $state -RepoPath $TestDrive -IsRemote $false
+        $result.Detached | Should -BeFalse
+        $result.Branch | Should -Be 'main'
+    }
+
+    It 'Local: counts the commits of a branch that was never pushed (no upstream)' {
+        Mock git {
+            $joined = ($args | ForEach-Object { "$_" }) -join ' '
+            $global:LASTEXITCODE = 0
+            if ($joined -match 'status --porcelain') { return @() }
+            if ($joined -match 'rev-parse --abbrev-ref') { return 'feature' }
+            if ($joined -match 'remote get-url') { return 'git@github.com:o/r.git' }
+            if ($joined -match '@\{u\}\.\.HEAD') { $global:LASTEXITCODE = 128; return $null }
+            if ($joined -match 'rev-list --count HEAD --not --remotes') { return '2' }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Get-GitRepositoryState -State $state -RepoPath $TestDrive -IsRemote $false
+        $result.HasUpstream | Should -BeFalse
+        $result.Ahead | Should -Be 2
+        $result.Detached | Should -BeFalse
+    }
+
+    It 'Remote: reads the SYMREF and LOCALAHEAD sections and asks for unquoted names' {
+        $script:c1SentCommand = ''
+        Mock ssh {
+            $script:c1SentCommand = "$($args[-1])"
+            $global:LASTEXITCODE = 0
+            return @(
+                '__IMPACT_STATUS__'
+                '__IMPACT_BRANCH__'
+                'feature'
+                '__IMPACT_SYMREF__'
+                'feature'
+                '__IMPACT_REMOTE__'
+                'git@github.com:IMPACT/repo.git'
+                '__IMPACT_AHEAD__'
+                '__IMPACT_LOCALAHEAD__'
+                '4'
+                '__IMPACT_OP__'
+            )
+        } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.5'
+        $result = Get-GitRepositoryState -State $state -RepoPath '/home/user/repo' -IsRemote $true
+        $result.HasChanges | Should -BeFalse
+        $result.HasUpstream | Should -BeFalse
+        $result.Ahead | Should -Be 4
+        $result.Detached | Should -BeFalse
+        $script:c1SentCommand | Should -Match ([regex]::Escape('git -c core.quotePath=false status --porcelain=v1'))
+        $script:c1SentCommand | Should -Match ([regex]::Escape('git symbolic-ref -q --short HEAD'))
+    }
+
+    It 'Remote: reports a detached HEAD' {
+        Mock ssh {
+            $global:LASTEXITCODE = 0
+            return @('__IMPACT_STATUS__', ' M a.R', '__IMPACT_BRANCH__', 'HEAD', '__IMPACT_SYMREF__', '__IMPACT_REMOTE__', 'git@github.com:IMPACT/repo.git', '__IMPACT_AHEAD__', '__IMPACT_LOCALAHEAD__', '7', '__IMPACT_OP__')
+        } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.5'
+        $result = Get-GitRepositoryState -State $state -RepoPath '/home/user/repo' -IsRemote $true
+        $result.Detached | Should -BeTrue
+        # Commits of a detached HEAD are never offered for pushing.
+        $result.Ahead | Should -Be 0
+    }
+
+    It 'Remote: reason Unreachable when ssh cannot connect, ReadFailed when the folder or git fails' {
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.5'
+        Mock ssh { $global:LASTEXITCODE = 255; return @() } -ModuleName 'IMPACT_Docker_GUI'
+        $why = $null
+        Get-GitRepositoryState -State $state -RepoPath '/home/user/repo' -IsRemote $true -Reason ([ref]$why) | Should -BeNullOrEmpty
+        $why | Should -Be 'Unreachable'
+
+        Mock ssh { $global:LASTEXITCODE = 1; return @() } -ModuleName 'IMPACT_Docker_GUI'
+        $why = $null
+        Get-GitRepositoryState -State $state -RepoPath '/home/user/repo' -IsRemote $true -Reason ([ref]$why) | Should -BeNullOrEmpty
+        $why | Should -Be 'ReadFailed'
+    }
+}
+
+Describe 'Invoke-GitChangeDetection: unavailable status, detached HEAD, earlier commits after Skip' -Tag Integration {
+    BeforeEach {
+        Enable-NonInteractiveMode
+        $script:c1GitCalls = @()
+        Mock git { $script:c1GitCalls += ($args -join ' ') } -ModuleName 'IMPACT_Docker_GUI'
+    }
+    AfterEach {
+        Disable-NonInteractiveMode
+    }
+
+    It 'Reports an unreadable git status as NOT successful, with the reason' {
+        Mock Get-GitRepositoryState { if ($null -ne $Reason) { $Reason.Value = 'GitMissing' }; return $null } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Invoke-GitChangeDetection -State $state -RepoPath $TestDrive -IsRemote $false
+        $result.Success | Should -BeFalse
+        $result.Outcome | Should -Be 'Unavailable'
+        $result.Message | Should -Match 'NOT checked or committed'
+        $result.Message | Should -Match 'git is not installed'
+    }
+
+    It 'Refuses to commit on a detached HEAD and never opens the dialog' {
+        Mock Get-GitRepositoryState {
+            return [pscustomobject]@{ HasChanges = $true; StatusText = ' M a.R'; Branch = 'HEAD'; Remote = ''; Ahead = 0; HasUpstream = $false; Detached = $true; Conflicts = @(); OperationInProgress = '' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+        Mock Show-GitCommitDialog { return @{ Message = 'x'; Push = $true } } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Invoke-GitChangeDetection -State $state -RepoPath $TestDrive -IsRemote $false
+        $result.Outcome | Should -Be 'Blocked'
+        $result.Success | Should -BeFalse
+        Should -Invoke Show-GitCommitDialog -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly
+        $script:c1GitCalls | Should -BeNullOrEmpty
+    }
+
+    It 'After Skip, still mentions earlier commits that are not on GitHub (NonInteractive: no push)' {
+        Mock Get-GitRepositoryState {
+            return [pscustomobject]@{ HasChanges = $true; StatusText = ' M a.R'; Branch = 'main'; Remote = ''; Ahead = 3; HasUpstream = $true; Detached = $false; Conflicts = @(); OperationInProgress = '' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+        Mock Show-GitCommitDialog { return $null } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Invoke-GitChangeDetection -State $state -RepoPath $TestDrive -IsRemote $false
+        $result.Outcome | Should -Be 'Skipped'
+        $result.Message | Should -Match '3 earlier commit'
+        $script:c1GitCalls | Should -BeNullOrEmpty
+    }
+
+    It 'Works with a status object that has no Detached property (older shape)' {
+        Mock Get-GitRepositoryState {
+            return [pscustomobject]@{ HasChanges = $false; StatusText = ''; Branch = 'main'; Remote = ''; Ahead = 0; HasUpstream = $true; Conflicts = @(); OperationInProgress = '' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -Location 'LOCAL'
+        $result = Invoke-GitChangeDetection -State $state -RepoPath $TestDrive -IsRemote $false
+        $result.Outcome | Should -Be 'NoChanges'
+    }
+}

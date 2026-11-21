@@ -99,7 +99,7 @@ function Ensure-RemotePreparation {
             return $false
         }
         if ($probeFailure -eq 'HostKeyChanged') {
-            $msg = "The workstation at $remoteIp identified itself with a different SSH host key than the one this PC remembers.`n`nThis is expected after the workstation was reinstalled, but it can also mean that the connection is being intercepted. For your safety IMPACT will not send your password.`n`nAsk the workstation admin whether the workstation was reinstalled. If it was, run this command in PowerShell and then start IMPACT again:`n  ssh-keygen -R $remoteIp"
+            $msg = "The workstation at $remoteIp identified itself with a different SSH host key than the one this PC remembers.`n`nThis is expected after the workstation was reinstalled, but it can also mean that the connection is being intercepted. For your safety IMPACT will not send your password.`n`nAsk the workstation admin whether the workstation was reinstalled. If it was, run this command in PowerShell and then start IMPACT again:`n  ssh-keygen -R $remoteIp`n`nIf IMPACT asked you for the workstation password before (it then used the Posh-SSH module), also run:`n  Remove-SSHTrustedHost -HostName $remoteIp"
             Write-Log "Host key of $remoteIp has changed; stopping before any password is sent: $probeOut" 'Error'
             [System.Windows.Forms.MessageBox]::Show($msg, 'Workstation identity changed', 'OK', 'Warning') | Out-Null
             return $false
@@ -127,7 +127,10 @@ mkdir -p "$USER_SSH_DIR" && chmod 700 "$USER_SSH_DIR"
 touch "$AUTH_KEYS" && chmod 600 "$AUTH_KEYS"
 
 echo "{2}" > "$KEY_TARGET_PUB"
-chown {0}:{0} "$KEY_TARGET_PUB"
+# "user:" (empty group) means the user's own login group, and "|| true" keeps a failed
+# chown from stopping the script under 'set -e'. The script runs as this user, so the
+# files already belong to it; "user:user" aborted when the group has another name.
+chown "$ACTUAL_USER": "$KEY_TARGET_PUB" 2>/dev/null || true
 chmod 644 "$KEY_TARGET_PUB"
 
 # Clean up stale pub files left by previous bug (extra underscore before .pub)
@@ -143,7 +146,7 @@ sed -i -E '/[[:space:]]IMPACT_{1}_?[[:space:]]*$/d' "$AUTH_KEYS" 2>/dev/null || 
 if ! grep -qxF "{2}" "$AUTH_KEYS"; then
     echo "{2}" >> "$AUTH_KEYS"
 fi
-chown {0}:{0} "$AUTH_KEYS"
+chown "$ACTUAL_USER": "$AUTH_KEYS" 2>/dev/null || true
 echo 'SSH_KEY_COPIED'
 '@ -f $remoteUser, $State.UserName, $publicKeyContent
 
@@ -181,6 +184,11 @@ echo 'SSH_KEY_COPIED'
         # Try Posh-SSH first (mirrors the legacy flow: create temp file remotely, then run install script)
         $poshSshUsed = $false
         $poshSshErrorText = $null   # why Posh-SSH failed, so we can show the real reason to the user
+        # Set from the exception TYPE in the catch below (not from the message text): an
+        # error line of the setup script such as "touch: ... Permission denied" must not
+        # be mistaken for a wrong password.
+        $poshSshAuthFailed = $false
+        $poshSshHostKeyRejected = $false
         $sshSession = $null
         $remoteTemp = "/tmp/ssh_key_temp_$($State.UserName)_$(Get-Date -Format 'HHmmss').pub"
         try {
@@ -233,6 +241,9 @@ echo 'SSH_KEY_COPIED'
 
                                 $remoteInstallScript = @'
 set -eu
+# Send error messages to normal output: Invoke-SSHCommand returns them separately, and we
+# only show .Output to the user. Without this line a failed step showed an empty reason.
+exec 2>&1
 umask 077
 ACTUAL_USER="$(whoami)"
 HOME_DIR="$(eval echo ~${ACTUAL_USER})"
@@ -252,7 +263,9 @@ if [ ! -f "$REMOTE_TEMP" ]; then
 fi
 
 cp "$REMOTE_TEMP" "$KEY_TARGET_PUB"
-chown ${ACTUAL_USER}:${ACTUAL_USER} "$KEY_TARGET_PUB"
+# "user:" = the user's own login group; "|| true" so a failed chown cannot abort the
+# script under 'set -e' ("user:user" failed when the group has another name).
+chown "$ACTUAL_USER": "$KEY_TARGET_PUB" 2>/dev/null || true
 chmod 644 "$KEY_TARGET_PUB"
 
 NEW_KEY=$(cat "$KEY_TARGET_PUB")
@@ -275,7 +288,8 @@ chmod 600 "$AUTH_KEYS"
 chmod 644 "$KEY_TARGET_PUB"
 # (No chown of the home folder: it already belongs to this user, and a chown
 # could fail and abort the script if the group name differs from the user name.)
-chown -R ${ACTUAL_USER}:${ACTUAL_USER} "$USER_SSH_DIR"
+# Not fatal either: a root-owned file an admin left in ~/.ssh would make it fail.
+chown -R "$ACTUAL_USER": "$USER_SSH_DIR" 2>/dev/null || true
 
 # Clean up stale pub files left by previous bug (extra underscore before .pub)
 STALE_PUB="$USER_SSH_DIR/id_ed25519_%%USERNAME%%_.pub"
@@ -298,6 +312,18 @@ echo SSH_KEY_COPIED
             $poshSshErrorText = "$($ex.GetType().FullName): $($ex.Message)"
             if ($ex.InnerException) { $poshSshErrorText += " | $($ex.InnerException.GetType().FullName): $($ex.InnerException.Message)" }
             Write-Log "Posh-SSH bootstrap failed: $poshSshErrorText" 'Warn'
+            # The type names are compared as text, because the Posh-SSH (SSH.NET) types do
+            # not exist in PowerShell until that module is loaded.
+            # Second case: Posh-SSH keeps its OWN list of trusted workstations (separate
+            # from OpenSSH's known_hosts). When the workstation's key changed (for example
+            # after a reinstall), Posh-SSH refuses it and SSH.NET reports a failed key
+            # exchange.
+            $exTypeNames = @($ex.GetType().Name; if ($ex.InnerException) { $ex.InnerException.GetType().Name })
+            if ($exTypeNames -contains 'SshAuthenticationException') {
+                $poshSshAuthFailed = $true
+            } elseif ($exTypeNames -contains 'SshConnectionException' -and $poshSshErrorText -match 'Key exchange negotiation failed|HostKeyNotVerifiable|fingerprint|host key') {
+                $poshSshHostKeyRejected = $true
+            }
         } finally {
             if ($sshSession) { try { Remove-SSHSession -SessionId $sshSession.SessionId -ErrorAction SilentlyContinue | Out-Null } catch { } }
             if (Get-Variable tempKeyFile -Scope 0 -ErrorAction SilentlyContinue) { try { Remove-Item $tempKeyFile -Force -ErrorAction SilentlyContinue; Write-Log 'Removed temporary key file.' 'Debug' } catch { } }
@@ -310,7 +336,13 @@ echo SSH_KEY_COPIED
         # by the workstation's brute-force protection.
         if (-not $keyAuthorized -and $poshSshUsed) {
             $poshFailure = Get-SshFailureKind -Output $poshSshErrorText
-            if ($poshFailure -eq 'AuthFailed' -and $poshSshErrorText -match 'Permission denied') {
+            if ($poshSshHostKeyRejected) {
+                $msg = "Posh-SSH did not accept the identity (SSH host key) of the workstation at $remoteIp. This usually means the workstation was reinstalled, but it can also mean that the connection is being intercepted. For your safety IMPACT did not log in.`n`nAsk the workstation admin whether the workstation was reinstalled. If it was, run this command in PowerShell and then start IMPACT again:`n  Remove-SSHTrustedHost -HostName $remoteIp`n(older Posh-SSH versions: Remove-SSHTrustedHost -SSHHost $remoteIp)`n`nDetails: $poshSshErrorText"
+                Write-Log $msg 'Error'
+                [System.Windows.Forms.MessageBox]::Show($msg, 'Workstation identity changed', 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            if ($poshSshAuthFailed) {
                 Write-Log "Password for $remoteUser@$remoteIp was not accepted." 'Warn'
                 [System.Windows.Forms.MessageBox]::Show("The password for $remoteUser@$remoteIp was not accepted.`n`nPlease check it (is Caps Lock on?) and try again.", 'Wrong password', 'OK', 'Warning') | Out-Null
                 # Run the remote preparation again, so the password dialog appears again.
@@ -357,9 +389,24 @@ echo SSH_KEY_COPIED
                     $pwFile = New-TemporaryFile
                     [System.IO.File]::WriteAllText($pwFile.FullName, $plainPw)
                     $plinkArgs = @('-batch', '-ssh', '-pwfile', $pwFile.FullName)
-                    $hostKeyLines = @()
-                    try { $hostKeyLines = @(& ssh-keygen -l -F $remoteIp 2>$null) } catch { $hostKeyLines = @() }
-                    foreach ($fp in @($hostKeyLines | ForEach-Object { [regex]::Matches("$_", 'SHA256:[A-Za-z0-9+/=]+') } | ForEach-Object { $_.Value })) {
+                    # Which host keys to give plink: OpenSSH stored only ONE key type during
+                    # the probe (the type it negotiated; the OpenSSH 8.1 of Windows 10 prefers
+                    # ECDSA), while PuTTY prefers Ed25519 and does not let the -hostkey list
+                    # change its choice. With only the stored fingerprint, plink then stopped
+                    # with "Host key did not appear in manually configured list". So we also
+                    # read the workstation's other host keys (ssh-keyscan), but trust them
+                    # only if they come from the same server that presented the key OpenSSH
+                    # already trusts; otherwise only the stored fingerprint is passed. (That
+                    # is the same level of trust as OpenSSH's 'accept-new' gives a key type
+                    # it has not seen before.)
+                    $getFingerprints = { param($Lines) @(@($Lines) | ForEach-Object { [regex]::Matches("$_", 'SHA256:[A-Za-z0-9+/=]+') } | ForEach-Object { $_.Value } | Select-Object -Unique) }
+                    $knownFps = @()
+                    try { $knownFps = @(& $getFingerprints @(& ssh-keygen -l -F $remoteIp 2>$null)) } catch { $knownFps = @() }
+                    $scannedFps = @()
+                    try { $scannedFps = @(& $getFingerprints @(& ssh-keyscan -T 10 -t ed25519,ecdsa,rsa $remoteIp 2>$null | & ssh-keygen -l -f - 2>$null)) } catch { $scannedFps = @() }
+                    $hostKeyFps = if (@($knownFps | Where-Object { $scannedFps -contains $_ }).Count -gt 0) { $scannedFps } else { $knownFps }
+                    Write-Log "plink host keys: known=$($knownFps -join ',') scanned=$($scannedFps -join ',')" 'Debug'
+                    foreach ($fp in $hostKeyFps) {
                         $plinkArgs += @('-hostkey', $fp)
                     }
                     $plinkArgs += @($remoteHost, 'bash -s')
@@ -440,7 +487,24 @@ echo SSH_KEY_COPIED
         $copyPrivateCmd = "umask 077 && mkdir -p ~/.ssh && chmod 700 ~/.ssh && tr -d '\r' > $remoteKeyFile.tmp && chmod 600 $remoteKeyFile.tmp && mv -f $remoteKeyFile.tmp $remoteKeyFile && echo PRIVATE_KEY_COPIED"
         $pkOut = $null
         try { $pkOut = $pkContent | & ssh @sshArgsWithInput $copyPrivateCmd 2>&1 } catch { $pkOut = $_.Exception.Message }
-        if (-not ($pkOut -match 'PRIVATE_KEY_COPIED')) { Write-Log "Remote private key copy may have failed: $pkOut" 'Warn' }
+        if (-not ($pkOut -match 'PRIVATE_KEY_COPIED')) {
+            Write-Log "Remote private key copy may have failed: $pkOut" 'Warn'
+            # Without the key on the workstation, Start is refused later with "close IMPACT
+            # and start it again", and this step then fails silently again, so the user
+            # would loop without ever seeing why. If a key from an earlier session is
+            # already there, a failed refresh is harmless (it is the same key); if not,
+            # stop here and show the reason.
+            $keyPresentOut = $null
+            try { $keyPresentOut = & ssh @sshArgs "test -s $remoteKeyFile && echo KEY_PRESENT || echo KEY_ABSENT" 2>&1 } catch { $keyPresentOut = $_.Exception.Message }
+            if (-not ("$keyPresentOut" -match 'KEY_PRESENT')) {
+                $pkDetail = (@($pkOut) | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -Last 3) -join ' '
+                if (-not $pkDetail) { $pkDetail = '(no error text)' }
+                $msg = "IMPACT could not copy your SSH key to the workstation ($remoteIp). Git inside the container needs it.`n`nDetails: $pkDetail`n`nPlease check the network or VPN connection and try again. If this keeps happening, ask the workstation admin whether the disk of the workstation is full or the folder ~/.ssh is not writable."
+                Write-Log $msg 'Error'
+                [System.Windows.Forms.MessageBox]::Show($msg, 'SSH key copy failed', 'OK', 'Error') | Out-Null
+                return $false
+            }
+        }
     } else {
         Write-Log "Local private key not found at $sshKeyPath; skipping remote copy." 'Warn'
     }
@@ -449,9 +513,32 @@ echo SSH_KEY_COPIED
     # shared account's file. Doing that replaced every colleague's entries on each start,
     # could bring in an outdated github.com key that then broke everyone's git push, and a
     # large file could exceed the Windows command-line length limit. Now we only make sure
-    # the file exists (older container setups mount it) and add github.com's host keys if
-    # the file has none yet. Existing lines are never changed or removed.
-    $khCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/known_hosts && { ssh-keygen -F github.com -f ~/.ssh/known_hosts >/dev/null 2>&1 || ssh-keyscan -T 10 -t ed25519,ecdsa,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null || true; } && echo KNOWN_HOSTS_OK"
+    # the file exists (older container setups mount it) and that it has a CURRENT key of
+    # github.com. Lines of other hosts are never changed.
+    # Why "current": just checking that SOME github.com line exists was not enough. A copy
+    # that holds only GitHub's old RSA key (replaced by GitHub in March 2023) makes OpenSSH
+    # refuse github.com with "REMOTE HOST IDENTIFICATION HAS CHANGED", which breaks the
+    # push on Stop for every colleague, and IMPACT never repaired it. So we compare the
+    # stored keys with GitHub's published fingerprints
+    # (https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints;
+    # update the three values below if GitHub ever changes its keys). Only when none of
+    # them is present are github.com's lines replaced, and only by freshly scanned key
+    # lines whose fingerprint is one of those (a tampered network answer is never stored;
+    # if nothing matches, the file stays as it is). 'ssh-keygen -R' also removes hashed
+    # lines (Ubuntu stores known_hosts hashed by default).
+    # The script is written on several lines for readability and joined into ONE line
+    # before it is sent, which is why every line ends with ';' or an operator.
+    $ghFpArgs = "-e 'SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU' -e 'SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM' -e 'SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s'"
+    $khScript = @'
+mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/known_hosts && {
+if ssh-keygen -l -F github.com -f ~/.ssh/known_hosts 2>/dev/null | grep -qF %%FP%%; then :;
+else t=$(mktemp) && {
+ssh-keyscan -T 10 -t ed25519,ecdsa,rsa github.com 2>/dev/null | while read -r l; do printf '%s\n' "$l" | ssh-keygen -l -f - 2>/dev/null | grep -qF %%FP%% && printf '%s\n' "$l"; done > "$t";
+if [ -s "$t" ]; then ssh-keygen -R github.com -f ~/.ssh/known_hosts >/dev/null 2>&1; cat "$t" >> ~/.ssh/known_hosts; fi;
+rm -f "$t"; };
+fi; true; } && echo KNOWN_HOSTS_OK
+'@
+    $khCmd = ($khScript.Trim() -replace '\s*\r?\n\s*', ' ').Replace('%%FP%%', $ghFpArgs)
     $khOut = $null
     try { $khOut = & ssh @sshArgs $khCmd 2>&1 } catch { $khOut = $_.Exception.Message }
     if (-not ($khOut -match 'KNOWN_HOSTS_OK')) { Write-Log "Remote known_hosts check may have failed: $khOut" 'Warn' }
@@ -561,15 +648,61 @@ echo SSH_KEY_COPIED
         return $false
     }
 
-    $selectedRepo = $listBox.SelectedItem
-    $State.SelectedRepo = $selectedRepo
+    $selectedRepo = [string]$listBox.SelectedItem
+
+    # The folder name is reused as the container name, the image name and the folder name
+    # inside the container. Folder names with spaces, brackets or umlauts (for example
+    # 'IMPACTncd_Germany - Kopie') are listed whole now, but Docker rejects them, and
+    # Start then failed with only "Docker build failed". So, as in the local flow,
+    # ConvertTo-DockerSafeRepoName (module) gives a Docker-safe form of the name. The
+    # REAL folder name is still used for the path on the workstation (RemoteRepo below),
+    # because that is where the files actually are.
+    $safeRepoName = ConvertTo-DockerSafeRepoName -Name $selectedRepo
+    if (-not $safeRepoName) {
+        Write-Log "Remote folder name '$selectedRepo' cannot be turned into a Docker name." 'Error'
+        [System.Windows.Forms.MessageBox]::Show(
+            "The folder name '$selectedRepo' cannot be used by Docker.`n`nPlease ask the workstation admin to rename the folder in $remoteRepoBase using only letters (A-Z), digits, '-' or '_' (for example IMPACTncd_Germany), then try again.",
+            'Unsupported Folder Name', 'OK', 'Error') | Out-Null
+        return $false
+    }
+    if ($safeRepoName -cne $selectedRepo) {
+        Write-Log "Remote folder name '$selectedRepo' contains characters Docker does not accept; using '$safeRepoName' for the container and image name instead." 'Warn'
+    }
+
+    # The model repository must contain a 'docker_setup' folder (the image is built from
+    # it). The Start button only checks this for local runs, so a wrong choice on the
+    # workstation used to show up only as a failed image build. One quick ssh call
+    # checks it now. If the check itself cannot run (no marker comes back), we do not
+    # block the user here; the later steps report connection problems clearly.
+    $quotedDockerSetup = "'" + "$remoteRepoBase/$selectedRepo/docker_setup".Replace("'", "'\''") + "'"
+    $setupCheckOut = $null
+    try { $setupCheckOut = & ssh @sshArgs "test -d $quotedDockerSetup && echo DOCKER_SETUP_OK || echo DOCKER_SETUP_MISSING" 2>&1 } catch { $setupCheckOut = $_.Exception.Message }
+    if ("$setupCheckOut" -match 'DOCKER_SETUP_MISSING') {
+        Write-Log "No docker_setup folder found in remote folder: $remoteRepoBase/$selectedRepo" 'Error'
+        [System.Windows.Forms.MessageBox]::Show(
+            "The folder '$selectedRepo' on the workstation does not contain a 'docker_setup' folder, so it is not an IMPACT model repository.`n`nPlease choose the model repository (for example IMPACTncd_Germany).",
+            'Not a Model Repository', 'OK', 'Error') | Out-Null
+        return $false
+    } elseif ("$setupCheckOut" -notmatch 'DOCKER_SETUP_OK') {
+        Write-Log "Could not check for docker_setup in $remoteRepoBase/${selectedRepo}: $setupCheckOut" 'Warn'
+    }
+
+    $State.SelectedRepo = $safeRepoName
     $State.Paths.RemoteRepo = "$remoteRepoBase/$selectedRepo"
-    $State.ContainerName = "${selectedRepo}_$($State.UserName)"
+    $State.ContainerName = "${safeRepoName}_$($State.UserName)"
     Write-Log "Selected remote repo: $($State.Paths.RemoteRepo)" 'Info'
 
     # 4.1.4: Configure Docker context over SSH (primary path) with direct-SSH fallback
     $contextName = "remote-$remoteIp"
     $State.Metadata.RemoteDockerContext = $contextName
+
+    # The local preparation (if the user chose Local earlier in this session and then went
+    # Back) set DOCKER_CONTEXT for this process. Remove it again: otherwise the repair
+    # below would read 'local' from 'docker context show' instead of the global setting.
+    if ($State.Metadata['DockerContextEnvSet']) {
+        $env:DOCKER_CONTEXT = $null
+        $State.Metadata['DockerContextEnvSet'] = $false
+    }
 
     Write-Log "Ensuring Docker context $contextName exists (ssh://$remoteHost)" 'Info'
     $ctxExists = (& docker context ls --format '{{.Name}}' 2>$null) -contains $contextName
@@ -765,7 +898,10 @@ function Ensure-LocalPreparation {
     $folderResult = $folderBrowser.ShowDialog()
     if ($folderResult -ne [System.Windows.Forms.DialogResult]::OK) {
         Write-Log 'Folder selection cancelled.' 'Warn'
-        [System.Windows.Forms.MessageBox]::Show('Folder selection is required to continue.', 'Selection Cancelled', 'OK', 'Warning') | Out-Null
+        # Say where the user ends up: returning $false takes them back to the location
+        # choice (the wizard does not exit), so the old "required to continue" text was
+        # misleading.
+        [System.Windows.Forms.MessageBox]::Show("No folder was selected.`n`nIMPACT goes back to the previous step, where you can choose the location again.", 'Selection Cancelled', 'OK', 'Information') | Out-Null
         return $false
     }
 
@@ -898,6 +1034,10 @@ function Ensure-LocalPreparation {
     # checks below really test the Docker engine on THIS computer.
     $env:DOCKER_HOST = $null
     $env:DOCKER_SSH_OPTS = $null
+    # DOCKER_CONTEXT is set again at the end of this function (see there). Cleared now so
+    # that a value from an earlier pass (for example a context that no longer exists)
+    # cannot make the docker commands below fail.
+    $env:DOCKER_CONTEXT = $null
 
     # Create the 'local' Docker context FIRST, so that every check below can name it
     # explicitly with '--context local'. Before, the checks used whatever context was
@@ -923,6 +1063,17 @@ function Ensure-LocalPreparation {
         }
     } else {
         Write-Log "Context '$LocalContextName' already exists." 'Debug'
+    }
+    # Every check below names this context explicitly. If it could not be created (for
+    # example because the .docker folder in the user profile is not writable), each check
+    # would fail with 'context "local" does not exist' although Docker Desktop is running,
+    # and the user would be told that Docker could not be started. Docker's built-in
+    # 'default' context always exists and, with DOCKER_HOST cleared above, also talks to
+    # the Docker engine on this computer, so we use that one instead.
+    & docker context inspect $LocalContextName *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Log "Docker context '$LocalContextName' is not available; using Docker's built-in 'default' context instead." 'Warn'
+        $LocalContextName = 'default'
     }
 
     # Text Docker prints when this Windows account is not allowed to use Docker
@@ -1122,18 +1273,29 @@ function Ensure-LocalPreparation {
         Write-Log 'Docker engine is running.' 'Info'
     }
 
-    # NOTE: 'docker context use' changes the user's GLOBAL Docker context. It is kept for
-    # now because the local image builds (Start button) still call 'docker build' without
-    # '--context', and switching to 'local' here makes them use this computer. It also
-    # repairs computers where an older version of this app left the global context
-    # pointing at the workstation. Once every local docker call passes '--context local',
-    # this line can be removed.
-    & docker context use $LocalContextName *> $null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Log "Switched to Docker context '$LocalContextName'." 'Info'
-    } else {
-        Write-Log "Failed to switch to Docker context '$LocalContextName'." 'Warn'
+    # We no longer run 'docker context use' here. It changed the user's GLOBAL Docker
+    # setting (saved in ~/.docker/config.json), which stayed changed after IMPACT closed.
+    # Instead, DOCKER_CONTEXT is set for THIS PowerShell process only: every docker
+    # command IMPACT starts (also a 'docker build' that does not pass '--context', which
+    # inherits this environment) then uses the local engine, and the user's own setting
+    # is left alone. It disappears when IMPACT closes.
+    # Repair first (DOCKER_CONTEXT is still cleared here, so 'docker context show' reports
+    # the GLOBAL setting): older versions of this app left the global context pointing at
+    # a workstation ('remote-<ip>'), so the user's own docker commands talked to it. Switch
+    # it back to Docker's built-in 'default' context. ('docker context show' does not
+    # exist in very old Docker versions; then the exit code is non-zero and we skip this.)
+    $currentGlobalContext = "$(& docker context show 2>$null)".Trim()
+    if ($LASTEXITCODE -eq 0 -and $currentGlobalContext -like 'remote-*') {
+        & docker context use default *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log "Reset the global Docker context from '$currentGlobalContext' back to 'default' (left over from an older version of this app)." 'Info'
+        }
     }
+    $env:DOCKER_CONTEXT = $LocalContextName
+    # Remembered so the remote preparation can remove it again if the user goes Back and
+    # chooses the workstation.
+    $State.Metadata['DockerContextEnvSet'] = $true
+    Write-Log "Using Docker context '$LocalContextName' for this IMPACT session (DOCKER_CONTEXT)." 'Info'
 
     & docker --context $LocalContextName version 2>&1 | Out-Null
     if ($LASTEXITCODE -eq 0) {
@@ -1300,7 +1462,11 @@ function Get-ContainerStatus {
     # Always start from empty recovered details (F32). They used to be reset only when
     # the container was running, so after Stop + Back the old password, port and
     # volume flag of a previous container were shown again for a new one.
-    $State.Metadata.Recovered = @{ Password = $null; Port = $null; UseVolumes = $false; OutputDir = $null; SynthpopDir = $null; VolumeOutput = $null; VolumeSynthpop = $null }
+    # RepoPath: the repository folder the running container really mounts, when the
+    # container records it (see below); $null otherwise. Other code resets Recovered
+    # without this key, so read it with ['RepoPath'] (dot syntax throws under StrictMode
+    # when the key is missing).
+    $State.Metadata.Recovered = @{ Password = $null; Port = $null; UseVolumes = $false; OutputDir = $null; SynthpopDir = $null; VolumeOutput = $null; VolumeSynthpop = $null; RepoPath = $null }
 
     # If running, attempt to recover connection details
     if ($isRunning) {
@@ -1310,7 +1476,11 @@ function Get-ContainerStatus {
             if ($meta) {
                 # Check each property before reading it: StrictMode throws on missing
                 # properties, and newer metadata files no longer contain the password (F40).
-                if ($meta.PSObject.Properties['password'] -and $meta.password) { $State.Metadata.Recovered.Password = $meta.password }
+                # The password is deliberately NOT read from this file any more: files
+                # written by older versions still hold it in plain text in a folder every
+                # colleague on the shared account can read. The container itself is the
+                # source for it (Get-ContainerRuntimeInfo below reads it from 'docker
+                # inspect'), so this file is never needed as a password source.
                 if ($meta.PSObject.Properties['port'] -and $meta.port) { $State.Metadata.Recovered.Port = $meta.port }
                 if ($meta.PSObject.Properties['useVolumes'] -and $null -ne $meta.useVolumes) { $metaUseVolumes = [bool]$meta.useVolumes }
             }
@@ -1330,6 +1500,14 @@ function Get-ContainerStatus {
         $State.Metadata.Recovered.SynthpopDir = $runtime.SynthpopDir
         $State.Metadata.Recovered.VolumeOutput = $runtime.VolumeOutput
         $State.Metadata.Recovered.VolumeSynthpop = $runtime.VolumeSynthpop
+        # The repository folder the container really mounts (from an 'impact.repo_path'
+        # label, if Get-ContainerRuntimeInfo provides one). With two clones that have the
+        # same folder name, the container manager can use it so that Stop commits and
+        # copies results for the right folder. Index syntax ['RepoPath'] returns $null
+        # when the key does not exist, which StrictMode allows (dot syntax would throw).
+        if ($runtime -is [System.Collections.IDictionary] -and $runtime['RepoPath']) {
+            $State.Metadata.Recovered.RepoPath = [string]$runtime['RepoPath']
+        }
     }
     return $State
 }
