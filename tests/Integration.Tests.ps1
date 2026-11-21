@@ -374,8 +374,9 @@ Describe 'Build-DockerRunCommand end-to-end' -Tag Integration {
         $joined | Should -Match '--name impact-inttest'
         $joined | Should -Match 'PASSWORD=IntPass!'
         $joined | Should -Match '9999:8787'
-        $joined | Should -Match 'impactncd_germany_output_inttest'
-        $joined | Should -Match 'impactncd_germany_synthpop_inttest'
+        # Volume names now include the container name (repo + user), F48
+        $joined | Should -Match 'impactncd_output_impact-inttest'
+        $joined | Should -Match 'impactncd_synthpop_impact-inttest'
         $joined | Should -Match 'impactncd_germany$'  # image name is last
     }
 
@@ -400,7 +401,7 @@ Describe 'Build-DockerRunCommand end-to-end' -Tag Integration {
         $joined | Should -Match '-m 384g'
         $joined | Should -Match 'type=bind,source=/mnt/Storage_1/IMPACT_Storage/Base/outputs'
         $joined | Should -Match 'type=bind,source=/mnt/Storage_1/IMPACT_Storage/Base/inputs/synthpop'
-        $joined | Should -Not -Match 'impactncd_germany_output_'  # no volume names in bind mode
+        $joined | Should -Not -Match 'impactncd_output_'  # no volume names in bind mode
     }
 }
 
@@ -690,7 +691,7 @@ Describe 'Remote container metadata lifecycle (mocked SSH)' -Tag Integration {
         $state.ContainerName = 'impact-metauser'
         $state.SelectedRepo  = 'IMPACTncd_Germany'
 
-        Write-RemoteContainerMetadata -State $state -Password 'MetaPass!' -Port '8787' -UseVolumes $false
+        Write-RemoteContainerMetadata -State $state -Port '8787' -UseVolumes $false
 
         $script:sshCommands.Count | Should -BeGreaterThan 0
         $lastCmd = $script:sshCommands[-1]
@@ -698,6 +699,11 @@ Describe 'Remote container metadata lifecycle (mocked SSH)' -Tag Integration {
         $lastCmd | Should -Match 'mkdir -p /tmp/impactncd'
         $lastCmd | Should -Match 'base64 -d'
         $lastCmd | Should -Match 'impact-metauser\.json'
+        # The RStudio password must not be stored in the shared /tmp file (F40)
+        $b64 = [regex]::Match($lastCmd, 'echo (\S+) \| base64 -d').Groups[1].Value
+        $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+        $json | Should -Not -Match 'password'
+        $json | Should -Not -Match 'MetaPass'
     }
 
     It 'Write-RemoteContainerMetadata is a no-op for LOCAL mode' {
@@ -707,7 +713,7 @@ Describe 'Remote container metadata lifecycle (mocked SSH)' -Tag Integration {
         } -ModuleName 'IMPACT_Docker_GUI'
 
         $state = New-TestSessionState -Location 'LOCAL'
-        Write-RemoteContainerMetadata -State $state -Password 'x' -Port '8787' -UseVolumes $false
+        Write-RemoteContainerMetadata -State $state -Port '8787' -UseVolumes $false
 
         $script:sshCommands.Count | Should -Be 0
     }
@@ -1340,5 +1346,197 @@ Describe 'Invoke-GitChangeDetection commit and push flow (mocked)' -Tag Integrat
         $result.Outcome | Should -Be 'PushFailed'
         $result.Success | Should -BeFalse
         $script:sshCalls.Count | Should -Be 2
+    }
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Container lifecycle / Docker volumes (mocked docker): F01, F02, F04, F13, F17
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Get-UsedPorts host address handling (mocked docker)' -Tag Integration {
+    It 'Finds ports bound to 127.0.0.1, 0.0.0.0 and [::]' {
+        Mock docker {
+            $global:LASTEXITCODE = 0
+            return @('127.0.0.1:8790->8787/tcp', '0.0.0.0:8787->8787/tcp, [::]:8787->8787/tcp', '8787/tcp', '0.0.0.0:5432->5432/tcp')
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $ports = @(Get-UsedPorts)
+        $ports | Should -Contain '8790'
+        $ports | Should -Contain '8787'
+        $ports | Should -Not -Contain '5432'
+        $ports.Count | Should -Be 2
+    }
+}
+
+Describe 'Get-ContainerRuntimeInfo labels and mounts (mocked docker)' -Tag Integration {
+    It 'Recovers volume mode, result folders and volume names from labels and mounts' {
+        Mock docker {
+            $joined = ($args | ForEach-Object { $_ }) -join ' '
+            $global:LASTEXITCODE = 0
+            if ($joined -match 'range .Config.Env') { return @('PASSWORD=Secret1', 'USERID=1000') }
+            if ($joined -match 'NetworkSettings.Ports') { return '8790' }
+            if ($joined -match 'json .Config.Labels') {
+                return ('{"impact.use_volumes":"true","impact.output_dir":"/mnt/out","impact.synthpop_dir":"/mnt/syn","maintainer":"a","Maintainer":"b"}' + "`t" +
+                        '[{"Type":"volume","Name":"impactncd_output_R_u","Destination":"/home/rstudio/R/outputs"},{"Type":"volume","Name":"impactncd_synthpop_R_u","Destination":"/home/rstudio/R/inputs/synthpop"},{"Type":"bind","Source":"/x","Destination":"/home/rstudio/R"}]')
+            }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.1'
+        $info = Get-ContainerRuntimeInfo -State $state
+        $info.Password       | Should -Be 'Secret1'
+        $info.Port           | Should -Be '8790'
+        $info.UseVolumes     | Should -BeTrue
+        $info.OutputDir      | Should -Be '/mnt/out'
+        $info.SynthpopDir    | Should -Be '/mnt/syn'
+        $info.VolumeOutput   | Should -Be 'impactncd_output_R_u'
+        $info.VolumeSynthpop | Should -Be 'impactncd_synthpop_R_u'
+    }
+
+    It 'Detects volume mode from the mounts of a container started by an older version (no labels)' {
+        Mock docker {
+            $joined = ($args | ForEach-Object { $_ }) -join ' '
+            $global:LASTEXITCODE = 0
+            if ($joined -match 'json .Config.Labels') {
+                return ('null' + "`t" + '[{"Type":"volume","Name":"impactncd_germany_output_u","Destination":"/home/rstudio/R/outputs"}]')
+            }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $info = Get-ContainerRuntimeInfo -State (New-TestSessionState)
+        $info.UseVolumes   | Should -BeTrue
+        $info.VolumeOutput | Should -Be 'impactncd_germany_output_u'
+        $info.OutputDir    | Should -BeNullOrEmpty
+    }
+
+    It 'Reports a bind-mode container as UseVolumes = false' {
+        Mock docker {
+            $joined = ($args | ForEach-Object { $_ }) -join ' '
+            $global:LASTEXITCODE = 0
+            if ($joined -match 'json .Config.Labels') {
+                return ('{"impact.use_volumes":"false","impact.output_dir":"C:\\o"}' + "`t" + '[{"Type":"bind","Source":"/c/o","Destination":"/home/rstudio/R/outputs"}]')
+            }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $info = Get-ContainerRuntimeInfo -State (New-TestSessionState)
+        $info.UseVolumes | Should -BeFalse
+        $info.OutputDir  | Should -Be 'C:\o'
+    }
+
+    It 'Leaves UseVolumes unknown ($null) when docker inspect fails' {
+        Mock docker { $global:LASTEXITCODE = 1; return '' } -ModuleName 'IMPACT_Docker_GUI'
+        $info = Get-ContainerRuntimeInfo -State (New-TestSessionState)
+        $info.UseVolumes | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Initialize-RsyncHelperImage (mocked docker)' -Tag Integration {
+    It 'Returns true without building when the image already exists' {
+        $script:b3Calls = @()
+        Mock docker {
+            $script:b3Calls += (($args | ForEach-Object { $_ }) -join ' ')
+            $global:LASTEXITCODE = 0
+        } -ModuleName 'IMPACT_Docker_GUI'
+        Initialize-RsyncHelperImage -State (New-TestSessionState) | Should -BeTrue
+        ($script:b3Calls -join "`n") | Should -Not -Match 'build'
+    }
+
+    It 'Returns false when the image is still missing after the build' {
+        Mock docker {
+            $joined = ($args | ForEach-Object { $_ }) -join ' '
+            $global:LASTEXITCODE = 1
+            if ($joined -match 'build') { return 'ERROR: failed to fetch alpine' }
+        } -ModuleName 'IMPACT_Docker_GUI'
+        Initialize-RsyncHelperImage -State (New-TestSessionState) | Should -BeFalse
+    }
+
+    It 'Builds without a local build context (Dockerfile on stdin)' {
+        $script:b3Calls = @()
+        $script:b3Built = $false
+        Mock docker {
+            $joined = ($args | ForEach-Object { $_ }) -join ' '
+            $script:b3Calls += $joined
+            if ($joined -match 'image inspect') { $global:LASTEXITCODE = $(if ($script:b3Built) { 0 } else { 1 }); return }
+            if ($joined -match 'build') { $script:b3Built = $true }
+            $global:LASTEXITCODE = 0
+        } -ModuleName 'IMPACT_Docker_GUI'
+        Initialize-RsyncHelperImage -State (New-TestSessionState) | Should -BeTrue
+        ($script:b3Calls | Where-Object { $_ -match 'build' }) | Should -Match 'build -t rsync-alpine -$'
+    }
+}
+
+Describe 'Sync-ImpactVolumeToHost (mocked docker)' -Tag Integration {
+    BeforeEach {
+        $script:b3Calls = @()
+        $script:b3RsyncExit = 0
+        $script:b3VolumeInspect = @{ Exit = 0; Out = '{"impact.target_dir":"/mnt/out"}' }
+        Mock docker {
+            $joined = ($args | ForEach-Object { $_ }) -join ' '
+            $script:b3Calls += $joined
+            if ($joined -match 'volume inspect') { $global:LASTEXITCODE = $script:b3VolumeInspect.Exit; return $script:b3VolumeInspect.Out }
+            if ($joined -match 'rsync-alpine rsync') { $global:LASTEXITCODE = $script:b3RsyncExit; return 'rsync: write failed' }
+            $global:LASTEXITCODE = 0
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+    }
+
+    It 'Refuses to copy when the target folder is unknown, and never runs rsync' {
+        $r = Sync-ImpactVolumeToHost -State (New-TestSessionState) -VolumeName 'vol1' -HostDir ''
+        $r.Success | Should -BeFalse
+        $r.Message | Should -Match 'unknown'
+        ($script:b3Calls -join "`n") | Should -Not -Match 'rsync'
+    }
+
+    It 'Reports failure when rsync fails (so the caller keeps the volume)' {
+        $script:b3RsyncExit = 23
+        $r = Sync-ImpactVolumeToHost -State (New-TestSessionState -Location 'REMOTE@10.0.0.1') -VolumeName 'vol1' -HostDir '/mnt/out'
+        $r.Success | Should -BeFalse
+        $r.Missing | Should -BeFalse
+        $r.Message | Should -Match 'failed'
+    }
+
+    It 'Succeeds when rsync exits 0 and converts a LOCAL Windows path for docker' {
+        $r = Sync-ImpactVolumeToHost -State (New-TestSessionState) -VolumeName 'vol1' -HostDir 'C:\Users\u\out'
+        $r.Success | Should -BeTrue
+        ($script:b3Calls | Where-Object { $_ -match 'rsync-alpine rsync' }) | Should -Match '/c/Users/u/out:/backup'
+    }
+
+    It 'Treats a volume that does not exist as nothing to copy' {
+        $script:b3VolumeInspect = @{ Exit = 1; Out = 'Error response from daemon: get vol1: no such volume' }
+        $r = Sync-ImpactVolumeToHost -State (New-TestSessionState) -VolumeName 'vol1' -HostDir 'C:\o'
+        $r.Success | Should -BeTrue
+        $r.Missing | Should -BeTrue
+        ($script:b3Calls -join "`n") | Should -Not -Match 'rsync-alpine rsync'
+    }
+
+    It 'Fails (does not claim success) when Docker cannot be reached' {
+        $script:b3VolumeInspect = @{ Exit = 1; Out = 'Cannot connect to the Docker daemon' }
+        $r = Sync-ImpactVolumeToHost -State (New-TestSessionState) -VolumeName 'vol1' -HostDir 'C:\o'
+        $r.Success | Should -BeFalse
+        $r.Missing | Should -BeFalse
+    }
+}
+
+Describe 'Get-ImpactVolumeInfo (mocked docker)' -Tag Integration {
+    It 'Returns the recorded target folder and the containers that still use the volume' {
+        Mock docker {
+            $joined = ($args | ForEach-Object { $_ }) -join ' '
+            $global:LASTEXITCODE = 0
+            if ($joined -match 'volume inspect') { return '{"impact.target_dir":"/mnt/out","impact.container":"R_u"}' }
+            if ($joined -match 'ps -a --filter volume=vol1') { return @('helper_1', '') }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+        $vi = Get-ImpactVolumeInfo -State (New-TestSessionState) -VolumeName 'vol1'
+        $vi.Exists    | Should -BeTrue
+        $vi.TargetDir | Should -Be '/mnt/out'
+        @($vi.UsedBy) | Should -Be @('helper_1')
+    }
+
+    It 'Handles a volume without labels' {
+        Mock docker { $global:LASTEXITCODE = 0; return 'null' } -ModuleName 'IMPACT_Docker_GUI'
+        $vi = Get-ImpactVolumeInfo -State (New-TestSessionState) -VolumeName 'vol1'
+        $vi.Exists    | Should -BeTrue
+        $vi.TargetDir | Should -BeNullOrEmpty
     }
 }

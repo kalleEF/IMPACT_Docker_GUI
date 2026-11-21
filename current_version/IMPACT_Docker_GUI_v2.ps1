@@ -1182,8 +1182,10 @@ function Get-ContainerStatus {
             if ($psExitCode -eq 0) {
                 $dockerReachable = $true
                 foreach ($line in ($all -split "`n")) {
-                    if ($line -match '0\.0\.0\.0:(\d{4})->8787/tcp') {
-                        $port = $matches[1]
+                    # Any host address (0.0.0.0, [::], or 127.0.0.1 for LOCAL containers, F13);
+                    # same pattern as Get-UsedPorts in the module.
+                    foreach ($m in [regex]::Matches($line, ':(\d{4,5})->8787/tcp')) {
+                        $port = $m.Groups[1].Value
                         if ($portUsers -notcontains $port) { $portUsers += $port }
                     }
                 }
@@ -1295,24 +1297,39 @@ function Get-ContainerStatus {
             }
         }
     }
+    # Always start from empty recovered details (F32). They used to be reset only when
+    # the container was running, so after Stop + Back the old password, port and
+    # volume flag of a previous container were shown again for a new one.
+    $State.Metadata.Recovered = @{ Password = $null; Port = $null; UseVolumes = $false; OutputDir = $null; SynthpopDir = $null; VolumeOutput = $null; VolumeSynthpop = $null }
 
     # If running, attempt to recover connection details
     if ($isRunning) {
-        # Pre-seed recovered fields so strict mode does not throw on missing properties
-        $State.Metadata.Recovered = @{ Password = $null; Port = $null; UseVolumes = $false }
+        $metaUseVolumes = $null
         if ($State.ContainerLocation -like 'REMOTE@*') {
             $meta = Read-RemoteContainerMetadata -State $State
             if ($meta) {
-                $State.Metadata.Recovered.Password = $meta.password
-                $State.Metadata.Recovered.Port = $meta.port
-                $State.Metadata.Recovered.UseVolumes = $meta.useVolumes
+                # Check each property before reading it: StrictMode throws on missing
+                # properties, and newer metadata files no longer contain the password (F40).
+                if ($meta.PSObject.Properties['password'] -and $meta.password) { $State.Metadata.Recovered.Password = $meta.password }
+                if ($meta.PSObject.Properties['port'] -and $meta.port) { $State.Metadata.Recovered.Port = $meta.port }
+                if ($meta.PSObject.Properties['useVolumes'] -and $null -ne $meta.useVolumes) { $metaUseVolumes = [bool]$meta.useVolumes }
             }
         }
-        if (-not $State.Metadata.Recovered.Password -or -not $State.Metadata.Recovered.Port) {
-            $runtime = Get-ContainerRuntimeInfo -State $State
-            if ($runtime.Password) { $State.Metadata.Recovered.Password = $runtime.Password }
-            if ($runtime.Port) { $State.Metadata.Recovered.Port = $runtime.Port }
+        # Always inspect the container itself: it is the most reliable source and, through
+        # its labels and mounts, the only one that also works for LOCAL containers (F04).
+        $runtime = Get-ContainerRuntimeInfo -State $State
+        if ($runtime.Password) { $State.Metadata.Recovered.Password = $runtime.Password }
+        if ($runtime.Port) { $State.Metadata.Recovered.Port = $runtime.Port }
+        if ($null -ne $runtime.UseVolumes) {
+            $State.Metadata.Recovered.UseVolumes = [bool]$runtime.UseVolumes
+        } elseif ($null -ne $metaUseVolumes) {
+            $State.Metadata.Recovered.UseVolumes = $metaUseVolumes
         }
+        # Where results must be copied back to at Stop, and which volumes hold them.
+        $State.Metadata.Recovered.OutputDir = $runtime.OutputDir
+        $State.Metadata.Recovered.SynthpopDir = $runtime.SynthpopDir
+        $State.Metadata.Recovered.VolumeOutput = $runtime.VolumeOutput
+        $State.Metadata.Recovered.VolumeSynthpop = $runtime.VolumeSynthpop
     }
     return $State
 }
@@ -1321,7 +1338,7 @@ function Get-ContainerStatus {
 function Show-ContainerManager {
     param([pscustomobject]$State)
     if (-not $State.Metadata.ContainsKey('Recovered') -or -not $State.Metadata.Recovered) {
-        $State.Metadata.Recovered = @{ UseVolumes = $false; Password = $null; Port = $null }
+        $State.Metadata.Recovered = @{ UseVolumes = $false; Password = $null; Port = $null; OutputDir = $null; SynthpopDir = $null; VolumeOutput = $null; VolumeSynthpop = $null }
     }
     if (-not $State.Metadata.ContainsKey('ActivePort')) { $State.Metadata.ActivePort = $null }
     if (-not $State.Metadata.ContainsKey('ActiveUseVolumes')) { $State.Metadata.ActiveUseVolumes = $false }
@@ -1329,6 +1346,13 @@ function Show-ContainerManager {
     if (-not $State.Metadata.ContainsKey('ActiveIsRemote')) { $State.Metadata.ActiveIsRemote = $false }
     Write-Log 'Opening container manager UI.' 'Info'
     $isRunning = $State.Metadata.ContainerRunning
+    if (-not $isRunning) {
+        # Nothing is running for this repo, so forget the port and volume mode of a
+        # container from earlier in this session (for example after Stop and Back),
+        # otherwise the info box would show a stale port (F32).
+        $State.Metadata.ActivePort = $null
+        $State.Metadata.ActiveUseVolumes = $false
+    }
     if ($isRunning) {
         $portDisplay = if ($State.Metadata.Recovered.Port) { ($State.Metadata.Recovered.Port -split '\s+')[0] } else { '8787' }
         $passDisplay = if ($State.Metadata.Recovered.Password) { $State.Metadata.Recovered.Password } else { $State.Password }
@@ -1338,12 +1362,20 @@ function Show-ContainerManager {
         Write-Log "Resumed existing container $($State.ContainerName) at $hostDisplay" 'Info'
         $State.Metadata.ActiveRepoPath = if ($State.ContainerLocation -eq 'LOCAL') { $State.Paths.LocalRepo } else { $State.Paths.RemoteRepo }
         $State.Metadata.ActiveIsRemote = ($State.ContainerLocation -like 'REMOTE@*')
-        $State.Metadata.ActiveUseVolumes = $State.Metadata.Recovered.UseVolumes
+        $State.Metadata.ActiveUseVolumes = [bool]$State.Metadata.Recovered.UseVolumes
         $State.Metadata.ActivePort = $portDisplay
+        # Restore the result folders recorded on the container (labels). Without them
+        # Stop cannot copy results out of the volumes (F01). They stay $null for
+        # containers started by older versions; Stop then keeps the volumes and says so.
+        $State.Paths.OutputDir = $State.Metadata.Recovered.OutputDir
+        $State.Paths.SynthpopDir = $State.Metadata.Recovered.SynthpopDir
         if ($State.Metadata.Recovered.UseVolumes) {
-            # Ensure expected volume names are populated for recovered sessions
-            $State.Metadata.VolumeOutput = "impactncd_germany_output_$($State.UserName)" -replace '[^a-zA-Z0-9_]','_'
-            $State.Metadata.VolumeSynthpop = "impactncd_germany_synthpop_$($State.UserName)" -replace '[^a-zA-Z0-9_]','_'
+            # Prefer the volume names the container really mounts (read with docker inspect),
+            # so containers started by an older version (other naming) are handled too.
+            # The computed names are only a fallback.
+            $fallbackNames = Get-ImpactVolumeNames -ContainerName $State.ContainerName
+            $State.Metadata.VolumeOutput = if ($State.Metadata.Recovered.VolumeOutput) { $State.Metadata.Recovered.VolumeOutput } else { $fallbackNames.Output }
+            $State.Metadata.VolumeSynthpop = if ($State.Metadata.Recovered.VolumeSynthpop) { $State.Metadata.Recovered.VolumeSynthpop } else { $fallbackNames.Synthpop }
         }
     }
 
@@ -1386,6 +1418,15 @@ function Show-ContainerManager {
     $form.Controls.Add($chkVolumes)
     $form.Controls.Add($chkRebuild)
     $form.Controls.Add($chkHigh)
+
+    # F85: the password in the info box is hidden by default, so it is not exposed when
+    # the screen is shared. This box reveals it when the user needs to read it.
+    # $uiState is a hashtable so the event handlers below can change it (a plain
+    # variable assigned inside a handler would only change a local copy).
+    $uiState = @{ ShowPassword = $false; Status = 'STOPPED' }
+    $chkShowPass = New-Object System.Windows.Forms.CheckBox -Property @{ Text='Show password'; Location=New-Object System.Drawing.Point(300,272); Size=New-Object System.Drawing.Size(200,22) }
+    Style-CheckBox -CheckBox $chkShowPass
+    $form.Controls.Add($chkShowPass)
 
     $lblPort = New-Object System.Windows.Forms.Label -Property @{ Text='Port (8787-8799)'; Location=New-Object System.Drawing.Point(20,304); Size=New-Object System.Drawing.Size(110,22) }
     $defaultPort = if ($State.Metadata.Recovered.Port) { $State.Metadata.Recovered.Port } else { Get-NextAvailablePort -UsedPorts $State.Ports.Used }
@@ -1449,7 +1490,9 @@ function Show-ContainerManager {
 
     $btnBack.Add_Click({
         if ($State.Metadata.ContainerRunning) {
-            [System.Windows.Forms.MessageBox]::Show('Please stop the container before going back.','Container running','OK','Warning') | Out-Null
+            # F18: if the container already ended on its own, Stop now detects that, copies
+            # results out of any Docker volumes and resets this flag, so point the user there.
+            [System.Windows.Forms.MessageBox]::Show("Please click 'Stop Container' before going back.`n`n(If the container already ended on its own, Stop tidies up and copies any results back.)",'Container running','OK','Warning') | Out-Null
             return
         }
         $form.Tag = 'back'
@@ -1523,8 +1566,14 @@ function Show-ContainerManager {
         param($Status)
         $info.Clear()
         $palette = Get-ThemePalette
+        # Remember the status so the 'Show password' box can redraw the same view.
+        $uiState.Status = $Status
 
         $passDisplay = if ($State.Metadata.Recovered.Password) { $State.Metadata.Recovered.Password } else { $State.Password }
+        if (-not $uiState.ShowPassword) {
+            # Fixed number of dots, so not even the password length is shown.
+            $passDisplay = ([string]::new([char]0x2022, 8)) + "   (tick 'Show password' to see it)"
+        }
         $portDisplay = if ($State.Metadata.ActivePort) { $State.Metadata.ActivePort } elseif ($State.Metadata.Recovered.Port) { ($State.Metadata.Recovered.Port -split '\s+')[0] } else { '8787' }
         $hostDisplay = if ($State.ContainerLocation -eq 'LOCAL') { "http://localhost:$portDisplay" } else { "http://$($State.RemoteHostIp):$portDisplay" }
 
@@ -1584,6 +1633,11 @@ function Show-ContainerManager {
     }
     Update-InfoBox -Status ($(if($isRunning){'RUNNING'}else{'STOPPED'}))
     $lblStatus.Text = ''
+
+    $chkShowPass.Add_CheckedChanged({
+        $uiState.ShowPassword = $chkShowPass.Checked
+        Update-InfoBox -Status $uiState.Status
+    })
 
     $btnStart.Add_Click({
         $useVolumes = $chkVolumes.Checked
@@ -1873,6 +1927,40 @@ function Show-ContainerManager {
 
         $repoMountSource = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $projectRoot } else { $projectRoot }
 
+        # F12 (partial): warn when another running container already uses this repository
+        # folder. On the shared workstation all colleagues work in the SAME checkout, so two
+        # containers on one folder mix their edits, git pulls and results, and a commit at
+        # Stop would include the other person's changes. We only warn; the user decides.
+        # (The 'Other containers are running' check above only sees this user's containers.)
+        try {
+            $ctxShared = Get-DockerContextArgs -State $State
+            $runningIds = @(& docker @ctxShared @('ps','-q') 2>$null | Where-Object { $_ -match '\S' })
+            if ($LASTEXITCODE -eq 0 -and $runningIds.Count -gt 0) {
+                $mountLines = & docker @ctxShared (@('inspect','-f','{{.Name}}{{range .Mounts}}{{if eq .Type "bind"}}|{{.Source}}{{end}}{{end}}') + $runningIds) 2>$null
+                $target = $repoMountSource.TrimEnd('/')
+                $sharing = @()
+                foreach ($ml in @($mountLines)) {
+                    $parts = "$ml" -split '\|'
+                    $otherName = $parts[0].Trim().TrimStart('/')
+                    if (-not $otherName -or $otherName -eq $State.ContainerName) { continue }
+                    foreach ($src in ($parts | Select-Object -Skip 1)) {
+                        $s = $src.Trim().TrimEnd('/')
+                        # Docker Desktop may report a LOCAL source with a prefix such as
+                        # /run/desktop/mnt/host/c/..., so for LOCAL compare the end of the path.
+                        $same = if ($State.ContainerLocation -eq 'LOCAL') { $s.EndsWith($target, [System.StringComparison]::OrdinalIgnoreCase) } else { $s -ceq $target }
+                        if ($same) { $sharing += $otherName; break }
+                    }
+                }
+                if ($sharing.Count -gt 0) {
+                    $msgShared = "Another running container is already using this repository folder:`n`n  $($sharing -join ', ')`n`n$projectRoot`n`nIf you both work in it at the same time, your edits, git pulls and results will mix, and a commit at Stop may include the other person's changes.`n`nStart anyway?"
+                    $answerShared = [System.Windows.Forms.MessageBox]::Show($msgShared, 'Repository already in use', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+                    if ($answerShared -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+                }
+            }
+        } catch {
+            Write-Log "Shared repository check failed (continuing): $($_.Exception.Message)" 'Debug'
+        }
+
         # Resolve the actual uid/gid of the host user so the container's rstudio
         # user matches.  This prevents the container from changing ownership of
         # bind-mounted files (especially .git) to a different uid.  The Rocker
@@ -1898,6 +1986,13 @@ function Show-ContainerManager {
             }
         }
 
+        # F13: in LOCAL mode publish RStudio on 127.0.0.1 only, so nobody else on the same
+        # Wi-Fi or network can reach the login page (and, after a login, the GitHub key).
+        # The GUI shows http://localhost:<port>, which keeps working. On the workstation the
+        # colleague's PC must reach the port, so REMOTE stays on all interfaces.
+        $hostPort = if ($portOverride) { $portOverride } else { '8787' }
+        $publishSpec = if ($State.ContainerLocation -eq 'LOCAL') { "127.0.0.1:${hostPort}:8787" } else { "${hostPort}:8787" }
+
         $dockerArgs = @('run','-d','--rm','--name',$State.ContainerName,
             '-e',"PASSWORD=$($State.Password)",
             '-e','DISABLE_AUTH=false',
@@ -1906,11 +2001,12 @@ function Show-ContainerManager {
             '-e','SYNC_ENABLED=false',
             '-e',"GIT_SSH_COMMAND=$(Get-ContainerGitSshCommand -UserName $State.UserName)",
             '--mount',"type=bind,source=$repoMountSource,target=/home/rstudio/$($State.SelectedRepo)",
-            '-p',($(if($portOverride){$portOverride}else{'8787'}) + ':8787')
+            '-p',$publishSpec
         )
 
         if ($customParams) {
-            $dockerArgs += ($customParams -split '\s+')
+            # F102: split like a shell, so a quoted value with spaces stays one argument.
+            $dockerArgs += @(Split-DockerCustomParams -Text $customParams)
         }
 
         if ($State.ContainerLocation -eq 'LOCAL') {
@@ -1919,48 +2015,147 @@ function Show-ContainerManager {
             $sshKeyPath = "/home/$($State.RemoteUser)/.ssh/id_ed25519_$($State.UserName)"
         }
 
+        # Removes the volumes created by THIS click when the start fails further down.
+        # That is safe: at that point they only hold copies of host files made a moment
+        # ago (volumes left over from an earlier session were dealt with before creating them).
+        $removeFreshVolumes = {
+            if ($useVolumes -and $State.Metadata.VolumeOutput -and $State.Metadata.VolumeSynthpop) {
+                & docker @(Get-DockerContextArgs -State $State) @('volume','rm','-f',$State.Metadata.VolumeOutput,$State.Metadata.VolumeSynthpop) 2>$null | Out-Null
+            }
+        }
+
         if ($useVolumes) {
-            $volOut = "impactncd_germany_output_$($State.UserName)" -replace '[^a-zA-Z0-9_]','_'
-            $volSyn = "impactncd_germany_synthpop_$($State.UserName)" -replace '[^a-zA-Z0-9_]','_'
-            $State.Metadata.VolumeOutput = $volOut
-            $State.Metadata.VolumeSynthpop = $volSyn
+            # F48: names include the container name (repo + user), so two repos no longer share volumes.
+            $volNames = Get-ImpactVolumeNames -ContainerName $State.ContainerName
+            $volOut = $volNames.Output
+            $volSyn = $volNames.Synthpop
+            # Not yet recorded in the state: $removeFreshVolumes must not touch these volumes
+            # before they were really created by this click.
+            $State.Metadata.VolumeOutput = $null
+            $State.Metadata.VolumeSynthpop = $null
 
             $ctxPrefix = Get-DockerContextArgs -State $State
 
-            # Ensure rsync-alpine exists (for later sync)
+            # F17: the rsync-alpine helper is needed to copy results back at Stop. Check that it
+            # really exists BEFORE any volume is created; the old code ignored a failed build,
+            # so the problem only appeared hours later when Stop could not copy the results.
             Write-Log 'Checking/building rsync-alpine helper image.' 'Debug'
-            & docker @ctxPrefix @('image','inspect','rsync-alpine') 2>$null
-            if ($LASTEXITCODE -ne 0) {
-                Write-Log 'rsync-alpine image not found; building inline.' 'Debug'
-                $dockerfileInline = "FROM alpine:latest`nRUN apk add --no-cache rsync"
-                if ($State.ContainerLocation -like 'REMOTE@*') {
-                    $dockerfileInline | & docker @ctxPrefix @('build','-t','rsync-alpine','-f','-','.')
+            if (-not (Initialize-RsyncHelperImage -State $State)) {
+                [System.Windows.Forms.MessageBox]::Show("The helper image needed for 'Use Docker Volumes' (rsync-alpine) could not be prepared. Usually Docker could not download the small Alpine Linux image (no internet access, a proxy, or a Docker Hub download limit).`n`nUntick 'Use Docker Volumes' to start without volumes, or check the network and try again.",'Volume helper missing','OK','Error') | Out-Null
+                return
+            }
+
+            # F02: volumes with these names may be left over from an earlier session that was
+            # never copied back (crash, reboot, Docker restart, or a failed Stop). They may hold
+            # the ONLY copy of results, so never delete them silently: copy them out first, or
+            # ask the user.
+            $volPairs = @(
+                @{ Name = $volOut; HostDir = $outputDir },
+                @{ Name = $volSyn; HostDir = $synthDir }
+            )
+            $leftovers = @()
+            foreach ($vp in $volPairs) {
+                $vi = Get-ImpactVolumeInfo -State $State -VolumeName $vp.Name
+                if ($null -eq $vi.Exists) {
+                    [System.Windows.Forms.MessageBox]::Show("Could not check the Docker volume '$($vp.Name)':`n$($vi.Error)`n`nCheck that Docker is running and try again.",'Volume check failed','OK','Error') | Out-Null
+                    return
+                }
+                if ($vi.Exists) {
+                    if ($vi.UsedBy.Count -gt 0) {
+                        [System.Windows.Forms.MessageBox]::Show("The Docker volume '$($vp.Name)' is still used by: $($vi.UsedBy -join ', ').`n`nStop or remove that container first.",'Volume in use','OK','Error') | Out-Null
+                        return
+                    }
+                    # Prefer the folder recorded when the volume was created: the YAML may point
+                    # somewhere else now.
+                    $target = if ($vi.TargetDir) { $vi.TargetDir } else { $vp.HostDir }
+                    $leftovers += [pscustomobject]@{ Name = $vp.Name; Target = $target }
+                }
+            }
+            if ($leftovers.Count -gt 0) {
+                $leftList = ($leftovers | ForEach-Object { "  - $($_.Name)`n      -> $($_.Target)" }) -join "`n"
+                $leftMsg = "Docker volumes from an earlier session of '$($State.ContainerName)' still exist:`n`n$leftList`n`nThey may contain results that were never copied back (for example after a crash, a reboot or a failed Stop).`n`nYes: copy their contents into the folders shown above, then start (recommended).`nNo: delete them WITHOUT copying, then start.`nCancel: do nothing."
+                $leftChoice = [System.Windows.Forms.MessageBox]::Show($leftMsg, 'Earlier results found', [System.Windows.Forms.MessageBoxButtons]::YesNoCancel, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button1)
+                if ($leftChoice -eq [System.Windows.Forms.DialogResult]::Yes) {
+                    foreach ($lo in $leftovers) {
+                        $lblStatus.Text = "Copying earlier results from $($lo.Name)..."
+                        $form.Refresh()
+                        $syncLeft = Sync-ImpactVolumeToHost -State $State -VolumeName $lo.Name -HostDir $lo.Target
+                        if (-not $syncLeft.Success) {
+                            $lblStatus.Text = ''
+                            [System.Windows.Forms.MessageBox]::Show("$($syncLeft.Message)`n`nNothing was deleted: the volume still holds the data. The container was not started.",'Copy failed','OK','Error') | Out-Null
+                            return
+                        }
+                    }
+                    $lblStatus.Text = ''
+                } elseif ($leftChoice -eq [System.Windows.Forms.DialogResult]::No) {
+                    $confirmDiscard = [System.Windows.Forms.MessageBox]::Show("Really delete these volumes and everything in them? This cannot be undone.`n`n$leftList", 'Delete earlier results?', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+                    if ($confirmDiscard -ne [System.Windows.Forms.DialogResult]::Yes) { return }
                 } else {
-                    $dockerfileInline | & docker build -t rsync-alpine -f - .
+                    return
+                }
+                # Only reached when the copy succeeded or the user explicitly chose to discard.
+                $rmLeftOut = & docker @ctxPrefix (@('volume','rm') + @($leftovers | ForEach-Object { $_.Name })) 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    [System.Windows.Forms.MessageBox]::Show("Could not remove the old Docker volumes:`n$rmLeftOut",'Volume error','OK','Error') | Out-Null
+                    return
+                }
+                Write-Log "Removed earlier volumes: $(($leftovers | ForEach-Object { $_.Name }) -join ', ')" 'Info'
+            }
+
+            # Create the volumes. The label records the host folder each one belongs to, so a
+            # later Start can copy leftovers to the right place even if the YAML changed.
+            Write-Log "Creating Docker volumes: $volOut, $volSyn" 'Debug'
+            foreach ($vp in $volPairs) {
+                $createOut = & docker @ctxPrefix @('volume','create','--label',"impact.target_dir=$($vp.HostDir)",'--label',"impact.container=$($State.ContainerName)",$vp.Name) 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    & docker @ctxPrefix @('volume','rm','-f',$volOut,$volSyn) 2>$null | Out-Null
+                    [System.Windows.Forms.MessageBox]::Show("Could not create the Docker volume '$($vp.Name)':`n$createOut",'Volume error','OK','Error') | Out-Null
+                    return
+                }
+            }
+            $State.Metadata.VolumeOutput = $volOut
+            $State.Metadata.VolumeSynthpop = $volSyn
+
+            # Fix ownership (checked now: a failure used to be ignored)
+            Write-Log "Setting volume ownership (chown ${containerUid}:${containerGid})." 'Debug'
+            foreach ($vn in @($volOut, $volSyn)) {
+                $chownOut = & docker @ctxPrefix @('run','--rm','-v',"${vn}:/volume",'alpine','sh','-c',"chown ${containerUid}:${containerGid} /volume") 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Log "Setting ownership of volume $vn failed: $chownOut" 'Error'
+                    & $removeFreshVolumes
+                    [System.Windows.Forms.MessageBox]::Show("Preparing the Docker volume '$vn' failed (could not set its owner):`n$chownOut",'Volume error','OK','Error') | Out-Null
+                    return
                 }
             }
 
-            Write-Log "Creating Docker volumes: $volOut, $volSyn" 'Debug'
-            & docker @ctxPrefix @('volume','rm',$volOut,'-f') 2>$null
-            & docker @ctxPrefix @('volume','rm',$volSyn,'-f') 2>$null
-            & docker @ctxPrefix @('volume','create',$volOut) | Out-Null
-            & docker @ctxPrefix @('volume','create',$volSyn) | Out-Null
-
-            # Fix ownership
-            Write-Log "Setting volume ownership (chown ${containerUid}:${containerGid})." 'Debug'
-            & docker @ctxPrefix @('run','--rm','-v',"${volOut}:/volume",'alpine','sh','-c',"chown ${containerUid}:${containerGid} /volume") 2>$null
-            & docker @ctxPrefix @('run','--rm','-v',"${volSyn}:/volume",'alpine','sh','-c',"chown ${containerUid}:${containerGid} /volume") 2>$null
-
-            # Pre-populate volumes from host dirs
+            # Pre-populate volumes from host dirs. One plain 'cp -r' whose result is checked
+            # (it used to end in '|| true', which hid every error). One unreadable file should
+            # not block the start, so on errors the user can still continue.
             Write-Log 'Pre-populating volumes from host directories.' 'Debug'
             $dockerOutputSource = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $outputDir } else { $outputDir }
             $dockerSynthSource  = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $synthDir } else { $synthDir }
-            & docker @ctxPrefix @('run','--rm','--user',"${containerUid}:${containerGid}",'-v',"${dockerOutputSource}:/source",'-v',"${volOut}:/volume",'alpine','sh','-c','cp -r /source/. /volume/ 2>/dev/null || cp -a /source/. /volume/ 2>/dev/null || true') 2>$null
-            & docker @ctxPrefix @('run','--rm','--user',"${containerUid}:${containerGid}",'-v',"${dockerSynthSource}:/source",'-v',"${volSyn}:/volume",'alpine','sh','-c','cp -r /source/. /volume/ 2>/dev/null || cp -a /source/. /volume/ 2>/dev/null || true') 2>$null
+            $prepopErrors = @()
+            foreach ($pp in @(@{ Src = $dockerOutputSource; Vol = $volOut }, @{ Src = $dockerSynthSource; Vol = $volSyn })) {
+                $cpOut = & docker @ctxPrefix @('run','--rm','--user',"${containerUid}:${containerGid}",'-v',"$($pp.Src):/source",'-v',"$($pp.Vol):/volume",'alpine','sh','-c','cp -r /source/. /volume/') 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    $prepopErrors += "$($pp.Vol): $((@($cpOut) | ForEach-Object { "$_" } | Select-Object -Last 3) -join ' ')"
+                }
+            }
+            if ($prepopErrors.Count -gt 0) {
+                Write-Log "Pre-populating volumes reported errors: $($prepopErrors -join ' / ')" 'Warn'
+                $prepopAnswer = [System.Windows.Forms.MessageBox]::Show("Copying your existing files into the Docker volumes reported errors:`n`n$($prepopErrors -join "`n")`n`nSome existing files may be missing inside the container (the files on disk are not affected).`n`nStart anyway?", 'Volume copy problem', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+                if ($prepopAnswer -ne [System.Windows.Forms.DialogResult]::Yes) {
+                    & $removeFreshVolumes
+                    return
+                }
+            }
 
             $dockerArgs += @('-v',"$($volOut):/home/rstudio/$($State.SelectedRepo)/outputs",
                              '-v',"$($volSyn):/home/rstudio/$($State.SelectedRepo)/inputs/synthpop")
         } else {
+            # Bind mode: make sure no volume names from an earlier start linger in the state.
+            $State.Metadata.VolumeOutput = $null
+            $State.Metadata.VolumeSynthpop = $null
             $outDocker = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $outputDir } else { $outputDir }
             $synDocker = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $synthDir } else { $synthDir }
             # repo already mounted above; only bind outputs and synthpop to avoid duplicate mount targets
@@ -1972,6 +2167,12 @@ function Show-ContainerManager {
             $dockerArgs += @('--cpus','32','-m','384g')
         }
 
+        # F01/F04: record how this container is started (volume mode, result folders,
+        # volume names) as Docker labels. A GUI that is closed and reopened reads them back
+        # (Get-ContainerRuntimeInfo), for LOCAL and REMOTE alike, so Stop can still copy the
+        # results to the right folders.
+        $dockerArgs += @(Get-ImpactContainerLabelArgs -UseVolumes $useVolumes -OutputDir $outputDir -SynthpopDir $synthDir -VolumeOutput $State.Metadata.VolumeOutput -VolumeSynthpop $State.Metadata.VolumeSynthpop)
+
         # Only the private key comes from the host. github.com's host key is
         # written inside the container below (Get-ContainerSshSetupCommand).
         $dockerArgs += @('--mount',"type=bind,source=$sshKeyPath,target=/keys/id_ed25519_$($State.UserName),readonly",
@@ -1982,38 +2183,53 @@ function Show-ContainerManager {
         $freshUsedPorts = Get-UsedPorts -ContextArgs (Get-DockerContextArgs -State $State)
         $chosenPort = if ($portOverride) { $portOverride } else { '8787' }
         if ($freshUsedPorts -contains $chosenPort) {
+            & $removeFreshVolumes
             [System.Windows.Forms.MessageBox]::Show("Port $chosenPort was just taken by another container. Choose a different port.", 'Port conflict', 'OK', 'Error') | Out-Null
             return
         }
 
         $runCmd = (Get-DockerContextArgs -State $State) + $dockerArgs
-        Write-Log "Starting container with: docker $($runCmd -join ' ')" 'Debug'
+        # Hide the password: Debug lines always go to the log file on disk (F85).
+        $runCmdForLog = $runCmd | ForEach-Object { if ("$_" -like 'PASSWORD=*') { 'PASSWORD=***' } else { $_ } }
+        Write-Log "Starting container with: docker $($runCmdForLog -join ' ')" 'Debug'
 
         $rc = & docker $runCmd 2>&1
         if ($LASTEXITCODE -ne 0) {
+            $runExit = $LASTEXITCODE
             $friendlyError = Format-DockerError -RawError ([string]$rc)
-            Write-Log "Docker run failed (exit=$LASTEXITCODE): $rc" 'Error'
+            Write-Log "Docker run failed (exit=$runExit): $rc" 'Error'
+            & $removeFreshVolumes
             [System.Windows.Forms.MessageBox]::Show($friendlyError, 'Container start failed', 'OK', 'Error') | Out-Null
             return
         }
 
-        # Prepare SSH for git inside the container:
+        # Prepare SSH for git inside the container (Get-ContainerSshSetupCommand):
         #  - copy the key from the readonly bind mount to ~rstudio/.ssh with
         #    mode 600 and rstudio ownership (the bind mount keeps host ownership);
         #  - write github.com's host key to ~rstudio/.ssh/known_hosts with
         #    ssh-keyscan inside the container, so 'git pull' does not depend on
         #    the host's known_hosts having a github.com entry.
+        # The command prints KEY_FIXED only when every key step succeeded (F49).
         $fixKeyCmd = Get-ContainerSshSetupCommand -UserName $State.UserName -ContainerUid $containerUid -ContainerGid $containerGid
-        $fixCtx = (Get-DockerContextArgs -State $State) + @('exec', $State.ContainerName, 'sh', '-c', $fixKeyCmd)
-        try {
-            $fixOut = & docker $fixCtx 2>&1
-            if ($fixOut -match 'KEY_FIXED') {
-                Write-Log 'SSH key permissions fixed inside container.' 'Info'
-            } else {
-                Write-Log "SSH key permission fix may have failed: $fixOut" 'Warn'
+        # F88: run as root explicitly. Copying into /home/rstudio and chown need root, and
+        # the image's default user could change in the future.
+        $fixCtx = (Get-DockerContextArgs -State $State) + @('exec', '--user', 'root', $State.ContainerName, 'sh', '-c', $fixKeyCmd)
+        # Retry a few times: right after 'docker run' the container may still be setting
+        # itself up (for example remapping the rstudio user to USERID/GROUPID).
+        $keyFixed = $false
+        for ($attempt = 1; $attempt -le 3 -and -not $keyFixed; $attempt++) {
+            try {
+                $fixOut = & docker $fixCtx 2>&1
+                if ($fixOut -match 'KEY_FIXED') {
+                    $keyFixed = $true
+                    Write-Log 'SSH key permissions fixed inside container.' 'Info'
+                } else {
+                    Write-Log "SSH key permission fix attempt $attempt failed: $fixOut" 'Warn'
+                }
+            } catch {
+                Write-Log "SSH key permission fix attempt $attempt failed: $($_.Exception.Message)" 'Warn'
             }
-        } catch {
-            Write-Log "SSH key permission fix failed: $($_.Exception.Message)" 'Warn'
+            if (-not $keyFixed -and $attempt -lt 3) { Start-Sleep -Seconds 2 }
         }
 
         # Configure git inside the container for the rstudio user.
@@ -2026,21 +2242,57 @@ function Show-ContainerManager {
         # 3. safe.directory='*' is a safety net for any remaining ownership edge cases.
         $gitCfgCmd = "git config --global user.name '$($State.UserName)' && git config --global user.email '$($State.UserName)@users.noreply.github.com' && git config --global pull.ff true && git config --global pull.rebase false && git config --global --add safe.directory '*' && echo GIT_CONFIGURED"
         $gitCfgCtx = (Get-DockerContextArgs -State $State) + @('exec', '--user', 'rstudio', $State.ContainerName, 'sh', '-c', $gitCfgCmd)
-        try {
-            $gitCfgOut = & docker $gitCfgCtx 2>&1
-            if ($gitCfgOut -match 'GIT_CONFIGURED') {
-                Write-Log 'Git pull strategy (merge) configured inside container.' 'Info'
-            } else {
-                Write-Log "Git config inside container may have failed: $gitCfgOut" 'Warn'
+        $gitConfigured = $false
+        for ($attempt = 1; $attempt -le 3 -and -not $gitConfigured; $attempt++) {
+            try {
+                $gitCfgOut = & docker $gitCfgCtx 2>&1
+                if ($gitCfgOut -match 'GIT_CONFIGURED') {
+                    $gitConfigured = $true
+                    Write-Log 'Git pull strategy (merge) configured inside container.' 'Info'
+                } else {
+                    Write-Log "Git config inside container attempt $attempt failed: $gitCfgOut" 'Warn'
+                }
+            } catch {
+                Write-Log "Git config inside container attempt $attempt failed: $($_.Exception.Message)" 'Warn'
             }
-        } catch {
-            Write-Log "Git config inside container failed: $($_.Exception.Message)" 'Warn'
+            if (-not $gitConfigured -and $attempt -lt 3) { Start-Sleep -Seconds 2 }
+        }
+
+        # F49: 'docker run -d' only says the container was started, not that it is still
+        # running. If its start-up script fails, it stops at once and '--rm' deletes it,
+        # so check that it is still there before reporting RUNNING.
+        $psAfterStart = (Get-DockerContextArgs -State $State) + @('ps','--filter',"name=^$($State.ContainerName)$",'--format','{{.Names}}')
+        $psAfterOut = & docker @psAfterStart 2>$null
+        $psAfterExit = $LASTEXITCODE
+        if ($psAfterExit -eq 0 -and -not (@($psAfterOut) | Where-Object { "$_".Trim() -eq $State.ContainerName })) {
+            Write-Log "Container $($State.ContainerName) stopped right after starting." 'Error'
+            # The fresh volumes only hold copies of host files, so they can go.
+            & $removeFreshVolumes
+            [System.Windows.Forms.MessageBox]::Show("The container stopped right after it was started, so RStudio is not available.`n`nCheck the console window and the log file (~/.impact_gui/logs/impact.log) for details. Ticking 'Rebuild image' and starting again often helps.",'Container stopped','OK','Error') | Out-Null
+            return
+        } elseif ($psAfterExit -ne 0) {
+            # Docker could not be asked (for example a short network problem); carry on as before.
+            Write-Log 'Could not confirm that the container is still running (docker ps failed).' 'Warn'
+        }
+
+        if (-not $keyFixed -or -not $gitConfigured) {
+            # The container runs, so do not stop it, but tell the user clearly instead of
+            # only writing a console warning that nobody reads.
+            $setupProblems = @()
+            if (-not $keyFixed) { $setupProblems += "- Your GitHub SSH key could not be set up inside the container: git pull / push from RStudio will not work." }
+            if (-not $gitConfigured) { $setupProblems += "- Your git name and e-mail could not be set inside the container: git commit in RStudio may fail ('Please tell me who you are')." }
+            [System.Windows.Forms.MessageBox]::Show("The container is running, but part of its setup failed:`n`n$($setupProblems -join "`n")`n`nDetails are in the console window and the log file. Stopping and starting the container again often fixes this.",'Container setup incomplete','OK','Warning') | Out-Null
         }
 
         if ($State.ContainerLocation -like 'REMOTE@*') {
             $portStore = if ($portOverride) { $portOverride } else { '8787' }
-            Write-RemoteContainerMetadata -State $State -Password $State.Password -Port $portStore -UseVolumes $useVolumes
+            # No password in the metadata any more (F40): every colleague can read /tmp.
+            Write-RemoteContainerMetadata -State $State -Port $portStore -UseVolumes $useVolumes
         }
+
+        # F32: the recovered password/port/volume details belonged to the previous container.
+        # Forget them so the info box shows the password this container really uses.
+        $State.Metadata.Recovered = @{ Password = $null; Port = $null; UseVolumes = $false; OutputDir = $null; SynthpopDir = $null; VolumeOutput = $null; VolumeSynthpop = $null }
 
         $State.Metadata.ContainerRunning = $true
         $State.Metadata.ActiveUseVolumes = $useVolumes
@@ -2055,66 +2307,141 @@ function Show-ContainerManager {
         Write-Log "Container $($State.ContainerName) started." 'Info'
 
         $hostDisplay = if ($State.ContainerLocation -eq 'LOCAL') { "http://localhost:$($State.Metadata.ActivePort)" } else { "http://$($State.RemoteHostIp):$($State.Metadata.ActivePort)" }
-        Write-Host "Container ready: $hostDisplay (user: rstudio, password: $($State.Password))" -ForegroundColor Green
+        # F85: never print the password to the console (it stays visible during screen-sharing).
+        Write-Host "Container ready: $hostDisplay (user: rstudio, password: the one you entered at login)" -ForegroundColor Green
     })
 
     $btnStop.Add_Click({
         $ctxArgs = Get-DockerContextArgs -State $State
         $runCmd = $ctxArgs + @('ps','--filter',"name=^$($State.ContainerName)$",'--format','{{.Names}}')
         $exists = & docker $runCmd 2>$null
-        if (-not $exists) { Update-InfoBox -Status 'STOPPED'; $btnStart.Enabled=$true; $btnStop.Enabled=$false; return }
-
-        $stopCmd = $ctxArgs + @('stop',$State.ContainerName)
-        Write-Log "Stopping container $($State.ContainerName)" 'Info'
-        & docker $stopCmd 2>$null
-        Write-Log "docker stop exit=$LASTEXITCODE" 'Debug'
+        # F18: a non-zero exit code means Docker (or the ssh connection to the workstation)
+        # could not be reached, so we do NOT know whether the container still runs. Say so,
+        # and leave state and buttons unchanged so the user can simply try again. (Before,
+        # this looked the same as "container gone" and the UI wrongly showed STOPPED.)
         if ($LASTEXITCODE -ne 0) {
-            [System.Windows.Forms.MessageBox]::Show('Failed to stop container; check Docker.','Stop failed','OK','Error') | Out-Null
+            $where = if ($State.ContainerLocation -eq 'LOCAL') { 'Check that Docker Desktop is running.' } else { 'Check your network / VPN connection to the workstation.' }
+            [System.Windows.Forms.MessageBox]::Show("Could not reach Docker, so it is unknown whether the container is still running.`n`n$where Then click Stop again.",'Docker not reachable','OK','Warning') | Out-Null
             return
         }
+        # Docker answered but the container is not listed: it already ended on its own
+        # (crash, reboot, Docker restart, or stopped outside this tool). We still run the
+        # clean-up below: the Docker volumes survive the container and hold its results,
+        # and the state flags must be reset so Start and Back work again (F18).
+        $alreadyGone = -not (@($exists) | Where-Object { "$_".Trim() -eq $State.ContainerName })
 
-        # Sync volumes back if used
-        $useVolumesForStop = if ($State.Metadata.ActiveUseVolumes -ne $null) { $State.Metadata.ActiveUseVolumes } else { $chkVolumes.Checked }
+        if ($alreadyGone) {
+            Write-Log "Container $($State.ContainerName) is no longer running; cleaning up." 'Warn'
+        } else {
+            # F51: stopping ends every R session at once and the container is deleted
+            # (--rm), so ask first. 'No' is the default button, so a stray Enter is harmless.
+            $stopMsg = "Stop the container '$($State.ContainerName)' now?`n`n" +
+                       "- Any simulation that is still running will be killed.`n" +
+                       "- Unsaved changes in RStudio editor tabs will be lost.`n`n" +
+                       "Files you saved in the repository and your output folders are kept.`n`n" +
+                       "Tip: save your files in RStudio and let simulations finish first."
+            $stopAnswer = [System.Windows.Forms.MessageBox]::Show($stopMsg, 'Stop container?', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+            if ($stopAnswer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+            $stopCmd = $ctxArgs + @('stop',$State.ContainerName)
+            Write-Log "Stopping container $($State.ContainerName)" 'Info'
+            & docker $stopCmd 2>$null
+            Write-Log "docker stop exit=$LASTEXITCODE" 'Debug'
+            if ($LASTEXITCODE -ne 0) {
+                [System.Windows.Forms.MessageBox]::Show('Failed to stop container; check Docker.','Stop failed','OK','Error') | Out-Null
+                return
+            }
+        }
+
+        # Copy results out of the volumes, if volumes were used. The checkbox is NOT used as a
+        # fallback any more: it describes the next start, not the container being stopped.
+        $useVolumesForStop = [bool]$State.Metadata.ActiveUseVolumes
         Write-Log "Stop clicked; volumesUsed=$useVolumesForStop" 'Debug'
+        $volumeProblem = $null
         if ($useVolumesForStop) {
-            $ctxPrefix = Get-DockerContextArgs -State $State
-            if (-not $State.Metadata.VolumeOutput) {
-                $State.Metadata.VolumeOutput = "impactncd_germany_output_$($State.UserName)" -replace '[^a-zA-Z0-9_]','_'
-            }
-            if (-not $State.Metadata.VolumeSynthpop) {
-                $State.Metadata.VolumeSynthpop = "impactncd_germany_synthpop_$($State.UserName)" -replace '[^a-zA-Z0-9_]','_'
-            }
-
             $volOut = $State.Metadata.VolumeOutput
             $volSyn = $State.Metadata.VolumeSynthpop
-            if ($volOut -and $volSyn) {
-                $outBackup = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $State.Paths.OutputDir } else { $State.Paths.OutputDir }
-                $synBackup = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $State.Paths.SynthpopDir } else { $State.Paths.SynthpopDir }
-                Write-Log "Syncing volumes back -> outVol=$volOut to $outBackup; synVol=$volSyn to $synBackup" 'Debug'
-                Write-Log "Syncing volume $volOut back to $outBackup" 'Debug'
-                & docker @ctxPrefix @('run','--rm','-v',"$($volOut):/volume",'-v',"$($outBackup):/backup",'rsync-alpine','rsync','-avc','--no-owner','--no-group','--no-times','--no-perms','--chmod=ugo=rwX','/volume/','/backup/') 2>$null
-                Write-Log "Syncing volume $volSyn back to $synBackup" 'Debug'
-                & docker @ctxPrefix @('run','--rm','-v',"$($volSyn):/volume",'-v',"$($synBackup):/backup",'rsync-alpine','rsync','-avc','--no-owner','--no-group','--no-times','--no-perms','--chmod=ugo=rwX','/volume/','/backup/') 2>$null
-                & docker @ctxPrefix @('volume','rm',$volOut,$volSyn,'-f') 2>$null
-                Write-Log "Removed volumes $volOut, $volSyn after sync." 'Debug'
+            # F01: the volumes are deleted ONLY when both copies succeeded. Before, they were
+            # always deleted, even when the copy failed or the target folder was unknown
+            # (a resumed session), which lost all results of the run.
+            if (-not $volOut -or -not $volSyn) {
+                $volumeProblem = 'The names of the Docker volumes are unknown.'
+            } elseif (-not $State.Paths.OutputDir -or -not $State.Paths.SynthpopDir) {
+                $volumeProblem = 'The folders to copy the results back to are unknown (the container was probably started by an older version of this tool).'
+            } else {
+                $lblStatus.Text = 'Copying results from the Docker volumes back to your folders...'
+                $form.Refresh()
+                $syncOut = Sync-ImpactVolumeToHost -State $State -VolumeName $volOut -HostDir $State.Paths.OutputDir
+                $syncSyn = Sync-ImpactVolumeToHost -State $State -VolumeName $volSyn -HostDir $State.Paths.SynthpopDir
+                if ($syncOut.Success -and $syncSyn.Success) {
+                    $toRemove = @()
+                    if (-not $syncOut.Missing) { $toRemove += $volOut }
+                    if (-not $syncSyn.Missing) { $toRemove += $volSyn }
+                    if ($toRemove.Count -gt 0) {
+                        # Retry briefly: '--rm' may still be removing the stopped container,
+                        # and a volume cannot be removed while a container uses it.
+                        # '-f' only ignores volumes that are already gone.
+                        $removed = $false
+                        $rmOut = $null
+                        for ($i = 1; $i -le 5 -and -not $removed; $i++) {
+                            $rmOut = & docker @ctxArgs (@('volume','rm','-f') + $toRemove) 2>&1
+                            if ($LASTEXITCODE -eq 0) { $removed = $true } else { Start-Sleep -Seconds 1 }
+                        }
+                        if ($removed) {
+                            Write-Log "Removed volumes $($toRemove -join ', ') after a successful copy." 'Info'
+                        } else {
+                            # Not a data loss: everything was copied. The volumes only use disk space.
+                            Write-Log "Results were copied, but volumes $($toRemove -join ', ') could not be removed: $rmOut" 'Warn'
+                        }
+                    }
+                } else {
+                    $volumeProblem = (@($syncOut, $syncSyn) | Where-Object { -not $_.Success } | ForEach-Object { $_.Message }) -join "`n"
+                }
             }
         }
 
         $State.Metadata.ContainerRunning = $false
+        $State.Metadata.ActiveUseVolumes = $false
 
         if ($State.ContainerLocation -like 'REMOTE@*') { Remove-RemoteContainerMetadata -State $State }
+
+        # F32: the recovered details belonged to the container that is now gone.
+        $State.Metadata.Recovered = @{ Password = $null; Port = $null; UseVolumes = $false; OutputDir = $null; SynthpopDir = $null; VolumeOutput = $null; VolumeSynthpop = $null }
+        # F39: refresh the list of used ports, so starting again on the port that was just
+        # freed is not rejected as 'already in use'.
+        $State.Ports.Used = @(Get-UsedPorts -ContextArgs $ctxArgs)
 
         Update-InfoBox -Status 'STOPPED'
         $btnStart.Enabled = $true
         $btnStop.Enabled  = $false
         Write-Log "Container $($State.ContainerName) stopped." 'Info'
 
+        if ($volumeProblem) {
+            # Shown before the git dialog because it is about possible data loss.
+            $volList = (@($State.Metadata.VolumeOutput, $State.Metadata.VolumeSynthpop) | Where-Object { $_ }) -join ', '
+            Write-Log "Results were NOT copied back; volumes kept: $volList. Reason: $volumeProblem" 'Error'
+            # The next Start only recognises volumes named the current way; volumes of a
+            # container started by an older version need manual help.
+            $expectedNames = Get-ImpactVolumeNames -ContainerName $State.ContainerName
+            $nextStep = if ($State.Metadata.VolumeOutput -eq $expectedNames.Output -and $State.Metadata.VolumeSynthpop -eq $expectedNames.Synthpop) {
+                "The next time you click Start with 'Use Docker Volumes' ticked, the tool offers to copy them into your folders. If that does not work, ask the maintainer for help and quote the volume names above."
+            } else {
+                "Please do not delete them. Ask the maintainer to copy them for you and quote the volume names above."
+            }
+            [System.Windows.Forms.MessageBox]::Show("Your results were NOT copied back to your folders, so the Docker volumes were kept (nothing was deleted):`n`n  $volList`n`nReason:`n$volumeProblem`n`n$nextStep",'Results still in Docker volumes','OK','Error') | Out-Null
+        }
+
         if ($State.Metadata.ActiveRepoPath) {
             Invoke-GitChangeDetection -State $State -RepoPath $State.Metadata.ActiveRepoPath -IsRemote $State.Metadata.ActiveIsRemote
         }
 
-        $lblStatus.Text = 'All done. You can close this window or start another container.'
-        Write-Host "All done. You can close this window or start another container." -ForegroundColor Green
+        if ($volumeProblem) {
+            $lblStatus.Text = 'Stopped. Results are still in Docker volumes (see the message).'
+            Write-Host "Stopped, but results are still in Docker volumes: $volumeProblem" -ForegroundColor Yellow
+        } else {
+            $lblStatus.Text = 'All done. You can close this window or start another container.'
+            Write-Host "All done. You can close this window or start another container." -ForegroundColor Green
+        }
     })
 
     $btnClose.Add_Click({ $form.Close() })
@@ -2174,7 +2501,9 @@ function Invoke-ImpactGui {
                 else { $step = 4 } # cancelled/failed — back to location
             }
             6 { # Container manager
-                Get-ContainerStatus -State $state
+                # F83: discard the returned state object. Uncaptured, PowerShell printed the
+                # whole session state to the console, including the password in plain text.
+                $null = Get-ContainerStatus -State $state
                 $mgr = Show-ContainerManager -State $state
                 if ($mgr -eq 'back') { $step = 4 } # back to location selection
                 else { $step++ } # close — exit loop

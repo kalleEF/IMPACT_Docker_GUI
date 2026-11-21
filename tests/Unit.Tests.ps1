@@ -417,7 +417,8 @@ Describe 'Build-DockerRunCommand' -Tag Unit {
             -SynthpopDir 'C:\repos\IMPACTncd_Germany\inputs\synthpop' `
             -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice'
 
-        $args | Should -Contain '9090:8787'
+        # LOCAL containers are published on 127.0.0.1 only (F13)
+        $args | Should -Contain '127.0.0.1:9090:8787'
     }
 
     It 'Appends high-compute flags only for remote mode' {
@@ -452,8 +453,9 @@ Describe 'Build-DockerRunCommand' -Tag Unit {
             -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice'
 
         $joined = $args -join ' '
-        $joined | Should -Match '-v.*impactncd_germany_output_alice'
-        $joined | Should -Match '-v.*impactncd_germany_synthpop_alice'
+        # Volume names include the container name (repo + user), see Get-ImpactVolumeNames (F48)
+        $joined | Should -Match "-v.*impactncd_output_$($baseState.ContainerName)"
+        $joined | Should -Match "-v.*impactncd_synthpop_$($baseState.ContainerName)"
     }
 
     It 'Uses bind mounts when UseVolumes is false' {
@@ -1904,5 +1906,126 @@ Describe 'Get-GitPushFailureHint' -Tag Unit {
     It 'Falls back to a generic sentence' {
         $hint = InModuleScope 'IMPACT_Docker_GUI' { Get-GitPushFailureHint -Output 'something unexpected' }
         $hint | Should -Match 'details are shown below'
+    }
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Docker volume names, custom params, container labels, port binding
+#  (lifecycle / volume fixes: F13, F48, F102, F01/F04)
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Get-ImpactVolumeNames' -Tag Unit {
+    It 'Includes the container name, so two repos of one user get different volumes' {
+        $a = Get-ImpactVolumeNames -ContainerName 'IMPACTncd_Germany_alice'
+        $b = Get-ImpactVolumeNames -ContainerName 'OtherRepo_alice'
+        $a.Output   | Should -Be 'impactncd_output_IMPACTncd_Germany_alice'
+        $a.Synthpop | Should -Be 'impactncd_synthpop_IMPACTncd_Germany_alice'
+        $a.Output   | Should -Not -Be $b.Output
+        $a.Synthpop | Should -Not -Be $b.Synthpop
+    }
+
+    It 'Replaces characters Docker does not allow, but keeps dash and dot' {
+        $n = Get-ImpactVolumeNames -ContainerName 'my repo/x.y-z_al ice'
+        $n.Output | Should -Be 'impactncd_output_my_repo_x.y-z_al_ice'
+        $n.Output | Should -Match '^[a-zA-Z0-9][a-zA-Z0-9_.-]+$'
+    }
+}
+
+Describe 'Split-DockerCustomParams' -Tag Unit {
+    It 'Ignores leading, trailing and repeated spaces (no empty arguments)' {
+        $t = @(Split-DockerCustomParams -Text '  --shm-size   2g  ')
+        $t.Count | Should -Be 2
+        $t[0] | Should -Be '--shm-size'
+        $t[1] | Should -Be '2g'
+    }
+
+    It 'Keeps a quoted value with spaces together and removes the quotes' {
+        $t = @(Split-DockerCustomParams -Text "-e `"TZ=Europe Berlin`" --label 'a b=c'")
+        $t | Should -Be @('-e', 'TZ=Europe Berlin', '--label', 'a b=c')
+    }
+
+    It 'Keeps Windows backslashes unchanged' {
+        $t = @(Split-DockerCustomParams -Text '-v C:\data\x:/data')
+        $t | Should -Be @('-v', 'C:\data\x:/data')
+    }
+
+    It 'Returns nothing for empty or blank input' {
+        @(Split-DockerCustomParams -Text '').Count    | Should -Be 0
+        @(Split-DockerCustomParams -Text '   ').Count | Should -Be 0
+    }
+
+    It 'Treats a missing closing quote as running to the end' {
+        $t = @(Split-DockerCustomParams -Text '-e "A=b c')
+        $t | Should -Be @('-e', 'A=b c')
+    }
+}
+
+Describe 'Get-ImpactContainerLabelArgs' -Tag Unit {
+    It 'Records volume mode, result folders and volume names' {
+        $l = Get-ImpactContainerLabelArgs -UseVolumes $true -OutputDir 'C:\o' -SynthpopDir '/s' -VolumeOutput 'vo' -VolumeSynthpop 'vs'
+        $l | Should -Contain 'impact.use_volumes=true'
+        $l | Should -Contain 'impact.output_dir=C:\o'
+        $l | Should -Contain 'impact.synthpop_dir=/s'
+        $l | Should -Contain 'impact.volume_output=vo'
+        $l | Should -Contain 'impact.volume_synthpop=vs'
+        # every value is preceded by --label
+        for ($i = 0; $i -lt $l.Count; $i += 2) { $l[$i] | Should -Be '--label' }
+    }
+
+    It 'Records use_volumes=false and no volume names in bind mode' {
+        $l = Get-ImpactContainerLabelArgs -UseVolumes $false -OutputDir '/o' -SynthpopDir '/s' -VolumeOutput 'vo' -VolumeSynthpop 'vs'
+        $l | Should -Contain 'impact.use_volumes=false'
+        ($l -join ' ') | Should -Not -Match 'impact.volume_'
+    }
+
+    It 'Leaves out empty folders' {
+        $l = Get-ImpactContainerLabelArgs -UseVolumes $false -OutputDir '' -SynthpopDir '' -VolumeOutput '' -VolumeSynthpop ''
+        $l | Should -Be @('--label', 'impact.use_volumes=false')
+    }
+}
+
+Describe 'Build-DockerRunCommand port binding, labels and custom params' -Tag Unit {
+    BeforeAll {
+        $script:b3Local  = New-TestSessionState -UserName 'alice' -Password 'secret' -SelectedRepo 'IMPACTncd_Germany'
+        $script:b3Remote = New-TestSessionState -UserName 'alice' -Password 'secret' -Location 'REMOTE@10.152.14.124'
+        $script:b3Common = @{
+            ImageName      = 'test-image'
+            ProjectRoot    = 'C:\repos\IMPACTncd_Germany'
+            OutputDir      = 'C:\repos\IMPACTncd_Germany\outputs'
+            SynthpopDir    = 'C:\repos\IMPACTncd_Germany\inputs\synthpop'
+            SshKeyPath     = 'C:\Users\alice\.ssh\id_ed25519_alice'
+            KnownHostsPath = 'C:\Users\alice\.ssh\known_hosts'
+        }
+    }
+
+    It 'Publishes LOCAL containers on 127.0.0.1 only' {
+        $common = $script:b3Common
+        $a = Build-DockerRunCommand -State $script:b3Local -Port '8790' @common
+        $a | Should -Contain '127.0.0.1:8790:8787'
+        $a | Should -Not -Contain '8790:8787'
+    }
+
+    It 'Publishes REMOTE containers on all interfaces' {
+        $common = $script:b3Common
+        $a = Build-DockerRunCommand -State $script:b3Remote -Port '8790' @common
+        $a | Should -Contain '8790:8787'
+        ($a -join ' ') | Should -Not -Match '127\.0\.0\.1'
+    }
+
+    It 'Adds labels before the image name' {
+        $common = $script:b3Common
+        $a = Build-DockerRunCommand -State $script:b3Local -UseVolumes $true @common
+        $a | Should -Contain 'impact.use_volumes=true'
+        $a | Should -Contain 'impact.output_dir=C:\repos\IMPACTncd_Germany\outputs'
+        $a | Should -Contain "impact.volume_output=impactncd_output_$($script:b3Local.ContainerName)"
+        $a[-1] | Should -Be 'test-image'
+    }
+
+    It 'Never produces empty arguments from custom params with extra spaces' {
+        $common = $script:b3Common
+        $a = Build-DockerRunCommand -State $script:b3Local -CustomParams '  --shm-size  2g  ' @common
+        @($a | Where-Object { $_ -eq '' }).Count | Should -Be 0
+        $a | Should -Contain '--shm-size'
+        $a[-1] | Should -Be 'test-image'
     }
 }
