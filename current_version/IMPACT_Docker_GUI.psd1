@@ -67,6 +67,7 @@
         'Get-ImpactVolumeInfo'
         'Initialize-RsyncHelperImage'
         'Sync-ImpactVolumeToHost'
+        'Get-DockerfileBaseImage'
         'Get-ContainerGitSshCommand'
         'Get-ContainerSshSetupCommand'
         'Test-DockerDaemonReady'

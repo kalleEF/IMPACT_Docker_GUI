@@ -3589,6 +3589,59 @@ function Select-Location {
 # ══════════════════════════════════════════════════════════════════════════════
 
 <#
+.SYNOPSIS Reads the base image name from the first FROM line of a Dockerfile.
+.DESCRIPTION The "Image build failed" fallback in the Start handler builds the
+             prerequisite image locally. 'docker build' only uses that local image
+             for the main build if it has exactly the name that the main
+             Dockerfile names in its FROM line. This function finds that name, so
+             IMPACT does not depend on a name written into its own code.
+             Rules (a simplified version of Docker's own reading of the file):
+             - empty lines and lines starting with '#' (comments and parser
+               directives such as '# syntax=...') are skipped;
+             - 'ARG' lines before the first FROM are skipped (they set build
+               variables, they do not name an image);
+             - options such as '--platform=linux/amd64' after FROM are skipped;
+             - 'AS <stage>' after the image name is ignored.
+             Returns $null when there is no FROM line, when the image name uses a
+             build variable (for example FROM ${BASE}), which cannot be resolved
+             here, or when it is 'scratch' (Docker's empty image).
+.PARAMETER Content The Dockerfile text: one string with line breaks, or an array
+             of lines as returned by Get-Content or by ssh.
+.OUTPUTS [string] the image name, e.g. 'kalleef/prerequisite.impactncdger:latest', or $null.
+.EXAMPLE Get-DockerfileBaseImage -Content (Get-Content -LiteralPath $dockerfilePath)
+#>
+function Get-DockerfileBaseImage {
+    param(
+        # AllowNull/AllowEmptyCollection: a missing or empty file should give $null,
+        # not a parameter-binding error.
+        [AllowNull()][AllowEmptyCollection()][string[]]$Content
+    )
+    if (-not $Content) { return $null }
+    # Join and split again, so one string with line breaks and an array of lines are
+    # handled the same way. '\r?\n' also handles Windows line endings (CRLF).
+    $lines = ($Content -join "`n") -split "\r?\n"
+    foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        if ($trimmed -eq '' -or $trimmed.StartsWith('#')) { continue }
+        # PowerShell's -match ignores upper/lower case, so 'from' and 'FROM' both match.
+        if ($trimmed -match '^ARG\s') { continue }
+        if ($trimmed -match '^FROM\s+(.+)$') {
+            # Split the rest of the line into words and drop options that start with '--'.
+            $words = @($matches[1].Trim() -split '\s+' | Where-Object { $_ -and -not $_.StartsWith('--') })
+            if ($words.Count -eq 0) { return $null }
+            $image = $words[0]
+            # A '$' means a build variable (FROM $BASE or FROM ${BASE}); we cannot know its value.
+            if ($image.Contains('$') -or $image -eq 'scratch') { return $null }
+            return $image
+        }
+        # The first instruction that is neither a comment, ARG nor FROM means the file
+        # does not start with FROM, which Docker would reject anyway.
+        return $null
+    }
+    return $null
+}
+
+<#
 .SYNOPSIS Value for GIT_SSH_COMMAND inside the IMPACT container.
 .DESCRIPTION Git (also when started from the RStudio Git pane) uses this command
              to reach GitHub. It points at the user's private key and at a
@@ -4257,6 +4310,7 @@ Export-ModuleMember -Function @(
     # Container lifecycle (extracted)
     'ConvertTo-DockerSafeRepoName'
     'Build-DockerRunCommand'
+    'Get-DockerfileBaseImage'
     'Get-ContainerGitSshCommand'
     'Get-ContainerSshSetupCommand'
     # Docker volume helpers

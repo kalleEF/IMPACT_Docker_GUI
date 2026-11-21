@@ -3141,3 +3141,40 @@ Describe 'Ensure-SshConfigEntry when the ssh config cannot be backed up' -Tag Un
         $r | Should -BeLike '*.impact_gui*ssh-config-backups*config.impact-backup-*'
     }
 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Get-DockerfileBaseImage: the prerequisite fallback build must be tagged with
+#  the name in the main Dockerfile's FROM line, or the second main build would not
+#  use the image that was just built.
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Get-DockerfileBaseImage' -Tag Unit {
+    It 'Returns the image of a plain FROM line' {
+        Get-DockerfileBaseImage -Content @('FROM kalleef/prerequisite.impactncdger:latest', 'RUN echo hi') |
+            Should -BeExactly 'kalleef/prerequisite.impactncdger:latest'
+    }
+
+    It 'Skips comments, a syntax directive, blank lines and ARG lines before FROM' {
+        $text = "# syntax=docker/dockerfile:1`r`n`r`n# base image`r`nARG R_VERSION=4.4`r`nFROM rocker/rstudio:4.4.1`r`nRUN true"
+        Get-DockerfileBaseImage -Content $text | Should -BeExactly 'rocker/rstudio:4.4.1'
+    }
+
+    It 'Ignores options such as --platform and a stage name after AS' {
+        Get-DockerfileBaseImage -Content @('from --platform=linux/amd64 kalleef/base:1.0 AS builder') |
+            Should -BeExactly 'kalleef/base:1.0'
+    }
+
+    It 'Returns $null when the image name uses a build variable' {
+        Get-DockerfileBaseImage -Content @('ARG BASE=x', 'FROM ${BASE}') | Should -BeNullOrEmpty
+        Get-DockerfileBaseImage -Content @('FROM $BASE') | Should -BeNullOrEmpty
+    }
+
+    It 'Returns $null for scratch, an empty file and no input' {
+        Get-DockerfileBaseImage -Content @('FROM scratch') | Should -BeNullOrEmpty
+        Get-DockerfileBaseImage -Content @() | Should -BeNullOrEmpty
+        Get-DockerfileBaseImage -Content $null | Should -BeNullOrEmpty
+    }
+
+    It 'Returns $null when the first instruction is not FROM' {
+        Get-DockerfileBaseImage -Content @('RUN echo hi', 'FROM later/image:1') | Should -BeNullOrEmpty
+    }
+}

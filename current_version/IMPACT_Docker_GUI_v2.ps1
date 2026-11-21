@@ -2441,18 +2441,42 @@ function Show-ContainerManager {
                     $prereqDockerfile = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup 'Dockerfile.prerequisite.IMPACTncdGER' } else { "$dockerSetup/Dockerfile.prerequisite.IMPACTncdGER" }
                     $prereqContext = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup '.' } else { "$dockerSetup" }
                     # The name (tag) of the prerequisite image. The main Dockerfile of the model
-                    # repository (docker_setup/Dockerfile.IMPACTncdGER) starts with the line
-                    #     FROM kalleef/prerequisite.impactncdger:latest
+                    # repository (docker_setup/Dockerfile.IMPACTncdGER) starts with a FROM line,
+                    # today:  FROM kalleef/prerequisite.impactncdger:latest
                     # 'docker build' uses a LOCAL image of exactly that name when one exists. So the
                     # prerequisite image must be built under that same name; only then does the
-                    # second main build below use the image we just built. It used to be tagged
-                    # '<image>-prerequisite', a name the main Dockerfile never uses, so the second
-                    # main build ran on the same (broken or missing) base image as the build that
-                    # had just failed, and the user waited another 30-60 minutes for nothing.
-                    # Keep this name in sync with the FROM line of Dockerfile.IMPACTncdGER.
+                    # second main build below use the image we just built. A tag such as
+                    # '<image>-prerequisite', which the main Dockerfile never names, would leave the
+                    # second main build on the same (broken or missing) base image as the build that
+                    # had just failed, and the user would wait another 30-60 minutes for nothing.
+                    # We read the name from the FROM line (Get-DockerfileBaseImage), so a change in
+                    # the model repository's Dockerfile is followed automatically. Only when the
+                    # file cannot be read (or its FROM line uses a build variable) do we use the
+                    # name that the FROM line has today.
                     # On the workstation this local image is shared by the whole account, so
                     # colleagues' later builds also use it (until someone pulls that name again).
-                    $prereqTag = 'kalleef/prerequisite.impactncdger:latest'
+                    $defaultPrereqTag = 'kalleef/prerequisite.impactncdger:latest'
+                    $prereqTag = $null
+                    try {
+                        if ($State.ContainerLocation -eq 'LOCAL') {
+                            if (Test-Path -LiteralPath $dockerfileMain) {
+                                $prereqTag = Get-DockerfileBaseImage -Content @(Get-Content -LiteralPath $dockerfileMain)
+                            }
+                        } else {
+                            # The Dockerfile is on the workstation, so read it over SSH (same ssh
+                            # options as the YAML check above). The path is quoted for the shell.
+                            $dockerfileMainQ = ConvertTo-PosixShellLiteral -Value $dockerfileMain
+                            $dockerfileText = @(& ssh -n -i $State.Paths.SshPrivate -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes (Get-RemoteHostString -State $State) "cat $dockerfileMainQ" 2>$null)
+                            if ($LASTEXITCODE -eq 0) { $prereqTag = Get-DockerfileBaseImage -Content $dockerfileText }
+                        }
+                    } catch {
+                        Write-Log "Could not read the FROM line of ${dockerfileMain}: $($_.Exception.Message)" 'Warn'
+                    }
+                    if (-not $prereqTag) {
+                        Write-Log "No usable FROM line found in $dockerfileMain; tagging the prerequisite image as $defaultPrereqTag." 'Warn'
+                        $prereqTag = $defaultPrereqTag
+                    }
+                    Write-Log "Prerequisite image tag (from the main Dockerfile's FROM line): $prereqTag" 'Info'
                     $preSuccess = Invoke-StartImageBuild -Dockerfile $prereqDockerfile -Tag $prereqTag -Context $prereqContext -WithRepoArg $false
 
                     if (-not $preSuccess) {
