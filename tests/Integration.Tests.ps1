@@ -1540,3 +1540,36 @@ Describe 'Get-ImpactVolumeInfo (mocked docker)' -Tag Integration {
         $vi.TargetDir | Should -BeNullOrEmpty
     }
 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  C3: Ensure-RemoteDockerLogin quotes the repository path for the remote shell
+#  (B6a-R5: a folder name with a single quote broke the command or could run code)
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Ensure-RemoteDockerLogin quotes the .env path (B6a-R5, mocked SSH)' -Tag Integration {
+    BeforeAll {
+        # Pester can only mock a command that exists; on machines without an ssh client a
+        # throw-away global stand-in is created and removed again in AfterAll.
+        $script:c3LoginSshStubAdded = $false
+        if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+            function global:ssh { throw 'ssh stub: this call should have been mocked' }
+            $script:c3LoginSshStubAdded = $true
+        }
+    }
+    AfterAll {
+        if ($script:c3LoginSshStubAdded) { Remove-Item -Path Function:\ssh -ErrorAction SilentlyContinue }
+    }
+
+    It 'Sends a path with a single quote as one safely quoted word' {
+        $script:c3LoginCalls = [System.Collections.Generic.List[object]]::new()
+        Mock ssh {
+            $script:c3LoginCalls.Add(@($args))
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -Location 'REMOTE@10.0.0.9'
+        Ensure-RemoteDockerLogin -State $state -ProjectRoot "/srv/it's repo" | Should -BeFalse
+
+        $script:c3LoginCalls.Count | Should -Be 1
+        [string]$script:c3LoginCalls[0][-1] | Should -BeExactly "cat '/srv/it'\''s repo/docker_setup/.env' 2>/dev/null || true"
+    }
+}
