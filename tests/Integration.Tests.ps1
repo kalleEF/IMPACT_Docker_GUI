@@ -1629,7 +1629,7 @@ Describe 'Remote metadata: quoting and clean-up of old password files (B3-R6, mo
         if ($script:c2MetaSshStubAdded) { Remove-Item -Path Function:\ssh -ErrorAction SilentlyContinue }
     }
 
-    It 'Write-RemoteContainerMetadata quotes the file name and removes old files that contain a password' {
+    It 'Write-RemoteContainerMetadata quotes the file name and blanks the password in old files' {
         $script:c2MetaCmd = $null
         Mock ssh { $script:c2MetaCmd = $args[-1]; $global:LASTEXITCODE = 0 } -ModuleName 'IMPACT_Docker_GUI'
         $state = New-TestSessionState -UserName 'u' -Location 'REMOTE@10.0.0.1'
@@ -1637,7 +1637,10 @@ Describe 'Remote metadata: quoting and clean-up of old password files (B3-R6, mo
         Write-RemoteContainerMetadata -State $state -Port '8787' -UseVolumes $false
         $script:c2MetaCmd | Should -Match ([regex]::Escape("base64 -d > '/tmp/impactncd/R_u.json' && "))
         $script:c2MetaCmd | Should -Match 'grep -lZE'
-        $script:c2MetaCmd | Should -Match 'xargs -0 -r rm -f; true; \}$'
+        # The old files are edited (password blanked), never deleted: see the last test.
+        $script:c2MetaCmd | Should -Match 'xargs -0 -r sed -i -E '
+        $script:c2MetaCmd | Should -Not -Match 'rm -f; true'
+        $script:c2MetaCmd | Should -Match '; true; \}$'
     }
 
     It 'Remove-RemoteContainerMetadata removes the file and runs the same clean-up' {
@@ -1650,22 +1653,51 @@ Describe 'Remote metadata: quoting and clean-up of old password files (B3-R6, mo
         $script:c2MetaCmd | Should -Match 'grep -lZE'
     }
 
-    It 'The clean-up deletes only metadata files that have a password entry (runs the real shell snippet)' -Skip:(-not (Get-Command sh -ErrorAction SilentlyContinue) -or -not (Get-Command xargs -ErrorAction SilentlyContinue)) {
+    It 'The clean-up blanks only non-empty passwords and keeps every file and all other entries (runs the real shell snippet)' -Skip:(-not (Get-Command sh -ErrorAction SilentlyContinue) -or -not (Get-Command xargs -ErrorAction SilentlyContinue) -or -not (Get-Command sed -ErrorAction SilentlyContinue)) {
+        # Why the files must survive: a colleague still on an OLDER version learns the port
+        # and the volume mode of a running container only from this file (B3-R6 review).
         $cleanup = InModuleScope 'IMPACT_Docker_GUI' { Get-RemoteMetadataCleanupCommand }
         $dir = Join-Path ([System.IO.Path]::GetTempPath()) "impact_c2_meta_$([guid]::NewGuid().ToString('N').Substring(0,8))"
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
         try {
-            Set-Content -LiteralPath (Join-Path $dir 'old.json') -Value '{"container":"a","password":"secret","port":"8787"}'
-            Set-Content -LiteralPath (Join-Path $dir 'old spaced.json') -Value '{"password": "secret"}'
+            # Written exactly like the older version did (ConvertTo-Json -Compress), with a
+            # quote and a backslash in the password so the JSON escapes are exercised.
+            $oldJson = [ordered]@{ container = 'a'; repo = 'r'; user = 'u'; password = 'se"cr\et'; port = '8790'; useVolumes = $true } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath (Join-Path $dir 'old.json') -Value $oldJson
+            Set-Content -LiteralPath (Join-Path $dir 'old spaced.json') -Value '{"password": "secret", "port": "8791"}'
             Set-Content -LiteralPath (Join-Path $dir 'new.json') -Value '{"container":"b","port":"8787","useVolumes":false}'
-            Set-Content -LiteralPath (Join-Path $dir 'repo.json') -Value '{"container":"c","repo":"password"}'
+            Set-Content -LiteralPath (Join-Path $dir 'blank.json') -Value '{"container":"c","password":"","port":"8787"}'
+            Set-Content -LiteralPath (Join-Path $dir 'repo.json') -Value '{"container":"d","repo":"password"}'
             # Same snippet, pointed at the temporary folder instead of /tmp/impactncd.
             & sh -c ($cleanup.Replace('/tmp/impactncd/', "$dir/"))
             $LASTEXITCODE | Should -Be 0
-            Test-Path -LiteralPath (Join-Path $dir 'old.json') | Should -BeFalse
-            Test-Path -LiteralPath (Join-Path $dir 'old spaced.json') | Should -BeFalse
-            Test-Path -LiteralPath (Join-Path $dir 'new.json') | Should -BeTrue
-            Test-Path -LiteralPath (Join-Path $dir 'repo.json') | Should -BeTrue
+
+            # Every file is still there.
+            foreach ($name in 'old.json', 'old spaced.json', 'new.json', 'blank.json', 'repo.json') {
+                Test-Path -LiteralPath (Join-Path $dir $name) | Should -BeTrue
+            }
+            # The old files no longer contain the secret, but still have the key (an older
+            # version reads $meta.password under StrictMode) and their port and volume mode.
+            $old = Get-Content -Raw -LiteralPath (Join-Path $dir 'old.json')
+            $old | Should -Not -Match 'secr'
+            $oldMeta = $old | ConvertFrom-Json
+            $oldMeta.PSObject.Properties['password'] | Should -Not -BeNullOrEmpty
+            $oldMeta.password | Should -Be ''
+            $oldMeta.port | Should -Be '8790'
+            $oldMeta.useVolumes | Should -BeTrue
+            $oldMeta.container | Should -Be 'a'
+            $spaced = (Get-Content -Raw -LiteralPath (Join-Path $dir 'old spaced.json')) | ConvertFrom-Json
+            $spaced.password | Should -Be ''
+            $spaced.port | Should -Be '8791'
+            # Files without a password value are left exactly as they were.
+            (Get-Content -Raw -LiteralPath (Join-Path $dir 'new.json')).Trim() | Should -Be '{"container":"b","port":"8787","useVolumes":false}'
+            (Get-Content -Raw -LiteralPath (Join-Path $dir 'blank.json')).Trim() | Should -Be '{"container":"c","password":"","port":"8787"}'
+            (Get-Content -Raw -LiteralPath (Join-Path $dir 'repo.json')).Trim() | Should -Be '{"container":"d","repo":"password"}'
+
+            # Running it again changes nothing (a blanked file no longer matches).
+            & sh -c ($cleanup.Replace('/tmp/impactncd/', "$dir/"))
+            $LASTEXITCODE | Should -Be 0
+            (Get-Content -Raw -LiteralPath (Join-Path $dir 'old.json')) | Should -Be $old
         } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }

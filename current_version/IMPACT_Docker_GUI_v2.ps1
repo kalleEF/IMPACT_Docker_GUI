@@ -1750,6 +1750,19 @@ function Show-ContainerManager {
             return
         }
 
+        # REMOTE: check the SSH login FIRST, before the 'docker ps' below. That docker call
+        # also travels over ssh to the workstation, so when ssh itself is the problem it would
+        # fail first and only show the general "Docker is not reachable" box. This check tells
+        # the user the real cause instead: not connected (VPN), workstation identity changed
+        # (with the 'ssh-keygen -R <ip>' advice and the interception warning), or key missing
+        # / no longer accepted ("start IMPACT again").
+        if ($State.ContainerLocation -like 'REMOTE@*') {
+            if (-not (Test-RemoteSSHKeyFiles -State $State)) {
+                [System.Windows.Forms.MessageBox]::Show($(if ($State.Metadata['RemoteSshCheckMessage']) { $State.Metadata['RemoteSshCheckMessage'] } else { 'Your SSH key was not found on the workstation. Close IMPACT and start it again to set it up.' }), 'SSH problem', 'OK', 'Error') | Out-Null  # message explains the real cause (VPN, key missing, ...), set by Test-RemoteSSHKeyFiles
+                return
+            }
+        }
+
         # Ask Docker NOW instead of trusting lists collected when this window opened, which
         # may be minutes or hours old (F18/F39/F34). This one 'docker ps' tells us:
         #  - whether Docker answers at all (Docker Desktop stopped, or the network/VPN to the
@@ -1766,7 +1779,9 @@ function Show-ContainerManager {
             Write-Log "Start: Docker is not reachable (exit $psNowExit): $psNowError" 'Warn'
             $State.Metadata.DockerReachable = $false
             Update-InfoBox -Status 'UNKNOWN'
-            $dockerFix = if ($State.ContainerLocation -eq 'LOCAL') { 'Start Docker Desktop and wait until it reports that the engine is running, then click Start again.' } else { "Check your network or VPN connection to the workstation ($($State.RemoteHostIp)), then click Start again." }
+            # REMOTE: the SSH check above has just succeeded, so the connection itself was
+            # fine a moment ago; the likelier cause is Docker on the workstation, so say both.
+            $dockerFix = if ($State.ContainerLocation -eq 'LOCAL') { 'Start Docker Desktop and wait until it reports that the engine is running, then click Start again.' } else { "IMPACT could log in to the workstation ($($State.RemoteHostIp)), but Docker there did not answer. Check your network or VPN connection and click Start again in a minute. If it keeps failing, ask the workstation admin to check that Docker is running there." }
             [System.Windows.Forms.MessageBox]::Show("Docker is not reachable, so the container cannot be started.`n`n$dockerFix",'Docker not reachable','OK','Warning') | Out-Null
             return
         }
@@ -1808,13 +1823,6 @@ function Show-ContainerManager {
             $txtPort.Text = $freePort
             [System.Windows.Forms.MessageBox]::Show("Port $portOverride is already in use by another container.`n`nPort $freePort is free and has been entered in the Port box. Click Start again to use it.", 'Port conflict', 'OK', 'Warning') | Out-Null
             return
-        }
-
-        if ($State.ContainerLocation -like 'REMOTE@*') {
-            if (-not (Test-RemoteSSHKeyFiles -State $State)) {
-                [System.Windows.Forms.MessageBox]::Show($(if ($State.Metadata['RemoteSshCheckMessage']) { $State.Metadata['RemoteSshCheckMessage'] } else { 'Your SSH key was not found on the workstation. Close IMPACT and start it again to set it up.' }), 'SSH problem', 'OK', 'Error') | Out-Null  # message explains the real cause (VPN, key missing, ...), set by Test-RemoteSSHKeyFiles
-                return
-            }
         }
 
         # This user's other running containers, from the fresh 'docker ps' above (names end
@@ -2927,8 +2935,13 @@ try {
     Write-Host "A fatal error occurred: $($ex.Message)" -ForegroundColor Red
     # F82 / B6a-R2: real line breaks ("`n"; "\n" is not a line break in PowerShell) and the
     # real log file path. No second box when the user has already seen an explanation
-    # (see Invoke-ImpactGui), and no extra "Press Enter" when the box was shown: IMPACT.bat
-    # already waits for a key press after an error.
+    # (see Invoke-ImpactGui). The "Press Enter" wait below is only needed when the user
+    # has NOT seen the error in a message box: then the console text is the only place
+    # where the error appears, and the window must stay open to read it. When a box was
+    # shown, the user has already read the error there, so we do not make them press
+    # Enter as well. (Do not rely on IMPACT.bat to pause after an error: cmd reads every
+    # '%errorlevel%' inside a "( ... )" block before the block runs, so its check after
+    # pwsh always sees 0 and it never reaches its 'pause'.)
     $alreadyTold = $false
     try { $alreadyTold = [bool]$ex.Data['ImpactUserNotified'] } catch { }
     $boxShown = $false

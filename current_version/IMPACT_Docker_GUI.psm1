@@ -462,16 +462,30 @@ function ConvertTo-RemoteRepoList {
 }
 
 <#
-.SYNOPSIS Shell snippet that deletes metadata files written by OLDER versions (B3-R6).
+.SYNOPSIS Shell snippet that blanks the password in metadata files written by OLDER
+          versions (B3-R6).
 .DESCRIPTION Older versions stored the RStudio password in plain text in
              /tmp/impactncd/<container>.json. Everybody on the workstation shares one Unix
-             account, so every colleague could read those files. This snippet removes every
-             metadata file that still has a "password" entry. It never fails (the final
-             'true'), so it can be appended to another command with '&&'. -Z / -0 keep file
-             names with spaces intact.
+             account, so every colleague could read those files. This snippet finds every
+             metadata file whose "password" entry is not empty and replaces only that value
+             with "" (the "password" key and all other entries stay).
+             The files are deliberately NOT deleted: a colleague who still runs an OLDER
+             version may have a container running right now, and that version can only learn
+             the port and the volume mode ("useVolumes") from this file (its containers have
+             no impact.* labels). Without the file, its Stop would skip copying the results
+             out of the Docker volumes, and its next Start would delete those volumes. With
+             an empty password the older version simply reads the password from the running
+             container instead (docker inspect), and the current version ignores an empty
+             password anyway. The key is kept (not removed) because the older version reads
+             '$meta.password' under StrictMode, which would throw if the key were missing.
+             The sed pattern ("([^"\\]|\\.)*") also understands JSON escapes such as \" or
+             \\ inside the password. A file that has been blanked no longer matches the
+             grep, so the snippet does nothing the next time.
+             It never fails (the final 'true'), so it can be appended to another command
+             with '&&'. -Z / -0 keep file names with spaces intact.
 #>
 function Get-RemoteMetadataCleanupCommand {
-    return '{ grep -lZE ''"password"[[:space:]]*:'' /tmp/impactncd/*.json 2>/dev/null | xargs -0 -r rm -f; true; }'
+    return '{ grep -lZE ''"password"[[:space:]]*:[[:space:]]*"[^"]'' /tmp/impactncd/*.json 2>/dev/null | xargs -0 -r sed -i -E ''s/("password"[[:space:]]*:[[:space:]]*)"([^"\\]|\\.)*"/\1""/''; true; }'
 }
 
 function Write-RemoteContainerMetadata {
@@ -505,11 +519,11 @@ function Write-RemoteContainerMetadata {
     try {
         # 'umask' now comes before 'mkdir' so the folder is also created private (it used to be
         # created with default permissions first).
-        # The part after the write is a one-off clean-up (B3-R6): files written by OLDER
-        # versions still contain the RStudio password in plain text, readable by every
-        # colleague on the shared account. Any metadata file that has a "password" entry is
-        # deleted. That is safe: the port and volume mode are read from the container's
-        # labels now, and the password from the running container itself. The '{ ...; true; }'
+        # The part after the write is a clean-up (B3-R6): files written by OLDER versions
+        # still contain the RStudio password in plain text, readable by every colleague on
+        # the shared account. In every such file only the password value is blanked; the
+        # file itself is kept, because a colleague still on an older version needs its port
+        # and volume mode (see Get-RemoteMetadataCleanupCommand). The '{ ...; true; }'
         # makes sure the clean-up can never make the whole command fail.
         $cleanup = Get-RemoteMetadataCleanupCommand
         & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "umask 077 && mkdir -p /tmp/impactncd && echo $b64 | base64 -d > $metaPathQ && $cleanup" 2>$null
@@ -531,8 +545,9 @@ function Remove-RemoteContainerMetadata {
     $keyPath = $State.Paths.SshPrivate
     $metaPath = "/tmp/impactncd/$($State.ContainerName).json"
     Write-Log "Removing remote metadata at $metaPath on $remoteHost" 'Info'
-    # Quoted safely for the remote shell; also removes old files that still hold a
-    # password (see Get-RemoteMetadataCleanupCommand, B3-R6).
+    # Quoted safely for the remote shell; also blanks the password in old files of other
+    # containers that still hold one, without deleting those files (see
+    # Get-RemoteMetadataCleanupCommand, B3-R6).
     $metaPathQ = ConvertTo-PosixShellLiteral -Value $metaPath
     $cleanup = Get-RemoteMetadataCleanupCommand
     try { & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "rm -f $metaPathQ; $cleanup" 2>$null } catch {
