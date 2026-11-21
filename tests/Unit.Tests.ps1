@@ -7,6 +7,11 @@
 #>
 
 BeforeAll {
+    # Many tests build temp paths from $env:TEMP, which exists on Windows only. On Linux
+    # (CI containers, developer machines) it is empty, so Join-Path failed before the
+    # test could check anything. Use the system temp folder there instead.
+    if (-not $env:TEMP) { $env:TEMP = [System.IO.Path]::GetTempPath() }
+
     # Import the module under test
     $modulePath = Join-Path $PSScriptRoot '..' 'current_version' 'IMPACT_Docker_GUI.psm1'
     Import-Module $modulePath -Force -DisableNameChecking
@@ -705,57 +710,135 @@ Describe 'Test-AndCreateDirectory' -Tag Unit {
 #  Ensure-SshConfigEntry
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Ensure-SshConfigEntry' -Tag Unit {
-    # NOTE: These tests write to the real $HOME/.ssh/config since PowerShell's $HOME
-    # automatic variable cannot be overridden via $env:HOME on Windows.
-    # We test idempotency and cleanup by targeting a unique IP that won't collide.
-
+    # (F108) These tests used to write to the developer's REAL ~/.ssh/config: PowerShell's
+    # $HOME cannot be changed, so the function always used the real file. A crashed run
+    # left a test entry behind, and the "replace the entry" cases were never tested.
+    # Now every test works on a throw-away folder in the temp directory:
+    #  - Join-Path is mocked for the one call inside the module that builds "$HOME/.ssh",
+    #    so the module reads and writes <temp>/.ssh/config instead;
+    #  - guard mocks make any write below the real ~/.ssh fail loudly (and do nothing)
+    #    in case the module ever builds that path in another way.
     BeforeAll {
         $script:testIp = '198.51.100.99'  # RFC 5737 TEST-NET-3, won't collide with real entries
-        $script:configPath = Join-Path $HOME '.ssh' 'config'
-    }
+        $script:realSshDir = Join-Path $HOME '.ssh'
 
-    AfterAll {
-        # Cleanup: remove the test entry if it exists
-        if (Test-Path $script:configPath) {
-            Remove-SshConfigHostBlock -ConfigPath $script:configPath -HostPattern $script:testIp
+        # Reads the IdentityFile value(s) of the test host block. Quotes are allowed around
+        # the value, so these tests keep working if the module starts quoting the path
+        # (a path with spaces needs quotes in ~/.ssh/config).
+        function Get-TestHostIdentityFiles {
+            param([string]$ConfigPath, [string]$HostIp)
+            $inBlock = $false
+            foreach ($line in (Get-Content -LiteralPath $ConfigPath)) {
+                if ($line -match '^\s*Host\s+(\S+)\s*$') { $inBlock = ($Matches[1] -eq $HostIp); continue }
+                if ($inBlock -and $line -match '^\s*IdentityFile\s+"?([^"]+?)"?\s*$') { $Matches[1] }
+            }
         }
     }
 
-    It 'Creates or appends SSH config entry for a new Host' {
-        # Remove any leftover from previous runs
-        if (Test-Path $script:configPath) {
-            Remove-SshConfigHostBlock -ConfigPath $script:configPath -HostPattern $script:testIp
-        }
+    BeforeEach {
+        $script:fakeHome   = Join-Path ([System.IO.Path]::GetTempPath()) "impact_sshconfig_$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        $script:fakeSshDir = Join-Path $script:fakeHome '.ssh'
+        $script:configPath = Join-Path $script:fakeSshDir 'config'
+        New-Item -ItemType Directory -Path $script:fakeSshDir -Force | Out-Null
 
-        # Create a dummy key file so Ensure-SshConfigEntry doesn't consider it "missing"
-        $dummyKeyDir = Join-Path $env:TEMP 'impact_sshconfig_test_key'
-        New-Item -ItemType Directory -Path $dummyKeyDir -Force | Out-Null
-        $dummyKey = Join-Path $dummyKeyDir 'id_ed25519_test'
-        Set-Content -Path $dummyKey -Value 'dummy-key-content'
+        # Two dummy key files, so the function does not treat them as "deleted".
+        $keyDir = Join-Path $script:fakeHome 'keys'
+        New-Item -ItemType Directory -Path $keyDir -Force | Out-Null
+        $script:keyA = (Join-Path $keyDir 'id_ed25519_a') -replace '\\', '/'
+        $script:keyB = (Join-Path $keyDir 'id_ed25519_b') -replace '\\', '/'
+        Set-Content -LiteralPath $script:keyA -Value 'dummy-key-a'
+        Set-Content -LiteralPath $script:keyB -Value 'dummy-key-b'
 
-        Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile ($dummyKey -replace '\\','/')
-
-        Test-Path $script:configPath | Should -BeTrue
-        $content = Get-Content $script:configPath -Raw
-        $content | Should -Match ([regex]::Escape($script:testIp))
-
-        Remove-Item -Recurse -Force $dummyKeyDir -ErrorAction SilentlyContinue
+        # Redirect "$HOME/.ssh" inside the module to the temp folder. All other Join-Path
+        # calls do not match the filter and run normally.
+        Mock Join-Path -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { $Path -eq $HOME -and $ChildPath -eq '.ssh' } { $script:fakeSshDir }
+        # Safety net: never touch the real ~/.ssh, whatever the module does.
+        Mock Add-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path" }
+        Mock Set-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path" }
+        Mock New-Item    -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like "$($script:realSshDir)*" } { throw "Test tried to create something in the real SSH folder: $Path" }
     }
 
-    It 'Does not duplicate entry on second call with same key' {
-        $dummyKeyDir = Join-Path $env:TEMP 'impact_sshconfig_test_key'
-        New-Item -ItemType Directory -Path $dummyKeyDir -Force | Out-Null
-        $dummyKey = Join-Path $dummyKeyDir 'id_ed25519_test'
-        Set-Content -Path $dummyKey -Value 'dummy-key-content'
+    AfterEach {
+        Remove-Item -Recurse -Force -LiteralPath $script:fakeHome -ErrorAction SilentlyContinue
+    }
 
-        Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile ($dummyKey -replace '\\','/')
-        Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile ($dummyKey -replace '\\','/')
+    It 'Creates an entry for a new host (in the temp folder, not in the real ~/.ssh)' {
+        Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile $script:keyA
 
-        $content = Get-Content $script:configPath -Raw
-        $count = ([regex]::Matches($content, [regex]::Escape("Host $($script:testIp)"))).Count
-        $count | Should -Be 1
+        Test-Path -LiteralPath $script:configPath | Should -BeTrue -Because 'the redirected config file must have been written'
+        $content = Get-Content -LiteralPath $script:configPath -Raw
+        $content | Should -Match "(?m)^Host $([regex]::Escape($script:testIp))\s*$"
+        $content | Should -Match '(?m)^\s+User php-workstation\s*$'
+        $content | Should -Match '(?m)^\s+IdentitiesOnly yes\s*$'
+        @(Get-TestHostIdentityFiles -ConfigPath $script:configPath -HostIp $script:testIp) | Should -Be @($script:keyA)
+    }
 
-        Remove-Item -Recurse -Force $dummyKeyDir -ErrorAction SilentlyContinue
+    It 'Does not duplicate the entry on a second call with the same key' {
+        Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile $script:keyA
+        Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile $script:keyA
+
+        $content = Get-Content -LiteralPath $script:configPath -Raw
+        ([regex]::Matches($content, "(?m)^Host $([regex]::Escape($script:testIp))\s*$")).Count | Should -Be 1
+    }
+
+    # Windows only: the function turns '/' into '\' before checking that the key file
+    # exists, so on Linux every existing entry looks like "deleted key" and is rewritten.
+    # The GUI only runs on Windows, where an unchanged entry must be left alone.
+    It 'Leaves a valid entry byte-for-byte unchanged' -Skip:(-not $IsWindows) {
+        Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile $script:keyA
+        $before = Get-Content -LiteralPath $script:configPath -Raw
+        Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile $script:keyA
+        Get-Content -LiteralPath $script:configPath -Raw | Should -BeExactly $before
+    }
+
+    It 'Keeps the entries of other hosts' {
+        Set-Content -LiteralPath $script:configPath -Value @("Host github.com", "    User git", "", "Host other.example", "    User someone")
+        Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile $script:keyA
+
+        $content = Get-Content -LiteralPath $script:configPath -Raw
+        $content | Should -Match '(?m)^Host github\.com\s*$'
+        $content | Should -Match '(?m)^Host other\.example\s*$'
+        $content | Should -Match '(?m)^\s+User someone\s*$'
+        @(Get-TestHostIdentityFiles -ConfigPath $script:configPath -HostIp $script:testIp) | Should -Be @($script:keyA)
+    }
+
+    It 'Replaces the entry when its key file was deleted' {
+        $deletedKey = (Join-Path $script:fakeHome 'keys/id_ed25519_deleted') -replace '\\', '/'
+        Set-Content -LiteralPath $script:configPath -Value @("Host $($script:testIp)", "    User php-workstation", "    IdentityFile $deletedKey")
+        Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile $script:keyA
+
+        $content = Get-Content -LiteralPath $script:configPath -Raw
+        ([regex]::Matches($content, "(?m)^Host $([regex]::Escape($script:testIp))\s*$")).Count | Should -Be 1
+        @(Get-TestHostIdentityFiles -ConfigPath $script:configPath -HostIp $script:testIp) | Should -Be @($script:keyA)
+    }
+
+    It 'Replaces the entry when it points to a different key' {
+        Set-Content -LiteralPath $script:configPath -Value @("Host $($script:testIp)", "    User php-workstation", "    IdentityFile $($script:keyB)")
+        Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile $script:keyA
+
+        $content = Get-Content -LiteralPath $script:configPath -Raw
+        ([regex]::Matches($content, "(?m)^Host $([regex]::Escape($script:testIp))\s*$")).Count | Should -Be 1
+        @(Get-TestHostIdentityFiles -ConfigPath $script:configPath -HostIp $script:testIp) | Should -Be @($script:keyA)
+    }
+
+    It 'Rewrites an IdentityFile that uses backslashes with forward slashes' {
+        $keyABackslash = $script:keyA -replace '/', '\'
+        Set-Content -LiteralPath $script:configPath -Value @("Host $($script:testIp)", "    User php-workstation", "    IdentityFile $keyABackslash")
+        Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile $script:keyA
+
+        $content = Get-Content -LiteralPath $script:configPath -Raw
+        $content | Should -Not -Match ([regex]::Escape($keyABackslash))
+        @(Get-TestHostIdentityFiles -ConfigPath $script:configPath -HostIp $script:testIp) | Should -Be @($script:keyA)
+    }
+
+    It 'Replaces a host block that has no IdentityFile line' {
+        Set-Content -LiteralPath $script:configPath -Value @("Host $($script:testIp)", "    User someone-else")
+        Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile $script:keyA
+
+        $content = Get-Content -LiteralPath $script:configPath -Raw
+        ([regex]::Matches($content, "(?m)^Host $([regex]::Escape($script:testIp))\s*$")).Count | Should -Be 1
+        $content | Should -Not -Match 'someone-else'
+        @(Get-TestHostIdentityFiles -ConfigPath $script:configPath -HostIp $script:testIp) | Should -Be @($script:keyA)
     }
 }
 
@@ -931,15 +1014,10 @@ Describe 'Format-DockerError' -Tag Unit {
     }
 }
 
-# Save Unit test artifacts (TestResults XML)
-AfterAll {
-    try {
-        if (-not (Get-Command -Name Save-TestArtifacts -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'Helpers' 'TestSessionState.ps1') }
-        Save-TestArtifacts -Suite 'unit' -ExtraFiles @('./tests/TestResults-Unit.xml')
-    } catch {
-        Write-Warning "Failed to save unit test artifacts: $($_.Exception.Message)"
-    }
-}
+# (F111) A file-level AfterAll used to call Save-TestArtifacts here. It ran on EVERY
+# run, before Pester had written the result XML, so it saved an old or missing XML and
+# created an extra artifacts folder each time. tests/Invoke-Tests.ps1 already saves the
+# artifacts after the suite, and only when tests failed or were skipped.
 
 Describe 'Get-DockerCredentialsFromDotEnv' -Tag Unit {
     It 'Parses DOCKER_USERNAME / DOCKER_PASSWORD pair' {
@@ -1104,19 +1182,43 @@ Describe 'Initialize-Logging' -Tag Unit {
 #  Ensure-PowerShell7 — guard logic
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Ensure-PowerShell7' -Tag Unit {
-    It 'Returns without error when running under PowerShell 7+' {
-        # This test only runs in PS7+ (which our test runner always uses)
-        if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7) {
-            Set-ItResult -Skipped -Because 'Test requires PowerShell 7+'
-        }
-        { Ensure-PowerShell7 } | Should -Not -Throw
+    # (F109) These tests used to check only "does not throw", which also passes when the
+    # function wrongly restarts PowerShell. Now they check the actual behaviour: on a
+    # supported PowerShell (7.3 or newer) it returns nothing and never starts a new
+    # process; on an older PowerShell 7 it refuses to run (throws) without restarting.
+    BeforeAll {
+        $script:psSupported = ($PSVersionTable.PSEdition -eq 'Core') -and
+            ([version]('{0}.{1}' -f $PSVersionTable.PSVersion.Major, $PSVersionTable.PSVersion.Minor) -ge [version]'7.3')
     }
 
-    It 'Accepts the PS7RequestedFlag parameter without error' {
-        if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7) {
-            Set-ItResult -Skipped -Because 'Test requires PowerShell 7+'
+    BeforeEach {
+        # A relaunch would start pwsh again; it must never happen in these tests.
+        Mock Start-Process -ModuleName 'IMPACT_Docker_GUI' { throw 'Ensure-PowerShell7 tried to restart PowerShell' }
+        Enable-NonInteractiveMode   # no message boxes if the version is too old
+    }
+
+    AfterEach {
+        Disable-NonInteractiveMode
+    }
+
+    It 'Returns immediately (no output, no restart) on PowerShell 7.3 or newer, and refuses older versions' {
+        if ($script:psSupported) {
+            $result = Ensure-PowerShell7
+            $result | Should -BeNullOrEmpty
+        } else {
+            { Ensure-PowerShell7 } | Should -Throw '*7.3*'
         }
-        { Ensure-PowerShell7 -PS7RequestedFlag $true } | Should -Not -Throw
+        Should -Invoke Start-Process -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly
+    }
+
+    It 'Accepts the PS7RequestedFlag parameter and still never restarts' {
+        if ($script:psSupported) {
+            $result = Ensure-PowerShell7 -PS7RequestedFlag $true
+            $result | Should -BeNullOrEmpty
+        } else {
+            { Ensure-PowerShell7 -PS7RequestedFlag $true } | Should -Throw '*7.3*'
+        }
+        Should -Invoke Start-Process -ModuleName 'IMPACT_Docker_GUI' -Times 0 -Exactly
     }
 }
 

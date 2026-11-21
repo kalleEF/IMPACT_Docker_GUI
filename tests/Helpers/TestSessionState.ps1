@@ -247,9 +247,15 @@ function Wait-ForRStudioReady {
         try {
             $resp = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
             if ($resp.StatusCode -in @(200, 302)) { return $true }
-        } catch [System.Net.WebException] {
-            # Extract HTTP status code from the response if available
-            $webResp = $_.Exception.Response
+        } catch {
+            # (F109) The old code only looked at the status code inside
+            # 'catch [System.Net.WebException]'. PowerShell 7 never throws that type for an
+            # HTTP error answer: it throws HttpResponseException, whose Response is an
+            # HttpResponseMessage. So a 401/403 answer (server running, login required)
+            # was treated like "not ready yet". Both response types have a StatusCode, so
+            # read it from whatever exception arrived.
+            $webResp = $null
+            if ($_.Exception.PSObject.Properties['Response']) { $webResp = $_.Exception.Response }
             if ($webResp) {
                 try {
                     $httpCode = [int]$webResp.StatusCode
@@ -257,9 +263,7 @@ function Wait-ForRStudioReady {
                     if ($httpCode -in @(200, 302, 401, 403)) { return $true }
                 } catch {}
             }
-            # Connection refused / timeout — keep waiting
-        } catch {
-            # Non-HTTP error (DNS, socket) — keep waiting
+            # No HTTP answer at all (connection refused, timeout, DNS): keep waiting
         }
     }
     return $false

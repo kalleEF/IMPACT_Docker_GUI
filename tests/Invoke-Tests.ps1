@@ -20,6 +20,13 @@
         pwsh tests/Invoke-Tests.ps1 -Level RemoteE2E             # Unit -> ... -> RemoteE2E
         pwsh tests/Invoke-Tests.ps1 -Level All -GitHubToken ghp_xxx
         pwsh tests/Invoke-Tests.ps1 -Tag ImageValidation -SkipBuild -KeepArtifacts
+        pwsh tests/Invoke-Tests.ps1 -Level All -AllowSkip            # exit 0 even if Docker suites could not run
+
+    Exit codes:
+        0  every requested suite ran and passed
+        1  at least one test failed, or a test file / BeforeAll / AfterAll block failed
+        2  nothing failed, but at least one requested suite was NOT RUN (for example
+           Docker is not running). Use -AllowSkip to get 0 in that case.
 #>
 param(
     [string[]]$Tag,
@@ -31,7 +38,10 @@ param(
     [string]$GitHubToken,
     [switch]$SkipBuild,
     [switch]$KeepArtifacts,
-    [switch]$CodeCoverage
+    [switch]$CodeCoverage,
+    # Treat suites that could not run (no Docker, preflight failed, ...) as acceptable:
+    # they are still listed as NOT RUN, but the exit code stays 0.
+    [switch]$AllowSkip
 )
 
 $ErrorActionPreference = 'Stop'
@@ -314,25 +324,48 @@ function Ensure-WorkstationContainer {
 $totalPassed  = 0
 $totalFailed  = 0
 $totalSkipped = 0
+# Failures outside single tests: a test file that cannot be loaded (discovery error)
+# or a failing BeforeAll/AfterAll. Pester does not count these in FailedCount, so the
+# old summary said PASS for them (F73).
+$totalBlockFailures = 0
 $results      = @()
+
+# (F73) A suite that cannot run used to be dropped from the summary without a trace,
+# so '-Level RemoteE2E' with Docker stopped printed PASS after running only Unit and
+# Integration. Every such suite is now listed as NOT RUN with the reason, and the exit
+# code is 2 (unless -AllowSkip).
+function Add-NotRunResult {
+    param([string]$Name, [string]$Reason, [bool]$Incomplete = $true)
+    Write-Host "  NOT RUN  $Name - $Reason" -ForegroundColor Yellow
+    $script:results += [PSCustomObject]@{
+        Suite      = $Name
+        Passed     = 0
+        Failed     = 0
+        Skipped    = 0
+        Time       = '-'
+        Status     = 'NOT RUN'
+        Reason     = $Reason
+        Incomplete = $Incomplete
+    }
+}
 
 foreach ($name in $suitesToRun) {
     $suite = $suites[$name]
     if (-not $suite) {
-        Write-Host "  SKIP $name - unknown suite" -ForegroundColor Yellow
+        Add-NotRunResult -Name $name -Reason 'unknown suite name'
         continue
     }
 
     $testFile = $suite.Path
     if (-not (Test-Path $testFile)) {
-        Write-Host "  SKIP $name - file not found: $testFile" -ForegroundColor Yellow
+        Add-NotRunResult -Name $name -Reason "file not found: $testFile"
         continue
     }
 
     # ── Pre-suite setup ───────────────────────────────────────────────────
     if ($name -eq 'DockerSsh') {
         $ok = Ensure-SshdContainer
-        if (-not $ok) { continue }
+        if (-not $ok) { Add-NotRunResult -Name $name -Reason 'SSHD test container could not be set up (Docker not running or build failed, see above)'; continue }
     }
 
     if ($name -eq 'ImageValidation') {
@@ -344,14 +377,14 @@ foreach ($name in $suitesToRun) {
         try { docker info 2>$null | Out-Null; $dockerOk = ($LASTEXITCODE -eq 0) } catch {}
         $env:DOCKER_CONTEXT = $savedCtx
         if (-not $dockerOk) {
-            Write-Host '  SKIP ImageValidation - local Docker not running' -ForegroundColor Yellow
+            Add-NotRunResult -Name $name -Reason 'local Docker is not running'
             continue
         }
     }
 
     if ($name -eq 'RemoteE2E') {
         $ok = Ensure-WorkstationContainer
-        if (-not $ok) { continue }
+        if (-not $ok) { Add-NotRunResult -Name $name -Reason 'workstation test container could not be set up (Docker not running or build failed, see above)'; continue }
     }
 
     # ── Run preflight for E2E suites ──────────────────────────────────────
@@ -365,8 +398,10 @@ foreach ($name in $suitesToRun) {
         $preConfig.Run.Exit = $false
         $preConfig.Run.PassThru = $true
         $preResult = Invoke-Pester -Configuration $preConfig
-        if ($preResult.FailedCount -gt 0) {
-            Write-Host "  SKIP $name - preflight checks failed" -ForegroundColor Yellow
+        # .Result is 'Failed' also when the preflight file itself could not run, which
+        # FailedCount alone does not show.
+        if ($preResult.Result -eq 'Failed') {
+            Add-NotRunResult -Name $name -Reason 'preflight checks failed (see the Preflight output above)'
             continue
         }
     }
@@ -388,20 +423,47 @@ foreach ($name in $suitesToRun) {
     $r = Invoke-Pester -Configuration $config
     $sw.Stop()
 
+    # (F73) Decide from Pester's overall .Result ('Passed', 'Failed' or 'NotRun'), not
+    # from FailedCount alone: a test file that cannot be loaded, or a failing
+    # BeforeAll/AfterAll, gives Result 'Failed' with FailedCount 0.
+    $blockFailures = [int]$r.FailedBlocksCount + [int]$r.FailedContainersCount
     $totalPassed  += $r.PassedCount
     $totalFailed  += $r.FailedCount
     $totalSkipped += $r.SkippedCount
+    $totalBlockFailures += $blockFailures
+
+    $status = 'PASS'
+    $reason = ''
+    $incomplete = $false
+    if ($r.Result -eq 'Failed') {
+        $status = 'FAIL'
+        if ($blockFailures -gt 0) { $reason = "$blockFailures test file(s) or BeforeAll/AfterAll block(s) failed" }
+    } elseif ($r.Result -eq 'NotRun') {
+        # No test ran at all, for example because -ExcludeTag excluded every test.
+        $status = 'NOT RUN'
+        if ($ExcludeTag) {
+            $reason = 'every test was excluded by -ExcludeTag'
+        } else {
+            $reason = 'no test was run'
+            $incomplete = $true
+        }
+    }
     $results += [PSCustomObject]@{
-        Suite   = $name
-        Passed  = $r.PassedCount
-        Failed  = $r.FailedCount
-        Skipped = $r.SkippedCount
-        Time    = $sw.Elapsed.ToString('mm\:ss\.ff')
-        Status  = if ($r.FailedCount -gt 0) { 'FAIL' } else { 'PASS' }
+        Suite      = $name
+        Passed     = $r.PassedCount
+        Failed     = $r.FailedCount
+        Skipped    = $r.SkippedCount
+        Time       = $sw.Elapsed.ToString('mm\:ss\.ff')
+        Status     = $status
+        Reason     = $reason
+        Incomplete = $incomplete
     }
 
-    if ($r.FailedCount -gt 0) {
-        Write-Host "  FAIL  $name - $($r.FailedCount) test(s) failed" -ForegroundColor Red
+    if ($status -eq 'FAIL') {
+        $what = if ($r.FailedCount -gt 0) { "$($r.FailedCount) test(s) failed" } else { $reason }
+        Write-Host "  FAIL  $name - $what" -ForegroundColor Red
+    } elseif ($status -eq 'NOT RUN') {
+        Write-Host "  NOT RUN  $name - $reason" -ForegroundColor Yellow
     } else {
         Write-Host "  PASS  $name - $($r.PassedCount) passed in $($sw.Elapsed.ToString('mm\:ss'))" -ForegroundColor Green
     }
@@ -443,6 +505,8 @@ $suiteContainers = @{
 }
 
 foreach ($res in $results) {
+    # A suite that never ran has no result XML and no containers to collect.
+    if ($res.Status -eq 'NOT RUN') { continue }
     $artifactName = $suiteArtifactName[$res.Suite]
     if (-not $artifactName) { $artifactName = $res.Suite.ToLower() }
 
@@ -478,8 +542,20 @@ if ($xmlFiles.Count -gt 0) {
 Write-Host '=============================================' -ForegroundColor Cyan
 Write-Host '  Summary' -ForegroundColor Cyan
 Write-Host '=============================================' -ForegroundColor Cyan
-$results | Format-Table -AutoSize
-Write-Host "  Total: Passed=$totalPassed  Failed=$totalFailed  Skipped=$totalSkipped" -ForegroundColor $(if ($totalFailed -gt 0) { 'Red' } else { 'Green' })
+# Out-String with a fixed width: when the output is redirected (CI logs, a file) the
+# console width can be unknown, and a plain Format-Table then printed an empty table.
+$results | Format-Table -AutoSize -Property Suite, Status, Passed, Failed, Skipped, Time, Reason | Out-String -Width 200 | Write-Host
+$failedRuns = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
+$notRun     = @($results | Where-Object { $_.Status -eq 'NOT RUN' -and $_.Incomplete })
+$summaryColor = if ($failedRuns -gt 0) { 'Red' } elseif ($notRun.Count -gt 0) { 'Yellow' } else { 'Green' }
+Write-Host "  Total: Passed=$totalPassed  Failed=$totalFailed  Skipped=$totalSkipped  BlockFailures=$totalBlockFailures  NotRun=$($notRun.Count)" -ForegroundColor $summaryColor
+if ($notRun.Count -gt 0) {
+    Write-Host "  $($notRun.Count) suite(s) NOT RUN: $(($notRun | ForEach-Object { $_.Suite }) -join ', '). This run is INCOMPLETE." -ForegroundColor Yellow
+}
 Write-Host ''
 
-if ($totalFailed -gt 0) { exit 1 }
+# Exit codes: 1 = something failed, 2 = nothing failed but requested suites did not run
+# (unless -AllowSkip), 0 = everything requested ran and passed.
+if ($failedRuns -gt 0 -or $totalFailed -gt 0) { exit 1 }
+if ($notRun.Count -gt 0 -and -not $AllowSkip) { exit 2 }
+exit 0

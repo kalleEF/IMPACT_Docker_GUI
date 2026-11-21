@@ -1,0 +1,13 @@
+# Line endings for files in this repository.
+#
+# Windows batch files (.bat / .cmd) must have Windows (CRLF) line endings.
+# With Unix (LF) line endings cmd.exe can fail to find the ':labels' that
+# 'goto' jumps to, so IMPACT.bat could skip its error message and its pause.
+# 'text eol=crlf' makes git store them normalised in the repository and write
+# them with CRLF into every checkout and into GitHub's "Download ZIP",
+# whatever the git settings of the computer are.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# The application icon is binary: git must never change bytes inside it.
+*.ico binary

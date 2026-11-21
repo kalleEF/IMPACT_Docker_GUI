@@ -1,40 +1,34 @@
-# Testing Guide — IMPACT Docker GUI
+# Testing Guide: IMPACT Docker GUI
 
-This document explains the testing architecture, how to run tests locally, and how CI works.
+How the tests are organised, how to run them locally, and what CI runs.
 
-> **Key design constraint:** The IMPACT Docker GUI script runs **only on Windows** (WinForms UI, Docker Desktop contexts). The Docker images it manages are **Linux containers**. Tests are split accordingly: Unit & Integration run on Windows, while Docker-dependent tests run on Ubuntu (Linux) with PowerShell (`pwsh`).
+> **Platform note.** The GUI runs **only on Windows** (WinForms, Docker Desktop). The Docker images it manages are **Linux** containers. Unit and Integration tests therefore run on Windows in CI, and the Docker-based suites run on Ubuntu with PowerShell 7 (`pwsh`). On Linux or macOS many Integration tests fail or are skipped because WinForms/System.Drawing, the Windows service cmdlets or OpenSSH are missing; that is expected.
 
 ---
 
 ## Architecture
 
-The codebase is split into two layers to enable headless testing:
-
 | File | Purpose |
 |---|---|
-| `current_version/IMPACT_Docker_GUI.psm1` | PowerShell module — all core functions (logic, SSH, Docker, UI helpers). Importable by both the launcher and by tests. |
-| `current_version/IMPACT_Docker_GUI.psd1` | Module manifest (metadata, version, exports). |
-| `current_version/IMPACT_Docker_GUI_v2.ps1` | Thin launcher — imports the module, runs the top-level orchestration flow with WinForms UI. |
+| `current_version/IMPACT_Docker_GUI.psm1` | Module with the core functions (logic, SSH, Docker, git, dialogs). Imported by the GUI script and by the tests. |
+| `current_version/IMPACT_Docker_GUI.psd1` | Manifest. `FunctionsToExport` must list exactly the functions in the `.psm1`'s `Export-ModuleMember` (a unit test checks this). |
+| `current_version/IMPACT_Docker_GUI_v2.ps1` | GUI script: imports the module and runs the workflow (remote/local preparation, Container Manager with the Start/Stop handlers). Not imported by the tests; one unit test parses it to check that every module function it calls is exported. |
 
-### NonInteractive Mode
-
-The module exposes a `$script:NonInteractive` flag controlled by:
+### NonInteractive mode
 
 ```powershell
-Enable-NonInteractiveMode    # sets flag to $true
-Disable-NonInteractiveMode   # sets flag to $false
-Test-NonInteractiveMode      # returns current value
+Enable-NonInteractiveMode    # dialogs are skipped; values come from the session state
+Disable-NonInteractiveMode
+Test-NonInteractiveMode
 ```
 
-When enabled, every dialog function (e.g. `Show-CredentialDialog`, `Select-Location`, `Ensure-GitKeySetup`) reads its inputs from the `$State` hashtable instead of showing WinForms dialogs, making the script fully automatable.
+In NonInteractive mode the dialog functions (`Show-CredentialDialog`, `Select-Location`, `Ensure-GitKeySetup`, `Show-GitCommitDialog`, message boxes in the git flow, ...) read their input from `$State` instead of showing a window. `Show-CredentialDialog` then only warns about a weak RStudio password, so fixed test passwords keep working.
 
 ---
 
-## Test Framework
+## Test framework
 
-We use **[Pester 5](https://pester.dev/)** (PowerShell-native, xUnit-style).
-
-### Install Pester
+[Pester 5](https://pester.dev/). The runner installs it if needed:
 
 ```powershell
 Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
@@ -42,84 +36,91 @@ Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPubli
 
 ---
 
-## Test Suites
+## Test suites
 
-There are five test suites arranged in cumulative levels:
+| Level | File | Tag | What it covers | CI runner | Needs |
+|---|---|---|---|---|---|
+| 1 | `tests/Unit.Tests.ps1` | `Unit` | Pure logic: session state, path conversion, Docker context args, YAML parsing (quotes, `~`, empty values), `docker run` arguments (127.0.0.1 binding, labels, custom params), volume names, SSH config entries (in a temp folder), container SSH/git setup commands, port checks, Docker error messages, `.env` credentials, logging, PowerShell version guard, GitHub username/password rules, shell quoting, git push hints, manifest/export consistency | Windows | Nothing |
+| 2 | `tests/Integration.Tests.ps1` | `Integration` | Mocked multi-step flows: NonInteractive dialogs, SSH key setup (existing key and new key, in a temp folder), Docker daemon checks, ssh-agent, Write-Log output, remote container flow, git status/commit/push flow (local and remote), remote metadata, remote key check, Docker Desktop start, remote docker login, volume helpers | Windows | Nothing (everything mocked) |
+| 3 | `tests/DockerSsh.Tests.ps1` | `DockerSsh` | Live SSH against an SSHD container; plus the production in-container SSH setup command (`Get-ContainerSshSetupCommand`) run in a real container, with a strict host-key check against github.com (no token needed) | Ubuntu | Docker, SSHD image, internet for the github.com checks |
+| 4 | `tests/ImageValidation.Tests.ps1` | `ImageValidation` | Builds the real IMPACT image, starts it, checks RStudio, R packages, `global.R`, the production SSH setup, known_hosts, a strict host-key check, `GIT_SSH_COMMAND` in a clean R session (as RStudio starts them), and with a token GitHub auth and `git pull` | Ubuntu | Docker, internet |
+| 5 | `tests/RemoteE2E.Tests.ps1` | `RemoteE2E` | Full SSH to workstation to Docker flow (Docker-out-of-Docker): clone, build, start, RStudio, `global.R`, the production SSH setup and `GIT_SSH_COMMAND`, and with a token GitHub auth and `git pull` over SSH | Ubuntu | Docker, internet, Docker socket |
+| - | `tests/Preflight.Tests.ps1` | `Preflight` | Quick checks run before suites 3 to 5: Docker reachable, git and GitHub reachable, `ssh-keygen` present, test keys usable, temp folder writable | Ubuntu | Docker |
 
-| Level | File | Tag | Tests | What it covers | CI Runner | External deps |
-|---|---|---|---|---|---|---|
-| 1 | `tests/Unit.Tests.ps1` | `Unit` | 89 | Pure-logic functions: path conversion, `New-SessionState`, `Get-RemoteHostString`, `Get-DockerContextArgs`, `Get-YamlPathValue`, `Build-DockerRunCommand`, SSH config, theme palette, NonInteractive mode, `.env` credential parsing, logging init, PS7 guard, GitHub username validation | **Windows** | None |
-| 2 | `tests/Integration.Tests.ps1` | `Integration` | 49 | Mocked multi-function flows: credential dialogs with GitHub validation, Docker daemon checks, SSH agent, logging, GitHub API key management, remote container flow (YAML → path → `docker run`), git repository state, git change detection, remote container metadata, remote SSH key checks, Docker Desktop startup | **Windows** | None (all mocked) |
-| 3 | `tests/DockerSsh.Tests.ps1` | `DockerSsh` | 6 | Live SSH connectivity against SSHD container: remote command execution, metadata read/write, directory creation | **Ubuntu** | Docker, SSHD container |
-| 4 | `tests/ImageValidation.Tests.ps1` | `ImageValidation` | ~14 | Docker image validation: build IMPACT image, start container, check RStudio, R environment, `global.R`, Git/SSH config, GitHub SSH auth | **Ubuntu** | Docker, Internet |
-| 5 | `tests/RemoteE2E.Tests.ps1` | `RemoteE2E` | ~11 | Full SSH→Docker flow: SSH into workstation container → clone repo → build image → start IMPACT container → validate RStudio + `global.R` + `git pull` through SSH tunnel | **Ubuntu** | Docker, Internet, DooD socket |
+The number of tests changes often; the runner prints the counts per suite.
 
 ### LOCAL vs REMOTE coverage
 
-The GUI supports two modes:
-
-- **LOCAL** — Docker runs on the user's own machine; the repo and storage directories are local.
-- **REMOTE** — Docker runs on a remote workstation (e.g. `10.152.14.124`) via an SSH-based Docker context; paths like `/mnt/Storage_1/…` live on that machine.
-
-| Test layer | LOCAL | REMOTE |
+| Layer | LOCAL | REMOTE |
 |---|---|---|
-| Unit | Yes — relative-path YAML, local `Build-DockerRunCommand` | Yes — absolute-path YAML, `Get-RemoteHostString`, `Get-DockerContextArgs`, remote `Build-DockerRunCommand` |
-| Integration | Yes — local credential flow, Docker daemon checks | Yes — full mocked remote flow (YAML → path → `docker run` with SSH context args) |
-| DockerSsh | — | Yes — live SSH commands against SSHD container with remote-like directory layout |
-| ImageValidation | **Yes** — validates the Docker image independently (RStudio, R packages, `global.R`, Git/SSH) | — |
-| RemoteE2E | — | **Yes** — full SSH→Docker lifecycle via DooD workstation container |
+| Unit | Relative YAML paths, local `docker run` arguments | Absolute YAML paths, remote host string, context args, remote `docker run` arguments |
+| Integration | Local credential/git flows, Docker checks | Mocked remote flow (YAML, folders, `docker run`), remote git commit/push, metadata, key checks |
+| DockerSsh | - | Live SSH commands against an SSHD container; in-container SSH setup |
+| ImageValidation | The image itself, started like a local container | - |
+| RemoteE2E | - | Full SSH to Docker lifecycle via a workstation container |
 
-### Docker-out-of-Docker (DooD) Pattern
-
-The RemoteE2E tests use the **DooD** pattern to simulate a real workstation with Docker capabilities:
+### Docker-out-of-Docker (DooD) for RemoteE2E
 
 ```
-┌─── CI Host (Ubuntu runner) ──────────────────────────────────────────┐
-│  Docker daemon (host)                                                 │
-│  ┌─── workstation-test container ──────────────────────────────────┐  │
-│  │  Ubuntu 22.04 + SSHD + Docker CLI (no daemon)                   │  │
-│  │  /var/run/docker.sock → mounted from host (DooD)                │  │
-│  │  SSH on port 22 → mapped to host:2223                           │  │
-│  │                                                                  │  │
-│  │  testuser runs: docker build / docker run                       │  │
-│  │   └── talks to HOST daemon via mounted socket                   │  │
-│  │       └── creates SIBLING containers on the host                │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
-│  ┌─── impact-e2e container (sibling) ──────────────────────────────┐  │
-│  │  RStudio Server on port 18787                                    │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────────────────────┘
++--- CI host / your PC ---------------------------------------------------+
+|  Docker daemon (host)                                                   |
+|  +--- workstation-test container -----------------------------------+   |
+|  |  Ubuntu 22.04 + SSHD + Docker CLI (no daemon)                     |   |
+|  |  /var/run/docker.sock mounted from the host                       |   |
+|  |  SSH port 22 -> host 2223 (Invoke-Tests.ps1) or 2222 (CI)         |   |
+|  |  testuser runs docker build / docker run                          |   |
+|  |    -> talks to the HOST daemon -> creates SIBLING containers      |   |
+|  +-------------------------------------------------------------------+   |
+|  +--- impact_remote_e2e_inner (sibling) ------------------------------+  |
+|  |  RStudio Server (reached from the workstation via its container IP)|  |
+|  +--------------------------------------------------------------------+  |
++-------------------------------------------------------------------------+
 ```
 
-Key properties:
-- **No nested Docker daemon** — the workstation container has only the Docker CLI, not a daemon.
-- **No `--privileged`** — only the socket mount is needed (`-v /var/run/docker.sock:/var/run/docker.sock`).
-- **Sibling containers** — containers created from inside workstation-test appear as peers on the host.
-- **GID matching** — the entrypoint script detects the socket's GID and adjusts the `docker` group inside the container to match.
+- No nested Docker daemon and no `--privileged`: only the socket is mounted.
+- Bind mounts would refer to the HOST's file system, so the repository and the key are copied into the inner container with `docker cp`. The key goes to `/keys/id_ed25519_e2e`, the same place the GUI bind-mounts it, and then the **production** `Get-ContainerSshSetupCommand` runs (sent base64-encoded because it contains quotes). `USERID`/`GROUPID` are the workstation account's `id -u`/`id -g`, as in the GUI.
+- The entrypoint adjusts the `docker` group to the socket's GID.
 
 ---
 
-## Running Tests Locally
+## Running tests locally
 
-### Unified test runner
+### The test runner: `tests/Invoke-Tests.ps1`
 
-The recommended way to run tests is through `Run-AllTests.ps1`:
+| Command | What runs |
+|---|---|
+| `pwsh tests/Invoke-Tests.ps1` | Unit + Integration (default) |
+| `pwsh tests/Invoke-Tests.ps1 -Tag Unit` | One suite (also `Integration`, `DockerSsh`, `ImageValidation`, `RemoteE2E`) |
+| `pwsh tests/Invoke-Tests.ps1 -Level DockerSsh` | Unit, Integration and DockerSsh |
+| `pwsh tests/Invoke-Tests.ps1 -Level ImageValidation` | ... plus ImageValidation (15-25 min) |
+| `pwsh tests/Invoke-Tests.ps1 -Level RemoteE2E` | ... plus RemoteE2E (20-40 min) |
+| `pwsh tests/Invoke-Tests.ps1 -Level All` | Everything |
+| `pwsh tests/Invoke-Tests.ps1 -Level All -GitHubToken ghp_xxx` | Everything, including the GitHub SSH auth tests |
+| `-ExcludeTag <tag>` | Skip tests with that tag |
+| `-SkipBuild` / `-KeepArtifacts` | Reuse an existing image / keep clone and image after the E2E suites |
+| `-AllowSkip` | Exit 0 even if some suites could not run |
+| `-CodeCoverage` | Enable Pester code coverage |
 
-| Command | What runs | Time |
-|---|---|---|
-| `pwsh Run-AllTests.ps1` | Unit + Integration (default) | ~10 s |
-| `pwsh Run-AllTests.ps1 -Level DockerSsh` | + DockerSsh | ~30 s |
-| `pwsh Run-AllTests.ps1 -Level ImageValidation` | + ImageValidation | ~15–25 min |
-| `pwsh Run-AllTests.ps1 -Level RemoteE2E` | + RemoteE2E (full E2E) | ~20–40 min |
-| `pwsh Run-AllTests.ps1 -Level All` | Everything | ~30–50 min |
-| `pwsh Run-AllTests.ps1 -Level RemoteE2E -GitHubToken ghp_xxx` | Full with SSH auth tests | ~30–50 min |
+`-Tag` and `-Level` cannot be combined.
 
-The runner automatically:
-- Builds/starts required containers (SSHD, Workstation)
-- Generates SSH keys and configures connectivity
-- Sets up all environment variables
-- Runs suites in order with cumulative pass/fail tracking
-- Cleans up containers when done
+The runner:
+
+- loads `KEY=value` lines from a `.env` file in the repository root into environment variables (tokens are shown masked),
+- builds and starts the SSHD container (`sshd-test`, port **2222**) and the workstation container (`workstation-test`, port **2223**) when those suites are requested, creates throw-away test keys in `<temp>/impact_test_ssh` and sets the `IMPACT_TEST_SSH_*` / `IMPACT_REMOTE_E2E_SSH_*` variables,
+- runs the Preflight checks before DockerSsh, ImageValidation and RemoteE2E,
+- runs the suites in order and removes the containers it created,
+- saves artifacts (result XML, container logs, environment info) to `tests/artifacts/<suite>/<timestamp>/` **only when tests failed or were skipped** (the folder is git-ignored), then deletes the `tests/TestResults-*.xml` files,
+- prints a summary table with a **Status** per suite: `PASS`, `FAIL` or `NOT RUN` with the reason.
+
+**A suite that could not run is never silently left out.** If Docker is not running, a container could not be set up, the Preflight checks failed, the file is missing or the suite name is unknown, it is listed as `NOT RUN` with the reason, and the summary says the run is INCOMPLETE. A test file that cannot be loaded, or a failing `BeforeAll`/`AfterAll`, counts as `FAIL` even though no single test failed.
+
+**Exit codes:**
+
+| Code | Meaning |
+|---|---|
+| 0 | Every requested suite ran and passed. |
+| 1 | A test failed, or a test file / `BeforeAll` / `AfterAll` failed. |
+| 2 | Nothing failed, but at least one requested suite was NOT RUN. Use `-AllowSkip` to get 0 in that case (for example on a PC without Docker). |
 
 ### Direct Pester invocation
 
@@ -129,9 +130,9 @@ Invoke-Pester ./tests/Unit.Tests.ps1 -Output Detailed
 Invoke-Pester ./tests/Integration.Tests.ps1 -Output Detailed
 ```
 
-### Running DockerSsh tests manually
+There is no shared Pester configuration file; the runner and CI build their configuration in code.
 
-If you prefer manual setup:
+### DockerSsh tests by hand
 
 1. Build and start the SSHD container:
 
@@ -154,11 +155,13 @@ If you prefer manual setup:
    Invoke-Pester ./tests/DockerSsh.Tests.ps1 -Output Detailed
    ```
 
-3. Cleanup: `docker stop sshd-test && docker rm sshd-test`
+   The "Container SSH setup command in a real container" tests reuse the `impact-sshd-test` image. They are skipped (with the reason) when the image, `docker` or `ssh-keygen` is missing, and their github.com checks are skipped when github.com cannot be reached.
 
-### Running RemoteE2E tests manually
+3. Clean up: `docker stop sshd-test && docker rm sshd-test`
 
-1. Build and start the workstation container with DooD:
+### RemoteE2E tests by hand
+
+1. Build and start the workstation container:
 
    ```bash
    docker build -t impact-workstation-test -f tests/Helpers/WorkstationContainer.Dockerfile .
@@ -169,7 +172,7 @@ If you prefer manual setup:
    docker exec workstation-test chmod 600 /home/testuser/.ssh/authorized_keys
    ```
 
-2. Verify DooD works:
+2. Check that Docker works through SSH:
 
    ```bash
    ssh -p 2223 -i /tmp/id_ws_test -o StrictHostKeyChecking=no testuser@localhost "docker info --format '{{.ServerVersion}}'"
@@ -186,113 +189,99 @@ If you prefer manual setup:
    Invoke-Pester ./tests/RemoteE2E.Tests.ps1 -Output Detailed
    ```
 
-4. Cleanup: `docker stop workstation-test && docker rm workstation-test`
+4. Clean up: `docker stop workstation-test && docker rm workstation-test`
 
 ---
 
-## Environment Variables
+## Environment variables
 
-| Variable | Used by | Required | Purpose |
-|---|---|---|---|
-| `IMPACT_TEST_SSH_HOST` | DockerSsh | Yes | SSH host for SSHD container (typically `localhost`) |
-| `IMPACT_TEST_SSH_PORT` | DockerSsh | Yes | SSH port (typically `2222`) |
-| `IMPACT_TEST_SSH_USER` | DockerSsh | Yes | SSH username (typically `testuser`) |
-| `IMPACT_TEST_SSH_KEY` | DockerSsh | Yes | Path to SSH private key |
-| `IMPACT_REMOTE_E2E_SSH_HOST` | RemoteE2E | Yes | SSH host for workstation container |
-| `IMPACT_REMOTE_E2E_SSH_PORT` | RemoteE2E | Yes | SSH port (typically `2223`) |
-| `IMPACT_REMOTE_E2E_SSH_USER` | RemoteE2E | Yes | SSH username (typically `testuser`) |
-| `IMPACT_REMOTE_E2E_SSH_KEY` | RemoteE2E | Yes | Path to SSH private key |
-| `IMPACT_E2E_GITHUB_TOKEN` | ImageValidation, RemoteE2E | No | Fine-grained PAT with SSH keys Read/Write. Enables Git SSH auth + pull tests. If absent, those tests are skipped. |
-| `IMPACT_E2E_SKIP_BUILD` | ImageValidation, RemoteE2E | No | Set to `1` to skip Docker image build and reuse existing images. |
-| `IMPACT_E2E_KEEP_ARTIFACTS` | ImageValidation, RemoteE2E | No | Set to `1` to keep cloned repos + Docker images after tests. |
-
----
-
-## Typical Workflow After Making Changes
-
-1. **Edit** the module (`IMPACT_Docker_GUI.psm1`) or the launcher (`.ps1`).
-2. **Run unit tests** (~5 s):
-
-   ```powershell
-   pwsh Run-AllTests.ps1 -Level Unit
-   ```
-
-3. **Run unit + integration** (~10 s) if integration-level logic changed:
-
-   ```powershell
-   pwsh Run-AllTests.ps1
-   ```
-
-4. **Run up to DockerSsh** (~30 s) if SSH/remote logic changed:
-
-   ```powershell
-   pwsh Run-AllTests.ps1 -Level DockerSsh
-   ```
-
-5. **Run full E2E** (~30 min) if container lifecycle, image build, or `global.R` logic changed:
-
-   ```powershell
-   pwsh Run-AllTests.ps1 -Level RemoteE2E -GitHubToken ghp_xxx
-   ```
-
-6. **Push** — CI runs Unit + Integration + DockerSsh on every push. ImageValidation + RemoteE2E run on weekly schedule or manual dispatch.
+| Variable | Used by | Purpose |
+|---|---|---|
+| `IMPACT_TEST_SSH_HOST` | DockerSsh | SSH host of the SSHD container (`localhost`). The suite is skipped if it or the key is not set. |
+| `IMPACT_TEST_SSH_PORT` | DockerSsh | SSH port (default `2222`). |
+| `IMPACT_TEST_SSH_USER` | DockerSsh | SSH user (default `testuser`). |
+| `IMPACT_TEST_SSH_KEY` | DockerSsh, Preflight | Private key for the SSHD container. Preflight checks that it has no passphrase. |
+| `IMPACT_REMOTE_E2E_SSH_HOST` | RemoteE2E | SSH host of the workstation container (default `localhost`). |
+| `IMPACT_REMOTE_E2E_SSH_PORT` | RemoteE2E | SSH port (default `2222`; the runner uses `2223`). |
+| `IMPACT_REMOTE_E2E_SSH_USER` | RemoteE2E | SSH user (default `testuser`). |
+| `IMPACT_REMOTE_E2E_SSH_KEY` | RemoteE2E, Preflight | Private key for the workstation container. |
+| `IMPACT_E2E_GITHUB_TOKEN` | ImageValidation, RemoteE2E | Fine-grained token with **SSH keys: Read and Write**. Enables the GitHub SSH auth and `git pull` tests; they are skipped without it. |
+| `IMPACT_E2E_SKIP_BUILD` | ImageValidation, RemoteE2E | `1` = reuse the existing image. |
+| `IMPACT_E2E_KEEP_ARTIFACTS` | ImageValidation, RemoteE2E | `1` = keep the clone and the image after the tests. |
 
 ---
 
-## CI — GitHub Actions
+## Typical workflow after a change
 
-The workflow file lives at `.github/workflows/test.yml`.
+1. Edit the module (`IMPACT_Docker_GUI.psm1`) or the GUI script (`IMPACT_Docker_GUI_v2.ps1`).
+2. Run the unit tests: `pwsh tests/Invoke-Tests.ps1 -Tag Unit`.
+3. Run Unit + Integration: `pwsh tests/Invoke-Tests.ps1`.
+4. If SSH/remote logic or the container SSH setup changed: `pwsh tests/Invoke-Tests.ps1 -Level DockerSsh`.
+5. If the image, the container start or `global.R` handling changed: `pwsh tests/Invoke-Tests.ps1 -Level RemoteE2E -GitHubToken ghp_xxx`.
+6. Push. CI runs Unit, Integration and DockerSsh (see below); start the E2E jobs by hand when needed.
+
+---
+
+## CI: GitHub Actions
+
+Workflow: `.github/workflows/test.yml`.
 
 **Triggers:**
-- **Push** to `main` or `develop` → Unit (Windows) + Integration (Windows) + DockerSsh (Ubuntu)
-- **Pull request** → Same as push
-- **Manual dispatch** (`workflow_dispatch`) with `run_e2e` checkbox → all jobs including ImageValidation + RemoteE2E
-- **Weekly schedule** (Sunday 03:00 UTC) → all jobs including ImageValidation + RemoteE2E
 
-### Why Windows + Ubuntu?
+- **Push** to `main` or `develop`, but **only when** files under `current_version/`, `tests/` or the workflow file change (documentation-only pushes do not run CI): Unit, Integration, DockerSsh.
+- **Pull request** to `main` (any change): the same three jobs.
+- **Manual run** (`workflow_dispatch`): the same three jobs; ImageValidation and RemoteE2E only when **run_e2e** is ticked.
+- **Weekly** (Sunday 03:00 UTC): all five jobs.
+
+| Job | Runner | Runs on | What it does |
+|---|---|---|---|
+| `unit-tests` | `windows-latest` | push, PR, manual, weekly | Installs Pester, runs the `Unit` tag. |
+| `integration-tests` | `windows-latest` | same; after `unit-tests` | Checks that the docker CLI exists, runs the `Integration` tag (everything mocked). |
+| `docker-ssh-tests` | `ubuntu-latest` | same; after `unit-tests` | Builds the SSHD image, starts it with a fresh key, runs the `DockerSsh` tag, including the production in-container SSH setup in a real container and the strict github.com host-key check (no token). |
+| `image-validation` | `ubuntu-latest` | manual with run_e2e, weekly; after `docker-ssh-tests` | Preflight, then builds the real image and validates the container. 45 min timeout. |
+| `remote-e2e` | `ubuntu-latest` | manual with run_e2e, weekly; after `docker-ssh-tests` | Builds the workstation container (SSH port 2222), Preflight (the key path is set for the whole job, so Preflight checks it), then the full DooD flow. 60 min timeout. |
+
+Failed jobs upload their result XML; the E2E jobs also upload container logs and `docker inspect` output.
+
+### Why Windows and Ubuntu
 
 | Runner | Why |
 |---|---|
-| **Windows** for Unit & Integration | The script only runs on Windows (WinForms). These tests validate the script's own logic on its target platform. No Docker needed (everything mocked). |
-| **Ubuntu** for DockerSsh, ImageValidation, RemoteE2E | The Docker images are Linux containers. GitHub's `windows-latest` runners only support Windows containers (no Docker Desktop / WSL2). Linux container tests must run on Ubuntu. |
-
-### Jobs
-
-| Job | Runner | Trigger | What it does |
-|---|---|---|---|
-| `unit-tests` | `windows-latest` | push, PR | Installs Pester, runs `Unit` tag (65 tests) |
-| `integration-tests` | `windows-latest` | push, PR | Runs `Integration` tag (25 tests, all mocked). Needs unit-tests. |
-| `docker-ssh-tests` | `ubuntu-latest` | push, PR | Builds SSHD container, generates SSH key, runs `DockerSsh` tag (6 tests). Needs unit-tests. |
-| `image-validation` | `ubuntu-latest` | dispatch, schedule | Builds IMPACT Docker image, starts container, validates RStudio + R + Git config (~14 tests). 45 min timeout. Needs docker-ssh-tests. |
-| `remote-e2e` | `ubuntu-latest` | dispatch, schedule | Full DooD: builds workstation, SSH in, clone repo, build image, start container, validate via SSH tunnel (~11 tests). 60 min timeout. Needs docker-ssh-tests. |
+| Windows for Unit and Integration | The GUI only runs on Windows; WinForms-dependent code can only be tested there. |
+| Ubuntu for the Docker suites | The images are Linux containers; GitHub's Windows runners cannot run Linux containers. |
 
 ### Adding the GitHub token (optional)
 
-To enable SSH authentication + `git pull` tests in CI:
-
-1. Create a **fine-grained Personal Access Token** on GitHub with **SSH keys: Read and Write** permission.
-2. Add it as a repository secret named `IMPACT_E2E_GITHUB_TOKEN`.
-3. ImageValidation and RemoteE2E jobs automatically pick it up. Without it, the relevant tests are skipped (not failed).
+1. Create a **fine-grained personal access token** with **SSH keys: Read and Write**.
+2. Add it as the repository secret `IMPACT_E2E_GITHUB_TOKEN`.
+3. ImageValidation and RemoteE2E use it to register a temporary key (removed afterwards). Without it, only the token tests are skipped; the token-free host-key checks still run.
 
 ---
 
-## Test Helpers
+## Test helpers
 
 | File | Contents |
 |---|---|
-| `tests/Helpers/TestSessionState.ps1` | `New-TestSessionState` — creates a pre-populated `$State` hashtable for testing (supports `-Location 'LOCAL'` and `-Location 'REMOTE@<ip>'`); `New-DummySshKeyPair` — generates a throwaway ed25519 key pair; `Remove-TestArtifacts` — cleans up temp files |
-| `tests/Helpers/SshdContainer.Dockerfile` | Ubuntu 22.04 SSHD image with `testuser` and a fake `IMPACTncd_Germany` git repo (directory layout mirrors the real remote workstation). Used by DockerSsh tests. |
-| `tests/Helpers/WorkstationContainer.Dockerfile` | Extends SSHD container with Docker CE CLI (no daemon). Supports DooD via socket mount. Entrypoint is inlined (detects mounted Docker socket GID, adjusts `docker` group to match, starts SSHD). Used by RemoteE2E tests. |
-| `tests/.pesterconfig.psd1` | Default Pester 5 configuration |
-| `tests/Invoke-Tests.ps1` | Unified test runner — handles container lifecycle, SSH keys, env vars, `-Tag`/`-Level` modes, cumulative suite execution, cleanup, and summary |
+| `tests/Helpers/TestSessionState.ps1` | `New-TestSessionState` (state for `LOCAL` or `REMOTE@<ip>`, key paths in the temp folder), `New-DummySshKeyPair`, `Test-IsSshKeyUsable`, `Save-TestArtifacts`, `Remove-TestArtifacts`, `Assert-PreflightPassed`, `Wait-ForRStudioReady` (treats HTTP 200/302/401/403 as "ready", also for PowerShell 7's `HttpResponseException`), `Invoke-DockerExecSafe`, `ConvertTo-Base64Script` |
+| `tests/Helpers/SshdContainer.Dockerfile` | Ubuntu 22.04 with SSHD, `testuser` and a fake `IMPACTncd_Germany` repository with the workstation's folder layout. Also used for the in-container SSH setup tests. |
+| `tests/Helpers/WorkstationContainer.Dockerfile` | The SSHD image plus the Docker CLI (no daemon) for DooD; the entrypoint matches the `docker` group to the socket's GID. |
+| `tests/Invoke-Tests.ps1` | The runner described above. |
 
 ---
 
-## Writing New Tests
+## Test hygiene: what the tests may touch
 
-1. Add tests to the appropriate `.Tests.ps1` file (or create a new one).
-2. Tag every `Describe` block with `Unit`, `Integration`, `DockerSsh`, `ImageValidation`, or `RemoteE2E`.
-3. Import the module in `BeforeAll`:
+- **The tests never write to your real `~/.ssh`.** PowerShell's `$HOME` cannot be changed, so the tests of `Ensure-SshConfigEntry` and `Ensure-GitKeySetup` mock `Join-Path` for the single `Join-Path $HOME '.ssh'` call inside the module and work in a temp folder. Guard mocks make any write below the real `~/.ssh` (`Add-Content`, `Set-Content`, `New-Item`) fail loudly instead. `ssh-keygen`, `Set-Clipboard`, `ssh-agent` (`Get-Service`, `Start-Service`, `ssh-add`) and elevation (`Start-Process`) are mocked, so no key is created, nothing is copied to the clipboard and no UAC prompt appears.
+- **Older versions of the tests did write there.** If you ran them before, you may want to remove, by hand: the `Host 198.51.100.99` block in `~/.ssh/config`, and the files `~/.ssh/id_ed25519_gitsetup` and `~/.ssh/id_ed25519_gitsetup.pub` (and `ssh-add -d ~/.ssh/id_ed25519_gitsetup` if it was loaded into ssh-agent).
+- The `Write-Log` tests point the module's log file at a temp file and restore it afterwards.
+- Temp paths: on Linux `$env:TEMP` is empty, so the Unit and Integration files set it to the system temp folder when it is missing.
+
+---
+
+## Writing new tests
+
+1. Add new `Describe` blocks at the **end** of the right `.Tests.ps1` file, tagged `Unit`, `Integration`, `DockerSsh`, `ImageValidation` or `RemoteE2E`.
+2. Import the module in `BeforeAll`:
 
    ```powershell
    BeforeAll {
@@ -300,7 +289,11 @@ To enable SSH authentication + `git pull` tests in CI:
    }
    ```
 
-4. **Pester 5 scoping rule**: All constants and variables must be defined **inside `BeforeAll`** within the `Describe` block. Do NOT define `$script:` variables between `BeforeDiscovery` and `Describe` — they will be empty at runtime due to Pester 5's discovery/run phase separation.
-5. Use `Mock -ModuleName IMPACT_Docker_GUI` when mocking functions called inside the module.
-6. Use `New-TestSessionState` from the helper for a ready-made state object.
-7. For REMOTE-specific tests, use `New-TestSessionState -Location 'REMOTE@<ip>'` and mock SSH calls.
+3. **Pester 5 scoping:** define variables inside `BeforeAll`/`BeforeEach`/`It`. Values set in `BeforeDiscovery` (or between it and `Describe`) are only available while `-Skip:` is evaluated, not while the tests run.
+4. Mock functions that the module calls with `Mock <name> -ModuleName IMPACT_Docker_GUI`, and check them with `Should -Invoke ... -ModuleName IMPACT_Docker_GUI`.
+5. Pester can only mock commands that exist. For `ssh`, `ssh-keygen`, `ssh-add`, `docker`, `Get-Service` or `Start-Service` on a machine without them, define a temporary global stub that throws when called without a mock (`function global:ssh { throw 'ssh stub called without a mock' }`), and remove it in `AfterAll` with `Remove-Item Function:\ssh`.
+6. Native commands (and stubs without a `param()` block) receive their arguments in `$args`, also in mock bodies and `-ParameterFilter`. Set `$global:LASTEXITCODE` in a mock when the code checks it.
+7. The module runs under `Set-StrictMode -Version Latest`: reading a missing hashtable key with dot notation throws, so use `$h['key']` or `ContainsKey` in test helpers that touch the session state.
+8. Use `New-TestSessionState` for a ready-made state, and `-Location 'REMOTE@<ip>'` plus mocked `ssh` for remote tests.
+9. Code that uses WinForms or System.Drawing cannot even be compiled on Linux; mark such tests `-Skip:(-not $IsWindows)` with a comment.
+10. If you add or export a module function, update **both** `Export-ModuleMember` in the `.psm1` and `FunctionsToExport` in the `.psd1`.

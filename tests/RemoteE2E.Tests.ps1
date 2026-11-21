@@ -137,10 +137,26 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
         Invoke-WsSshCommand "mkdir -p $($script:REMOTE_REPO_DIR)/inputs/synthpop" | Out-Null
 
         # ── 5. Generate SSH key pair on workstation for GitHub auth ──────────
-        $script:remoteKeyPath = "/home/$($script:SshUser)/.ssh/id_ed25519_e2e"
+        # The key has the same name the GUI uses on the workstation:
+        # ~/.ssh/id_ed25519_<user>, with <user> = 'e2e' in this suite.
+        $script:E2E_USER = 'e2e'
+        $script:remoteKeyPath = "/home/$($script:SshUser)/.ssh/id_ed25519_$($script:E2E_USER)"
         Invoke-WsSshCommand "rm -f $($script:remoteKeyPath) $($script:remoteKeyPath).pub" | Out-Null
         Invoke-WsSshCommand "ssh-keygen -t ed25519 -C 'remote_e2e' -f $($script:remoteKeyPath) -N '' -q" | Out-Null
-        Invoke-WsSshCommand "ssh-keyscan -t ed25519 github.com >> /home/$($script:SshUser)/.ssh/known_hosts 2>/dev/null" | Out-Null
+        # (F70) No ssh-keyscan of github.com here any more. It pre-filled host keys that
+        # the production code never writes for the container, so a broken in-container
+        # known_hosts setup could not be noticed. The container's known_hosts now comes
+        # only from Get-ContainerSshSetupCommand (step 8d), exactly as in production.
+
+        # The GUI starts the container with the uid/gid of the workstation account
+        # (USERID/GROUPID), so the rstudio user owns the bind-mounted files. Do the same.
+        $script:ContainerUid = "$((Invoke-WsSshCommand 'id -u') | Select-Object -First 1)".Trim()
+        $script:ContainerGid = "$((Invoke-WsSshCommand 'id -g') | Select-Object -First 1)".Trim()
+        if ($script:ContainerUid -notmatch '^\d+$' -or $script:ContainerGid -notmatch '^\d+$') {
+            Write-Host "[RemoteE2E][Diag] Could not read uid/gid on the workstation ('$($script:ContainerUid)'/'$($script:ContainerGid)'); using 1000:1000" -ForegroundColor Yellow
+            $script:ContainerUid = '1000'
+            $script:ContainerGid = '1000'
+        }
 
         # ── 6. Register SSH key with GitHub (optional) ──────────────────────
         $script:githubKeyId = $null
@@ -207,15 +223,20 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
         Write-Host '[RemoteE2E] Starting IMPACT container on workstation ...' -ForegroundColor Cyan
         Invoke-WsSshCommand "docker stop $($script:INNER_CONTAINER) 2>/dev/null; docker rm $($script:INNER_CONTAINER) 2>/dev/null" | Out-Null
 
-        $containerKeyTarget = '/home/rstudio/.ssh/id_ed25519_e2e'
-        $gitSshCmd = "ssh -i $containerKeyTarget -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/ssh/ssh_known_hosts -o StrictHostKeyChecking=yes"
+        # (F70) GIT_SSH_COMMAND is the exact value the GUI uses in production
+        # (Get-ContainerGitSshCommand). It used to be a test-only command with
+        # /etc/ssh/ssh_known_hosts and StrictHostKeyChecking=yes, so the weekly run never
+        # tested what users get. The value contains no single quote, so it can be wrapped
+        # in '...' for the workstation's shell; the check below makes sure of that.
+        $gitSshCmd = Get-ContainerGitSshCommand -UserName $script:E2E_USER
+        if ($gitSshCmd.Contains("'")) { throw "GIT_SSH_COMMAND contains a single quote and cannot be quoted for the remote shell: $gitSshCmd" }
 
-        # Start container WITHOUT -v mounts (DooD: host paths ≠ workstation paths)
+        # Start container WITHOUT -v mounts (DooD: host paths differ from workstation paths)
         $runCmd = @(
             "docker run -d --name $($script:INNER_CONTAINER)",
             "-e PASSWORD=$($script:TEST_PASSWORD)",
             "-e DISABLE_AUTH=false",
-            "-e USERID=1000 -e GROUPID=1000",
+            "-e USERID=$($script:ContainerUid) -e GROUPID=$($script:ContainerGid)",
             "-e CONTAINER_REPO_NAME=$($script:REPO_NAME)",
             "-e SYNC_ENABLED=false",
             "-e 'GIT_SSH_COMMAND=$gitSshCmd'",
@@ -253,31 +274,33 @@ Describe 'RemoteE2E: Windows -> SSH -> Workstation -> Docker build/run' -Tag Rem
         Invoke-WsSshCommand "docker exec $($script:INNER_CONTAINER) mkdir -p /home/rstudio/$($script:REPO_NAME)/outputs /home/rstudio/$($script:REPO_NAME)/inputs/synthpop" | Out-Null
 
         # ── 8c. Copy SSH key into container ───────────────────────────────
+        # In production the key is bind-mounted read-only at /keys/id_ed25519_<user>,
+        # and Get-ContainerSshSetupCommand copies it from there into ~rstudio/.ssh.
+        # DooD cannot bind-mount it, so 'docker cp' puts it at the same /keys path.
         Write-Host '[RemoteE2E] Copying SSH key into inner container ...' -ForegroundColor Cyan
-        # First create the target directory, then copy the key file
-        Invoke-WsSshCommand "docker exec $($script:INNER_CONTAINER) mkdir -p /home/rstudio/.ssh" | Out-Null
-        $cpKeyCmd = "docker cp $($script:remoteKeyPath) $($script:INNER_CONTAINER):$containerKeyTarget"
+        Invoke-WsSshCommand "docker exec --user root $($script:INNER_CONTAINER) mkdir -p /keys" | Out-Null
+        $cpKeyCmd = "docker cp $($script:remoteKeyPath) $($script:INNER_CONTAINER):/keys/id_ed25519_$($script:E2E_USER)"
         $cpKeyOut = Invoke-WsSshCommand $cpKeyCmd
         if ($script:LastSshExitCode -ne 0) {
             Write-Host "[RemoteE2E][Diag] docker cp key failed (exit $($script:LastSshExitCode)): $($cpKeyOut -join ' ')" -ForegroundColor Red
         }
 
-        # ── 8d. Fix ownership + set up SSH known hosts ────────────────────
-        $fixCmd = @(
-            "docker exec $($script:INNER_CONTAINER) sh -c '",
-            "chown -R 1000:1000 /home/rstudio/$($script:REPO_NAME) &&",
-            "chmod 600 $containerKeyTarget &&",
-            "chown 1000:1000 $containerKeyTarget &&",
-            "ssh-keyscan -t ed25519 github.com > /etc/ssh/ssh_known_hosts 2>/dev/null;",
-            "cp /etc/ssh/ssh_known_hosts /home/rstudio/.ssh/known_hosts 2>/dev/null;",
-            "chown -R 1000:1000 /home/rstudio/.ssh;",
-            "echo KEY_FIXED'"
-        ) -join ' '
-        $fixOut = Invoke-WsSshCommand $fixCmd
-        if (($fixOut -join '') -notmatch 'KEY_FIXED') {
-            Write-Host "[RemoteE2E][Diag] SSH key/ownership fix may have failed: $($fixOut -join ' ')" -ForegroundColor Yellow
+        # ── 8d. Fix repo ownership + run the PRODUCTION SSH setup ─────────
+        # The repo chown is only needed because DooD copies the repo in with 'docker cp'
+        # (production bind-mounts it). The SSH part is exactly the command the GUI runs:
+        # key copy, github.com host keys via ssh-keyscan inside the container, chown to
+        # the account's uid/gid, then KEY_FIXED. It contains single quotes, so it is sent
+        # base64-encoded through the PowerShell -> ssh -> sh -> docker exec layers.
+        $setupCmd = "chown -R $($script:ContainerUid):$($script:ContainerGid) /home/rstudio/$($script:REPO_NAME) && " +
+            (Get-ContainerSshSetupCommand -UserName $script:E2E_USER -ContainerUid $script:ContainerUid -ContainerGid $script:ContainerGid)
+        $setupB64 = ConvertTo-Base64Script -Script $setupCmd
+        $fixCmd = "docker exec --user root $($script:INNER_CONTAINER) sh -c 'echo $setupB64 | base64 -d | sh'"
+        $script:KeySetupOutput = (Invoke-WsSshCommand $fixCmd) -join "`n"
+        if ($script:KeySetupOutput -notmatch 'KEY_FIXED') {
+            # Reported by its own test below, so the remaining tests still run.
+            Write-Host "[RemoteE2E][Diag] Production SSH setup did not print KEY_FIXED: $($script:KeySetupOutput)" -ForegroundColor Yellow
         } else {
-            Write-Host '[RemoteE2E] Repo + SSH key copied and permissions fixed.' -ForegroundColor DarkGray
+            Write-Host '[RemoteE2E] Repo copied; production SSH setup finished (KEY_FIXED).' -ForegroundColor DarkGray
         }
 
         # ── 9. Wait for RStudio Server ──────────────────────────────────────
@@ -428,21 +451,66 @@ tryCatch({
     }
 
     # ═════════════════════════════════════════════════════════════════════════
+    #  Production SSH setup inside the container (no token needed, F70)
+    # ═════════════════════════════════════════════════════════════════════════
+    It 'The production SSH setup command finished inside the container (KEY_FIXED)' -Skip:$script:SkipTests {
+        if (-not (Assert-PreflightPassed)) { return }
+        $script:KeySetupOutput | Should -Match 'KEY_FIXED' -Because 'Get-ContainerSshSetupCommand must run to the end inside the container'
+    }
+
+    It 'The setup wrote github.com host keys to the rstudio known_hosts file' -Skip:$script:SkipTests {
+        if (-not (Assert-PreflightPassed)) { return }
+        $out = Invoke-WsSshCommand "docker exec $($script:INNER_CONTAINER) ssh-keygen -F github.com -f /home/rstudio/.ssh/known_hosts >/dev/null 2>&1 && echo GITHUB_KNOWN"
+        ($out -join '') | Should -Match 'GITHUB_KNOWN'
+    }
+
+    It 'The private key belongs to the container user and has mode 600' -Skip:$script:SkipTests {
+        if (-not (Assert-PreflightPassed)) { return }
+        $out = Invoke-WsSshCommand "docker exec $($script:INNER_CONTAINER) stat -c '%u:%g %a' /home/rstudio/.ssh/id_ed25519_$($script:E2E_USER)"
+        ($out -join '').Trim() | Should -Be "$($script:ContainerUid):$($script:ContainerGid) 600"
+    }
+
+    # No token needed: GitHub checks its host key before the user's key. With
+    # StrictHostKeyChecking=yes (stricter than the accept-new in GIT_SSH_COMMAND) ssh only
+    # gets to "Permission denied (publickey)" or "successfully authenticated" if the
+    # production setup really stored github.com's host key.
+    It 'github.com host key is verified before authentication (no token needed)' -Skip:$script:SkipTests {
+        if (-not (Assert-PreflightPassed)) { return }
+        $cmd = "docker exec --user rstudio $($script:INNER_CONTAINER) ssh -i /home/rstudio/.ssh/id_ed25519_$($script:E2E_USER) -o IdentitiesOnly=yes -o UserKnownHostsFile=/home/rstudio/.ssh/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=15 -T git@github.com 2>&1"
+        $text = (Invoke-WsSshCommand $cmd) -join "`n"
+        $text | Should -Not -Match 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED'
+        $text | Should -Match 'Permission denied \(publickey\)|successfully authenticated'
+    }
+
+    It 'GIT_SSH_COMMAND in the container is the production value' -Skip:$script:SkipTests {
+        if (-not (Assert-PreflightPassed)) { return }
+        $out = Invoke-WsSshCommand "docker exec $($script:INNER_CONTAINER) printenv GIT_SSH_COMMAND"
+        ($out -join '').Trim() | Should -Be (Get-ContainerGitSshCommand -UserName $script:E2E_USER)
+    }
+
+    # ═════════════════════════════════════════════════════════════════════════
     #  GitHub SSH auth (requires token)
     # ═════════════════════════════════════════════════════════════════════════
     It 'Can authenticate to GitHub via SSH from inside the IMPACT container' -Skip:($script:SkipTests -or -not $env:IMPACT_E2E_GITHUB_TOKEN) {
         if (-not (Assert-PreflightPassed)) { return }
-        $cmd = "docker exec --user rstudio $($script:INNER_CONTAINER) ssh -i /home/rstudio/.ssh/id_ed25519_e2e -o IdentitiesOnly=yes -o UserKnownHostsFile=/home/rstudio/.ssh/known_hosts -o StrictHostKeyChecking=yes -T git@github.com 2>&1"
+        # (F70) Uses the container's own $GIT_SSH_COMMAND (the production value) instead
+        # of a hand-written ssh command. BatchMode=yes: fail instead of asking anything.
+        # The single quotes keep the workstation's shell from expanding the variable;
+        # the shell inside the container expands it from the container environment.
+        $cmd = "docker exec --user rstudio $($script:INNER_CONTAINER) sh -c '`$GIT_SSH_COMMAND -o BatchMode=yes -T git@github.com 2>&1'"
         $out = Invoke-WsSshCommand $cmd
         ($out -join "`n") | Should -Match 'successfully authenticated'
     }
 
-    It 'Can execute git pull from inside the IMPACT container' -Skip:($script:SkipTests -or -not $env:IMPACT_E2E_GITHUB_TOKEN) {
+    It 'Can execute git pull over SSH from inside the IMPACT container' -Skip:($script:SkipTests -or -not $env:IMPACT_E2E_GITHUB_TOKEN) {
         if (-not (Assert-PreflightPassed)) { return }
         # Mark the copied repo as safe (ownership differs from rstudio user)
         Invoke-WsSshCommand "docker exec --user rstudio $($script:INNER_CONTAINER) git config --global --add safe.directory /home/rstudio/$($script:REPO_NAME)" | Out-Null
 
-        $cmd = "docker exec --user rstudio --workdir /home/rstudio/$($script:REPO_NAME) $($script:INNER_CONTAINER) git pull 2>&1"
+        # The repo was cloned over HTTPS. 'insteadOf' makes this pull go over SSH, so it
+        # really uses GIT_SSH_COMMAND, the key and known_hosts (a plain HTTPS pull of
+        # this public repo would pass even with a broken SSH setup).
+        $cmd = "docker exec --user rstudio --workdir /home/rstudio/$($script:REPO_NAME) $($script:INNER_CONTAINER) git -c url.git@github.com:.insteadOf=https://github.com/ pull 2>&1"
         $out = Invoke-WsSshCommand $cmd
         ($out -join "`n") | Should -Match 'Already up to date|Updating|Fast-forward|Merge made'
     }

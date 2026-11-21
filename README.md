@@ -1,73 +1,70 @@
-# 🐳 IMPACT Docker GUI
+# IMPACT Docker GUI
 
-A Windows GUI tool for building, launching, and managing **IMPACT NCD Germany** RStudio Server containers — locally via Docker Desktop or remotely on a shared workstation over SSH.
+A Windows tool for building, starting and stopping **IMPACT NCD Germany** RStudio Server containers, either locally with Docker Desktop or on the shared Linux workstation over SSH.
 
-## What It Does
+## What it does
 
-- Generates and manages per-user SSH keys for GitHub and remote access
-- Builds Docker images from the project's `Dockerfile` and starts RStudio Server containers
-- Supports **local** (Docker Desktop) and **remote** (SSH-based) container orchestration
-- Mounts project files into the container so you can work in RStudio through your browser
-- Optionally uses Docker volumes with automatic data sync on stop
-- Detects Git changes on container stop and offers a commit/push dialog
+- Creates a personal SSH key for GitHub and for logging in to the workstation
+- Builds the Docker image from the model repository's `docker_setup` folder and starts an RStudio Server container
+- Works **locally** (Docker Desktop, RStudio reachable only from your PC) or **remotely** (Docker Engine on the workstation, account `php-workstation`)
+- Mounts the repository into the container, so you edit the real files in RStudio in your browser
+- Optional Docker volumes for outputs and synthpop, copied back to your folders when you stop (volumes are deleted only after a successful copy)
+- When you stop, offers to commit and push your changes with your own GitHub identity and key
 
-## Quick Start
+## Quick start
 
-1. Double-click `IMPACT.bat` (or run `IMPACT_Docker_GUI_v2.ps1` directly)
-2. Enter your **GitHub username** and a password
-3. Add the generated SSH public key to GitHub if needed
-4. Choose **Local** or **Remote** and select your repository
-5. Click **Start Container** → open the displayed URL → log in as `rstudio`
-6. Click **Stop Container** when done
+1. Install **PowerShell 7.3 or newer** once: `winget install --id Microsoft.PowerShell --source winget` (or the `.msi` from <https://aka.ms/powershell-release>).
+2. Double-click `current_version\IMPACT.bat` (or create a Desktop shortcut with `Create-Shortcut.bat`).
+3. Enter your **GitHub username** and choose a **new RStudio password** (at least 8 characters, **not** your GitHub password).
+4. If a new SSH key was created, add the public key to GitHub (Settings, SSH and GPG keys).
+5. Choose **Local** or **Remote** and select your repository.
+6. Click **Start Container**, open the URL shown, log in as `rstudio`.
+7. Click **Stop Container** when you are done (it asks for confirmation).
+
+> **Remote mode:** your private GitHub SSH key (no passphrase) is copied into the shared workstation account, where everyone using that account can read it. Read [Your GitHub key on the shared workstation](documentation/IMPACT_Docker_GUI_v2_User.md#your-github-key-on-the-shared-workstation) before using remote mode.
 
 ## Requirements
 
-- **Windows 10+** with **PowerShell 7** (auto-detected and relaunched)
-- **Docker Desktop** (local mode) or SSH access to the remote workstation
-- **OpenSSH client** (`ssh`, `ssh-keygen`) on PATH
+- **Windows 10 or 11** with **PowerShell 7.3+** (`pwsh`). It is not part of Windows; `IMPACT.bat` explains how to install it if it is missing and does not fall back to Windows PowerShell 5.1. If the GUI script is started from Windows PowerShell, it restarts itself in PowerShell 7.
+- **Docker Desktop** for local mode. For remote-only use, the `docker` command-line program on PATH is enough.
+- **OpenSSH client** (`ssh`, `ssh-keygen`); the tool offers to install it if it is missing.
+- **Network access to the workstation** (institute network or VPN) for remote mode.
+- Optional: **Git for Windows** (commit/push offer in local mode), **Posh-SSH** (first password login to the workstation; the tool offers to install it).
 
-## Repository Structure
+## Repository structure
 
-| Directory | Contents |
+| Path | Contents |
 |---|---|
-| `current_version/` | Active release — module (`IMPACT_Docker_GUI.psm1`), launcher script (`IMPACT_Docker_GUI_v2.ps1`), batch launcher, and application icon |
-| `tests/` | Pester 5 test suites (Unit, Integration, DockerSsh, ImageValidation, RemoteE2E), test helpers, container Dockerfiles |
-| `documentation/` | User Guide, Technical Documentation, and Testing Guide |
-| `.github/workflows/` | GitHub Actions CI workflow |
-| `_old/` | Previous version (v1) — kept for reference |
+| `current_version/` | The tool: `IMPACT.bat` (launcher), `Create-Shortcut.bat`, `IMPACT_Docker_GUI_v2.ps1` (GUI and workflow), `IMPACT_Docker_GUI.psm1` (module with the core functions), `IMPACT_Docker_GUI.psd1` (manifest), `IMPACT_icon.ico` |
+| `tests/` | Pester 5 suites (Unit, Integration, DockerSsh, ImageValidation, RemoteE2E, Preflight), the test runner `Invoke-Tests.ps1`, helpers and test container Dockerfiles |
+| `documentation/` | User guide, technical documentation, testing guide, known bugs |
+| `.github/workflows/test.yml` | GitHub Actions CI |
+| `.gitattributes` | Keeps the `.bat` files with Windows (CRLF) line endings |
 
 ## Documentation
 
-- **[User Guide](documentation/IMPACT_Docker_GUI_v2_User.md)** — step-by-step instructions, options reference, troubleshooting, and glossary
-- **[Technical Documentation](documentation/IMPACT_Docker_GUI_v2_Tech.md)** — architecture, data model, function reference, workflow internals, and extension points
-- **[Testing Guide](documentation/TESTING.md)** — test architecture, running tests locally, CI setup, and writing new tests
+- **[User Guide](documentation/IMPACT_Docker_GUI_v2_User.md)**: step-by-step instructions, every dialog and message, options, troubleshooting
+- **[Technical Documentation](documentation/IMPACT_Docker_GUI_v2_Tech.md)**: architecture, session state, functions, workflow internals, security
+- **[Testing Guide](documentation/TESTING.md)**: test suites, running tests, CI
+- **[Known Bugs](documentation/KNOWN_BUGS.md)**: known problems and design limitations
 
 ## Testing
 
 ```powershell
-# Run all unit + integration tests (default)
+# Unit + Integration (default)
 pwsh tests/Invoke-Tests.ps1
 
-# Single suite
+# One suite
 pwsh tests/Invoke-Tests.ps1 -Tag Unit
-pwsh tests/Invoke-Tests.ps1 -Tag Integration
 pwsh tests/Invoke-Tests.ps1 -Tag DockerSsh
-pwsh tests/Invoke-Tests.ps1 -Tag ImageValidation
-pwsh tests/Invoke-Tests.ps1 -Tag RemoteE2E
 
-# Cumulative (Unit -> Integration -> ... -> target level)
+# Cumulative: Unit -> Integration -> ... -> the given level
 pwsh tests/Invoke-Tests.ps1 -Level All
 pwsh tests/Invoke-Tests.ps1 -Level RemoteE2E -GitHubToken ghp_xxx
 ```
 
-See **[Testing Guide](documentation/TESTING.md)** for Docker SSH tests, CI details, and writing new tests.
-
-## Launcher & Desktop Shortcut
-
-Double-click `current_version\IMPACT.bat` to start the GUI. It auto-detects PowerShell 7 with a fallback to Windows PowerShell.
-
-To create a desktop shortcut with the IMPACT icon, double-click `current_version\Create-Shortcut.bat` once.
+Exit code 0 = everything requested ran and passed, 1 = failures, 2 = some suites could not run (for example Docker is not running; add `-AllowSkip` to accept that). See the **[Testing Guide](documentation/TESTING.md)**.
 
 ## License
 
-Internal tool under MIT License.
+Internal tool under the MIT License.
