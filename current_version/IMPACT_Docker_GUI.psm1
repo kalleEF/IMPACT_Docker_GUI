@@ -461,6 +461,19 @@ function ConvertTo-RemoteRepoList {
         Sort-Object -Unique
 }
 
+<#
+.SYNOPSIS Shell snippet that deletes metadata files written by OLDER versions (B3-R6).
+.DESCRIPTION Older versions stored the RStudio password in plain text in
+             /tmp/impactncd/<container>.json. Everybody on the workstation shares one Unix
+             account, so every colleague could read those files. This snippet removes every
+             metadata file that still has a "password" entry. It never fails (the final
+             'true'), so it can be appended to another command with '&&'. -Z / -0 keep file
+             names with spaces intact.
+#>
+function Get-RemoteMetadataCleanupCommand {
+    return '{ grep -lZE ''"password"[[:space:]]*:'' /tmp/impactncd/*.json 2>/dev/null | xargs -0 -r rm -f; true; }'
+}
+
 function Write-RemoteContainerMetadata {
     # The RStudio password is deliberately NOT stored here (F40). Everybody on the
     # workstation uses the same Unix account, so a file in /tmp is readable by all
@@ -486,10 +499,20 @@ function Write-RemoteContainerMetadata {
     } | ConvertTo-Json -Compress
     Write-Log ("Metadata payload: container={0} repo={1} port={2} useVolumes={3}" -f $State.ContainerName, $State.SelectedRepo, $Port, $UseVolumes) 'Debug'
     $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload))
+    # The path is quoted with ConvertTo-PosixShellLiteral so a quote in the name can never
+    # break (or change) the command the workstation's shell runs.
+    $metaPathQ = ConvertTo-PosixShellLiteral -Value $metaPath
     try {
         # 'umask' now comes before 'mkdir' so the folder is also created private (it used to be
         # created with default permissions first).
-        & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "umask 077 && mkdir -p /tmp/impactncd && echo $b64 | base64 -d > '$metaPath'" 2>$null
+        # The part after the write is a one-off clean-up (B3-R6): files written by OLDER
+        # versions still contain the RStudio password in plain text, readable by every
+        # colleague on the shared account. Any metadata file that has a "password" entry is
+        # deleted. That is safe: the port and volume mode are read from the container's
+        # labels now, and the password from the running container itself. The '{ ...; true; }'
+        # makes sure the clean-up can never make the whole command fail.
+        $cleanup = Get-RemoteMetadataCleanupCommand
+        & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "umask 077 && mkdir -p /tmp/impactncd && echo $b64 | base64 -d > $metaPathQ && $cleanup" 2>$null
         # Only claim success when ssh really succeeded (it used to log 'saved' even on failure).
         if ($LASTEXITCODE -eq 0) {
             Write-Log 'Remote metadata saved.' 'Info'
@@ -508,7 +531,11 @@ function Remove-RemoteContainerMetadata {
     $keyPath = $State.Paths.SshPrivate
     $metaPath = "/tmp/impactncd/$($State.ContainerName).json"
     Write-Log "Removing remote metadata at $metaPath on $remoteHost" 'Info'
-    try { & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "rm -f '$metaPath'" 2>$null } catch {
+    # Quoted safely for the remote shell; also removes old files that still hold a
+    # password (see Get-RemoteMetadataCleanupCommand, B3-R6).
+    $metaPathQ = ConvertTo-PosixShellLiteral -Value $metaPath
+    $cleanup = Get-RemoteMetadataCleanupCommand
+    try { & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "rm -f $metaPathQ; $cleanup" 2>$null } catch {
         Write-Log "Remote metadata removal failed: $($_.Exception.Message)" 'Warn'
     }
 }
@@ -521,7 +548,7 @@ function Read-RemoteContainerMetadata {
     $metaPath = "/tmp/impactncd/$($State.ContainerName).json"
     Write-Log "Attempting to read remote metadata from $metaPath on $remoteHost" 'Info'
     try {
-        $json = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "cat '$metaPath' 2>/dev/null" 2>$null
+        $json = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes $remoteHost "cat $(ConvertTo-PosixShellLiteral -Value $metaPath) 2>/dev/null" 2>$null
         if ($json) {
             Write-Log 'Remote metadata read successfully.' 'Info'
             return $json | ConvertFrom-Json -ErrorAction Stop
@@ -655,7 +682,9 @@ function Get-ContainerRuntimeInfo {
     # reopening the GUI can still copy results back at Stop (F01/F04).
     # UseVolumes stays $null when it could not be found out (for example because
     # docker inspect failed), so callers can tell "unknown" apart from "no volumes".
-    $info = @{ Password = $null; Port = $null; UseVolumes = $null; OutputDir = $null; SynthpopDir = $null; VolumeOutput = $null; VolumeSynthpop = $null }
+    # RepoPath is the repository folder the container was started from (label
+    # impact.repo_path, F84); it stays $null for containers started by older versions.
+    $info = @{ Password = $null; Port = $null; UseVolumes = $null; OutputDir = $null; SynthpopDir = $null; VolumeOutput = $null; VolumeSynthpop = $null; RepoPath = $null }
     $cmdEnv = @('inspect','-f','{{range .Config.Env}}{{println .}}{{end}}',$State.ContainerName)
     $cmdPort= @('inspect','-f','{{range $p, $c := .NetworkSettings.Ports}}{{if eq $p "8787/tcp"}}{{range $c}}{{println .HostPort}}{{end}}{{end}}{{end}}',$State.ContainerName)
     # Labels and mounts in one call, separated by a TAB. A TAB can never appear inside
@@ -710,8 +739,9 @@ function Get-ContainerRuntimeInfo {
             if ($labels['impact.synthpop_dir']) { $info.SynthpopDir = [string]$labels['impact.synthpop_dir'] }
             if (-not $info.VolumeOutput -and $labels['impact.volume_output'])     { $info.VolumeOutput   = [string]$labels['impact.volume_output'] }
             if (-not $info.VolumeSynthpop -and $labels['impact.volume_synthpop']) { $info.VolumeSynthpop = [string]$labels['impact.volume_synthpop'] }
+            if ($labels['impact.repo_path'])    { $info.RepoPath    = [string]$labels['impact.repo_path'] }
         }
-        Write-Log "Recovered runtime info -> PasswordPresent=$([bool]$info.Password) Port=$($info.Port) UseVolumes=$($info.UseVolumes) OutputDir=$($info.OutputDir) SynthpopDir=$($info.SynthpopDir) Volumes=$($info.VolumeOutput),$($info.VolumeSynthpop)" 'Debug'
+        Write-Log "Recovered runtime info -> PasswordPresent=$([bool]$info.Password) Port=$($info.Port) UseVolumes=$($info.UseVolumes) OutputDir=$($info.OutputDir) SynthpopDir=$($info.SynthpopDir) Volumes=$($info.VolumeOutput),$($info.VolumeSynthpop) RepoPath=$($info.RepoPath)" 'Debug'
     } catch {
         Write-Log "Failed to inspect container runtime info: $($_.Exception.Message)" 'Debug'
     }
@@ -754,7 +784,10 @@ function Test-PortValue {
     if ([string]::IsNullOrWhiteSpace($Port)) {
         return @{ Valid = $false; ErrorMessage = 'Port cannot be empty.' }
     }
-    if ($Port -notmatch '^\d+$') {
+    # [0-9] instead of \d: in .NET, \d also matches non-ASCII digits such as full-width
+    # digits (U+FF10 to U+FF19, typed with an IME or pasted), which then made the [int] conversion below
+    # throw inside the Port box's TextChanged handler (B6a-R4).
+    if ($Port -notmatch '^[0-9]+$') {
         return @{ Valid = $false; ErrorMessage = 'Port must be a number.' }
     }
     # More than 5 digits can never be a valid port. Checking this BEFORE the [int]
@@ -768,7 +801,12 @@ function Test-PortValue {
     if ($Port.Length -gt 1 -and $Port.StartsWith('0')) {
         return @{ Valid = $false; ErrorMessage = 'Port must not start with 0.' }
     }
-    $portInt = [int]$Port
+    # TryParse never throws; if the text somehow is not a valid number it is simply
+    # reported as out of range instead of crashing the caller.
+    $portInt = 0
+    if (-not [int]::TryParse($Port, [ref]$portInt)) {
+        return @{ Valid = $false; ErrorMessage = "Port must be between $RangeStart and $RangeEnd." }
+    }
     if ($portInt -lt $RangeStart -or $portInt -gt $RangeEnd) {
         return @{ Valid = $false; ErrorMessage = "Port must be between $RangeStart and $RangeEnd." }
     }
@@ -889,8 +927,13 @@ function Get-YamlPathValue {
         # missing file and a failed SSH connection would both just give empty output, and the log
         # could not say which of the two happened.
         $missingMarker = '__IMPACT_YAML_MISSING__'
+        # ConvertTo-PosixShellLiteral quotes the path safely for the workstation's shell.
+        # Plain '...' broke the command for a path that contains a quote (possible now that
+        # YAML quoting is understood, for example '/mnt/it''s'), and the user then got a
+        # misleading "could not reach the workstation" message (B4-R7).
+        $yamlPathQ = ConvertTo-PosixShellLiteral -Value $YamlPath
         try {
-            $content = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=30 -o BatchMode=yes $remoteHost "if [ -f '$YamlPath' ]; then cat '$YamlPath'; else echo $missingMarker; fi" 2>$null
+            $content = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=30 -o BatchMode=yes $remoteHost "if [ -f $yamlPathQ ]; then cat $yamlPathQ; else echo $missingMarker; fi" 2>$null
         } catch { return $null }
         if ("$content" -match $missingMarker) {
             Write-Log "YAML file not found on the workstation: $YamlPath" 'Warn'
@@ -901,8 +944,10 @@ function Get-YamlPathValue {
             return $null
         }
     } else {
-        if (-not (Test-Path $YamlPath)) { return $null }
-        $content = Get-Content -Path $YamlPath -Raw
+        # -LiteralPath: a folder name such as 'IMPACTncd_Germany [v2]' contains [ ], which
+        # -Path would read as a wildcard pattern, so the existing file was "not found" (B2-R3).
+        if (-not (Test-Path -LiteralPath $YamlPath)) { return $null }
+        $content = Get-Content -LiteralPath $YamlPath -Raw
     }
 
     # Check for "no content" BEFORE reading .Length. Under StrictMode, reading .Length of $null
@@ -965,6 +1010,8 @@ function Test-AndCreateDirectory {
         #   'EmptyPath'            no path was given (for example the YAML key is missing)
         #   'Missing'              the folder does not exist (or is a file, not a folder)
         #   'PosixPathInLocalMode' a Linux-style path (/... or ~...) was used for a local run
+        #   'NetworkPathInLocalMode' a network folder (\\server\share or a mapped network
+        #                          drive) was used for a local run; Docker Desktop cannot mount it
         #   'Unreachable'          the workstation could not be reached over SSH to check it
         #   'CreateFailed'         -Create was given but the folder could not be created
         # Usage: $why = $null; Test-AndCreateDirectory ... -Reason ([ref]$why)
@@ -980,8 +1027,11 @@ function Test-AndCreateDirectory {
     if ($State.ContainerLocation -like 'REMOTE@*') {
         $remoteHost = Get-RemoteHostString -State $State
         $keyPath = $State.Paths.SshPrivate
+        # Quote the path safely for the workstation's shell (a ' inside it broke the
+        # command before, which then looked like "workstation unreachable", B4-R7).
+        $pathQ = ConvertTo-PosixShellLiteral -Value $Path
         try {
-            $check = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "test -d '$Path' && echo EXISTS || echo MISSING" 2>$null
+            $check = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "test -d $pathQ && echo EXISTS || echo MISSING" 2>$null
             if ("$check" -match 'EXISTS') {
                 Write-Log "Remote path verified for ${PathKey}: $Path" 'Debug'
                 return $true
@@ -1000,7 +1050,7 @@ function Test-AndCreateDirectory {
             }
             # mkdir runs as the SSH user, so the new folder belongs to the same user whose
             # uid/gid the container later uses for its bind mounts.
-            $made = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "mkdir -p '$Path' && echo CREATED" 2>$null
+            $made = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "mkdir -p $pathQ && echo CREATED" 2>$null
             if ("$made" -match 'CREATED') {
                 Write-Log "Created remote directory for ${PathKey}: $Path" 'Info'
                 return $true
@@ -1011,6 +1061,26 @@ function Test-AndCreateDirectory {
         } catch {
             Write-Log "Failed to validate remote directory ${Path}: $($_.Exception.Message)" 'Debug'
             Set-Reason 'Unreachable'
+            return $false
+        }
+    }
+
+    # F36 / B4-R6: Docker Desktop cannot bind-mount network folders. A UNC path
+    # (\\server\share\out, which Get-YamlPathValue has already turned into //server/share/out)
+    # or a mapped network drive (for example H:\IMPACT\outputs) used to fail only at
+    # 'docker run', after a possibly long image build, with a raw mount error. This check
+    # comes BEFORE the Linux-path check below, because '//server/...' also starts with '/'
+    # and the user would otherwise get the wrong advice ("use a Windows path").
+    if ($State.ContainerLocation -eq 'LOCAL') {
+        $isNetworkPath = $Path -match '^(?:\\\\|//)[^\\/]'
+        if (-not $isNetworkPath -and $IsWindows -and $Path -match '^([A-Za-z]):') {
+            # Asking Windows for the drive type never blocks the start: if it fails, we
+            # simply treat the drive as local (Docker will then report any real problem).
+            try { $isNetworkPath = ([System.IO.DriveInfo]::new($Matches[1]).DriveType -eq [System.IO.DriveType]::Network) } catch { $isNetworkPath = $false }
+        }
+        if ($isNetworkPath) {
+            Write-Log "Network folder not supported in local mode for ${PathKey}: $Path" 'Error'
+            Set-Reason 'NetworkPathInLocalMode'
             return $false
         }
     }
@@ -1046,7 +1116,8 @@ function Test-AndCreateDirectory {
         $native = $Path
     }
 
-    if (-not (Test-Path $native -PathType Container)) {
+    # -LiteralPath: brackets in a folder name ('IMPACTncd_Germany [v2]') are not wildcards (B2-R3).
+    if (-not (Test-Path -LiteralPath $native -PathType Container)) {
         Write-Log "Local path missing or not a directory (no auto-create): $native" 'Error'
         Set-Reason 'Missing'
         return $false
@@ -2813,7 +2884,8 @@ function Build-DockerRunCommand {
     }
 
     # Labels that let a reopened GUI find out how this container was started (F01/F04).
-    $dockerArgs += @(Get-ImpactContainerLabelArgs -UseVolumes $UseVolumes -OutputDir $OutputDir -SynthpopDir $SynthpopDir -VolumeOutput $volOut -VolumeSynthpop $volSyn)
+    # RepoPath records which repository folder is mounted (F84), same as the GUI does.
+    $dockerArgs += @(Get-ImpactContainerLabelArgs -UseVolumes $UseVolumes -OutputDir $OutputDir -SynthpopDir $SynthpopDir -VolumeOutput $volOut -VolumeSynthpop $volSyn -RepoPath $ProjectRoot)
 
     # Only the private key is mounted from the host. The github.com host key is
     # written inside the container by Get-ContainerSshSetupCommand, so the
@@ -2887,6 +2959,11 @@ function Split-DockerCustomParams {
              and REMOTE containers. Get-ContainerRuntimeInfo reads them. Without them
              a resumed session did not know where to copy results back to, and Stop
              deleted the volumes anyway (F01/F04).
+             impact.repo_path records the repository folder that is mounted into the
+             container (F84). A running container is found by NAME only, so a second
+             clone with the same folder name elsewhere looked like the same repository,
+             and Stop then checked git changes in the wrong folder. With this label the
+             GUI can tell the two apart when it reconnects to a running container.
 #>
 function Get-ImpactContainerLabelArgs {
     param(
@@ -2894,9 +2971,12 @@ function Get-ImpactContainerLabelArgs {
         [string]$OutputDir,
         [string]$SynthpopDir,
         [string]$VolumeOutput,
-        [string]$VolumeSynthpop
+        [string]$VolumeSynthpop,
+        # Optional: the repository folder mounted into the container (F84).
+        [string]$RepoPath
     )
     $labelArgs = @('--label', ("impact.use_volumes=" + $(if ($UseVolumes) { 'true' } else { 'false' })))
+    if ($RepoPath)    { $labelArgs += @('--label', "impact.repo_path=$RepoPath") }
     if ($OutputDir)   { $labelArgs += @('--label', "impact.output_dir=$OutputDir") }
     if ($SynthpopDir) { $labelArgs += @('--label', "impact.synthpop_dir=$SynthpopDir") }
     if ($UseVolumes -and $VolumeOutput)   { $labelArgs += @('--label', "impact.volume_output=$VolumeOutput") }
@@ -2973,9 +3053,16 @@ function Initialize-RsyncHelperImage {
              caller removes a volume only after Success is $true for it (F01). An empty
              target folder is refused, because docker would otherwise get an invalid
              mount like ':/backup' (this is what happened in resumed sessions).
+             A target folder that does not exist (renamed, moved, a drive that is not
+             connected) is refused too, so the caller keeps the volume (B3-R4).
+.PARAMETER KeepNewerOnHost
+             Do not overwrite a file in the target folder that is NEWER than the copy in
+             the volume (rsync --update). Used when copying volumes left over from an
+             earlier session: since then, newer results may have been written straight
+             into the folder, and the old volume copy must not replace them (B3-R1).
 #>
 function Sync-ImpactVolumeToHost {
-    param([pscustomobject]$State, [string]$VolumeName, [string]$HostDir)
+    param([pscustomobject]$State, [string]$VolumeName, [string]$HostDir, [switch]$KeepNewerOnHost)
     $result = [pscustomobject]@{ Success = $false; Missing = $false; Message = '' }
     if ([string]::IsNullOrWhiteSpace($VolumeName) -or [string]::IsNullOrWhiteSpace($HostDir)) {
         $result.Message = "Cannot copy volume '$VolumeName': the folder to copy it to is unknown."
@@ -2999,9 +3086,16 @@ function Sync-ImpactVolumeToHost {
     $ctx = Get-DockerContextArgs -State $State
     $backup = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $HostDir } else { $HostDir }
     Write-Log "Copying volume $VolumeName back to $backup" 'Info'
+    # Same rsync options as before; only '-v' was dropped to keep the log small.
+    $rsyncArgs = @('rsync','-ac','--no-owner','--no-group','--no-times','--no-perms','--chmod=ugo=rwX')
+    if ($KeepNewerOnHost) { $rsyncArgs += '--update' }
+    $rsyncArgs += @('/volume/','/backup/')
     try {
-        # Same rsync options as before; only '-v' was dropped to keep the log small.
-        $out = & docker @ctx @('run','--rm','-v',"$($VolumeName):/volume",'-v',"$($backup):/backup",'rsync-alpine','rsync','-ac','--no-owner','--no-group','--no-times','--no-perms','--chmod=ugo=rwX','/volume/','/backup/') 2>&1
+        # The target folder is mounted with '--mount' instead of '-v' (B3-R4): for '-v'
+        # Docker silently CREATES a missing host folder (on the workstation even owned by
+        # root), so a copy to a folder that no longer exists "succeeded" into a new, empty
+        # folder and the caller then deleted the volume. '--mount' refuses a missing folder.
+        $out = & docker @ctx (@('run','--rm','-v',"$($VolumeName):/volume",'--mount',"type=bind,source=$backup,target=/backup",'rsync-alpine') + $rsyncArgs) 2>&1
         $code = $LASTEXITCODE
     } catch {
         $out = $_.Exception.Message
@@ -3012,8 +3106,13 @@ function Sync-ImpactVolumeToHost {
         $result.Message = "Copied volume '$VolumeName' to $HostDir."
     } else {
         $tail = (@($out) | ForEach-Object { "$_" } | Select-Object -Last 5) -join ' '
-        $result.Message = "Copying volume '$VolumeName' to $HostDir failed (exit $code): $tail"
-        Write-Log $result.Message 'Error'
+        if ($tail -match 'bind source path does not exist') {
+            # Plain-language version of Docker's mount error (see '--mount' above).
+            $result.Message = "The folder '$HostDir' does not exist (it may have been renamed or moved, or it is on a drive that is not connected), so volume '$VolumeName' was not copied."
+        } else {
+            $result.Message = "Copying volume '$VolumeName' to $HostDir failed (exit $code): $tail"
+        }
+        Write-Log "$($result.Message) Docker said: $tail" 'Error'
     }
     return $result
 }
@@ -3235,6 +3334,9 @@ Export-ModuleMember -Function @(
     # YAML / paths
     'Get-YamlPathValue'
     'Test-AndCreateDirectory'
+    # Safe quoting of paths inside commands run by the workstation's shell (the GUI's
+    # Start button uses it for its remote YAML check and remote image build).
+    'ConvertTo-PosixShellLiteral'
     # Git
     'Get-GitRepositoryState'
     'Show-GitCommitDialog'

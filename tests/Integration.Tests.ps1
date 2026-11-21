@@ -1499,7 +1499,8 @@ Describe 'Sync-ImpactVolumeToHost (mocked docker)' -Tag Integration {
     It 'Succeeds when rsync exits 0 and converts a LOCAL Windows path for docker' {
         $r = Sync-ImpactVolumeToHost -State (New-TestSessionState) -VolumeName 'vol1' -HostDir 'C:\Users\u\out'
         $r.Success | Should -BeTrue
-        ($script:b3Calls | Where-Object { $_ -match 'rsync-alpine rsync' }) | Should -Match '/c/Users/u/out:/backup'
+        # The target folder is mounted with --mount (not -v), so Docker refuses a missing folder (B3-R4).
+        ($script:b3Calls | Where-Object { $_ -match 'rsync-alpine rsync' }) | Should -Match 'type=bind,source=/c/Users/u/out,target=/backup'
     }
 
     It 'Treats a volume that does not exist as nothing to copy' {
@@ -1538,5 +1539,135 @@ Describe 'Get-ImpactVolumeInfo (mocked docker)' -Tag Integration {
         $vi = Get-ImpactVolumeInfo -State (New-TestSessionState) -VolumeName 'vol1'
         $vi.Exists    | Should -BeTrue
         $vi.TargetDir | Should -BeNullOrEmpty
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  C2: copying volumes back, repository label, remote metadata clean-up
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Sync-ImpactVolumeToHost: newer files and missing folders (B3-R1, B3-R4, mocked docker)' -Tag Integration {
+    BeforeEach {
+        $script:c2Calls = @()
+        $script:c2RsyncExit = 0
+        $script:c2RsyncOut = ''
+        Mock docker {
+            $joined = ($args | ForEach-Object { $_ }) -join ' '
+            $script:c2Calls += $joined
+            if ($joined -match 'volume inspect') { $global:LASTEXITCODE = 0; return '{"impact.target_dir":"/mnt/out"}' }
+            if ($joined -match 'rsync-alpine rsync') { $global:LASTEXITCODE = $script:c2RsyncExit; return $script:c2RsyncOut }
+            $global:LASTEXITCODE = 0
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+    }
+
+    It 'Keeps newer files in the folder (rsync --update) with -KeepNewerOnHost' {
+        $r = Sync-ImpactVolumeToHost -State (New-TestSessionState -Location 'REMOTE@10.0.0.1') -VolumeName 'vol1' -HostDir '/mnt/out' -KeepNewerOnHost
+        $r.Success | Should -BeTrue
+        ($script:c2Calls | Where-Object { $_ -match 'rsync-alpine rsync' }) | Should -Match ' --update '
+    }
+
+    It 'Does not pass --update without -KeepNewerOnHost (normal Stop)' {
+        Sync-ImpactVolumeToHost -State (New-TestSessionState -Location 'REMOTE@10.0.0.1') -VolumeName 'vol1' -HostDir '/mnt/out' | Out-Null
+        ($script:c2Calls | Where-Object { $_ -match 'rsync-alpine rsync' }) | Should -Not -Match '--update'
+    }
+
+    It 'Mounts the target folder with --mount, so Docker refuses (and does not create) a missing folder' {
+        Sync-ImpactVolumeToHost -State (New-TestSessionState -Location 'REMOTE@10.0.0.1') -VolumeName 'vol1' -HostDir '/mnt/out' | Out-Null
+        $rsyncCall = $script:c2Calls | Where-Object { $_ -match 'rsync-alpine rsync' }
+        $rsyncCall | Should -Match '--mount type=bind,source=/mnt/out,target=/backup'
+        $rsyncCall | Should -Not -Match '/mnt/out:/backup'
+    }
+
+    It 'Explains a missing target folder in plain words and reports failure' {
+        $script:c2RsyncExit = 125
+        $script:c2RsyncOut = 'docker: Error response from daemon: invalid mount config for type "bind": bind source path does not exist: /mnt/out.'
+        $r = Sync-ImpactVolumeToHost -State (New-TestSessionState -Location 'REMOTE@10.0.0.1') -VolumeName 'vol1' -HostDir '/mnt/out'
+        $r.Success | Should -BeFalse
+        $r.Missing | Should -BeFalse
+        $r.Message | Should -Match "folder '/mnt/out' does not exist"
+    }
+}
+
+Describe 'Get-ContainerRuntimeInfo reads the repository folder label (F84, mocked docker)' -Tag Integration {
+    It 'Returns RepoPath from the impact.repo_path label' {
+        Mock docker {
+            $joined = ($args | ForEach-Object { $_ }) -join ' '
+            $global:LASTEXITCODE = 0
+            if ($joined -match 'json .Config.Labels') {
+                return ('{"impact.use_volumes":"false","impact.repo_path":"C:\\Users\\Max Mustermann\\IMPACTncd_Germany"}' + "`t" + '[]')
+            }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+        $info = Get-ContainerRuntimeInfo -State (New-TestSessionState)
+        $info.RepoPath | Should -Be 'C:\Users\Max Mustermann\IMPACTncd_Germany'
+    }
+
+    It 'Leaves RepoPath empty for a container started by an older version (no label)' {
+        Mock docker {
+            $joined = ($args | ForEach-Object { $_ }) -join ' '
+            $global:LASTEXITCODE = 0
+            if ($joined -match 'json .Config.Labels') { return ('{"impact.use_volumes":"false"}' + "`t" + '[]') }
+            return ''
+        } -ModuleName 'IMPACT_Docker_GUI'
+        $info = Get-ContainerRuntimeInfo -State (New-TestSessionState)
+        $info.ContainsKey('RepoPath') | Should -BeTrue
+        $info.RepoPath | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Remote metadata: quoting and clean-up of old password files (B3-R6, mocked SSH)' -Tag Integration {
+    BeforeAll {
+        # Temporary ssh stub so Pester can mock ssh on machines without an ssh client.
+        $script:c2MetaSshStubAdded = $false
+        if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+            function global:ssh { throw 'ssh stub: this call should have been mocked' }
+            $script:c2MetaSshStubAdded = $true
+        }
+    }
+
+    AfterAll {
+        if ($script:c2MetaSshStubAdded) { Remove-Item -Path Function:\ssh -ErrorAction SilentlyContinue }
+    }
+
+    It 'Write-RemoteContainerMetadata quotes the file name and removes old files that contain a password' {
+        $script:c2MetaCmd = $null
+        Mock ssh { $script:c2MetaCmd = $args[-1]; $global:LASTEXITCODE = 0 } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -UserName 'u' -Location 'REMOTE@10.0.0.1'
+        $state.ContainerName = 'R_u'
+        Write-RemoteContainerMetadata -State $state -Port '8787' -UseVolumes $false
+        $script:c2MetaCmd | Should -Match ([regex]::Escape("base64 -d > '/tmp/impactncd/R_u.json' && "))
+        $script:c2MetaCmd | Should -Match 'grep -lZE'
+        $script:c2MetaCmd | Should -Match 'xargs -0 -r rm -f; true; \}$'
+    }
+
+    It 'Remove-RemoteContainerMetadata removes the file and runs the same clean-up' {
+        $script:c2MetaCmd = $null
+        Mock ssh { $script:c2MetaCmd = $args[-1]; $global:LASTEXITCODE = 0 } -ModuleName 'IMPACT_Docker_GUI'
+        $state = New-TestSessionState -UserName 'u' -Location 'REMOTE@10.0.0.1'
+        $state.ContainerName = 'R_u'
+        Remove-RemoteContainerMetadata -State $state
+        $script:c2MetaCmd | Should -Match ([regex]::Escape("rm -f '/tmp/impactncd/R_u.json'; "))
+        $script:c2MetaCmd | Should -Match 'grep -lZE'
+    }
+
+    It 'The clean-up deletes only metadata files that have a password entry (runs the real shell snippet)' -Skip:(-not (Get-Command sh -ErrorAction SilentlyContinue) -or -not (Get-Command xargs -ErrorAction SilentlyContinue)) {
+        $cleanup = InModuleScope 'IMPACT_Docker_GUI' { Get-RemoteMetadataCleanupCommand }
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) "impact_c2_meta_$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        try {
+            Set-Content -LiteralPath (Join-Path $dir 'old.json') -Value '{"container":"a","password":"secret","port":"8787"}'
+            Set-Content -LiteralPath (Join-Path $dir 'old spaced.json') -Value '{"password": "secret"}'
+            Set-Content -LiteralPath (Join-Path $dir 'new.json') -Value '{"container":"b","port":"8787","useVolumes":false}'
+            Set-Content -LiteralPath (Join-Path $dir 'repo.json') -Value '{"container":"c","repo":"password"}'
+            # Same snippet, pointed at the temporary folder instead of /tmp/impactncd.
+            & sh -c ($cleanup.Replace('/tmp/impactncd/', "$dir/"))
+            $LASTEXITCODE | Should -Be 0
+            Test-Path -LiteralPath (Join-Path $dir 'old.json') | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $dir 'old spaced.json') | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $dir 'new.json') | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $dir 'repo.json') | Should -BeTrue
+        } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }

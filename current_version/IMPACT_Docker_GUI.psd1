@@ -38,6 +38,7 @@
         'Format-DockerError'
         'Get-YamlPathValue'
         'Test-AndCreateDirectory'
+        'ConvertTo-PosixShellLiteral'
         'Get-GitRepositoryState'
         'Show-GitCommitDialog'
         'Invoke-GitChangeDetection'

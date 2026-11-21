@@ -1345,6 +1345,35 @@ function Show-ContainerManager {
     if (-not $State.Metadata.ContainsKey('ActiveRepoPath')) { $State.Metadata.ActiveRepoPath = $null }
     if (-not $State.Metadata.ContainsKey('ActiveIsRemote')) { $State.Metadata.ActiveIsRemote = $false }
     Write-Log 'Opening container manager UI.' 'Info'
+
+    # F84: a running container is found by its NAME only ("<repo>_<user>"), so a second
+    # clone with the same folder name somewhere else looked like the same repository, and
+    # Stop then copied results and checked git changes in the wrong folder. Start now
+    # records the mounted folder in the container label impact.repo_path. This helper
+    # returns that folder when it DIFFERS from the selected one and can really be used;
+    # otherwise $null, and the selected folder is kept (also for containers started by
+    # older versions, which have no such label).
+    function Get-DifferentLabelRepoPath {
+        param([string]$LabelPath, [string]$SelectedPath)
+        if (-not $LabelPath) { return $null }
+        if ($State.ContainerLocation -eq 'LOCAL') {
+            # Windows paths: compare without caring about upper/lower case or / versus \.
+            $labelNorm = ($LabelPath -replace '/', '\').TrimEnd('\')
+            $selectedNorm = ("$SelectedPath" -replace '/', '\').TrimEnd('\')
+            if ($labelNorm -ieq $selectedNorm) { return $null }
+            # Only switch to a folder that exists on this PC. A drive that is not connected
+            # (or a wrongly decoded name) must not send Stop to a missing folder.
+            if (-not (Test-Path -LiteralPath $LabelPath -PathType Container)) {
+                Write-Log "Container label names repository folder '$LabelPath', which does not exist on this PC; keeping '$SelectedPath'." 'Warn'
+                return $null
+            }
+        } elseif ($LabelPath.TrimEnd('/') -ceq "$SelectedPath".TrimEnd('/')) {
+            # Linux paths on the workstation are case-sensitive.
+            return $null
+        }
+        return $LabelPath
+    }
+
     $isRunning = $State.Metadata.ContainerRunning
     if (-not $isRunning) {
         # Nothing is running for this repo, so forget the port and volume mode of a
@@ -1362,6 +1391,21 @@ function Show-ContainerManager {
         Write-Log "Resumed existing container $($State.ContainerName) at $hostDisplay" 'Info'
         $State.Metadata.ActiveRepoPath = if ($State.ContainerLocation -eq 'LOCAL') { $State.Paths.LocalRepo } else { $State.Paths.RemoteRepo }
         $State.Metadata.ActiveIsRemote = ($State.ContainerLocation -like 'REMOTE@*')
+        # F84: which folder does the running container really use? Get-ContainerStatus may
+        # already have read the label into Recovered.RepoPath; if it did not collect that
+        # key at all, ask the container directly (one extra 'docker inspect').
+        $labelRepoPath = $null
+        if ($State.Metadata.Recovered.ContainsKey('RepoPath')) {
+            $labelRepoPath = $State.Metadata.Recovered['RepoPath']
+        } else {
+            try { $labelRepoPath = (Get-ContainerRuntimeInfo -State $State).RepoPath } catch { $labelRepoPath = $null }
+        }
+        $otherRepoPath = Get-DifferentLabelRepoPath -LabelPath $labelRepoPath -SelectedPath $State.Metadata.ActiveRepoPath
+        if ($otherRepoPath) {
+            Write-Log "Running container '$($State.ContainerName)' uses repository folder '$otherRepoPath', not the selected '$($State.Metadata.ActiveRepoPath)'." 'Warn'
+            [System.Windows.Forms.MessageBox]::Show("The running container '$($State.ContainerName)' was started from a DIFFERENT folder than the one you selected (both folders have the same name):`n`n  Container uses:`n  $otherRepoPath`n`n  You selected:`n  $($State.Metadata.ActiveRepoPath)`n`nWhen you click Stop, IMPACT copies results and checks git changes in the folder the container really uses (the first one).",'Different repository folder','OK','Warning') | Out-Null
+            $State.Metadata.ActiveRepoPath = $otherRepoPath
+        }
         $State.Metadata.ActiveUseVolumes = [bool]$State.Metadata.Recovered.UseVolumes
         $State.Metadata.ActivePort = $portDisplay
         # Restore the result folders recorded on the container (labels). Without them
@@ -1511,7 +1555,13 @@ function Show-ContainerManager {
         }
         if ($State.Metadata.ContainerRunning) {
             if ($form.Tag -ne 'back') {
-                $answer = [System.Windows.Forms.MessageBox]::Show('A container is still running. Close without stopping?','Container running','YesNo','Warning')
+                $closeMsg = 'A container is still running. Close without stopping?'
+                # F04: in volume mode the results live only inside the Docker volumes until
+                # Stop copies them back, so say that clearly before the window goes away.
+                if ($State.Metadata['ActiveUseVolumes']) {
+                    $closeMsg += "`n`nYour results stay inside Docker volumes until you reopen IMPACT and click Stop."
+                }
+                $answer = [System.Windows.Forms.MessageBox]::Show($closeMsg,'Container running','YesNo','Warning')
                 if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { $_.Cancel = $true }
             }
         }
@@ -1582,6 +1632,11 @@ function Show-ContainerManager {
         if ($Status -eq 'RUNNING') {
             $info.SelectionColor = $palette.Success
             $info.AppendText("$([char]0x25CF)  RUNNING`n")
+        } elseif ($Status -eq 'UNKNOWN') {
+            # F34: Docker could not be asked, so we really do not know whether the container
+            # runs. Showing STOPPED here used to make a running container look stopped.
+            $info.SelectionColor = $palette.Danger
+            $info.AppendText("$([char]0x25CB)  UNKNOWN (Docker not reachable)`n")
         } else {
             $info.SelectionColor = $palette.AccentAlt
             $info.AppendText("$([char]0x25CB)  STOPPED`n")
@@ -1631,15 +1686,47 @@ function Show-ContainerManager {
         $info.SelectionFont = $bodyFont;  $info.SelectionColor = $palette.Text
         $info.AppendText("$($State.ContainerLocation)`n")
     }
-    Update-InfoBox -Status ($(if($isRunning){'RUNNING'}else{'STOPPED'}))
+    # Get-ContainerStatus sets DockerReachable; $false means the user clicked Cancel in its
+    # 'Docker Not Reachable' box. ['DockerReachable'] returns $null (not an error under
+    # StrictMode) if the key was never set.
+    $dockerUnreachable = ($State.Metadata['DockerReachable'] -eq $false)
+    Update-InfoBox -Status ($(if($isRunning){'RUNNING'}elseif($dockerUnreachable){'UNKNOWN'}else{'STOPPED'}))
     $lblStatus.Text = ''
+    if ($dockerUnreachable -and -not $isRunning) {
+        $lblStatus.Text = 'Docker could not be reached. Click Back and continue again to check again.'
+    } elseif (-not $isRunning) {
+        # B3-R1: results of an earlier volume-mode session may still sit in Docker volumes
+        # (after a crash, a reboot or a failed Stop). Tick 'Use Docker Volumes' and say so;
+        # Start then offers to copy them back. One quick 'docker volume ls' is enough for
+        # this hint, Start checks the volumes properly before it changes anything.
+        try {
+            $hintNames = Get-ImpactVolumeNames -ContainerName $State.ContainerName
+            $hintCtx = Get-DockerContextArgs -State $State
+            $existingVolumes = @(& docker @hintCtx volume ls --format '{{.Name}}' 2>$null)
+            if ($LASTEXITCODE -eq 0 -and ($existingVolumes -contains $hintNames.Output -or $existingVolumes -contains $hintNames.Synthpop)) {
+                Write-Log "Docker volumes from an earlier session of $($State.ContainerName) still exist." 'Warn'
+                $chkVolumes.Checked = $true
+                $lblStatus.Text = 'Results from an earlier session are still in Docker volumes. Click Start to copy them back.'
+            }
+        } catch {
+            Write-Log "Leftover volume check failed (continuing): $($_.Exception.Message)" 'Debug'
+        }
+        # F93: Get-NextAvailablePort returns the first port even when every port is taken, so
+        # the Port box alone does not show that nothing is free. Say it here.
+        if (@($State.Ports.Used) -contains [string]$defaultPort) {
+            $lblStatus.Text = 'All RStudio ports (8787-8799) are in use. Stop another container before you click Start.'
+        }
+    }
 
     $chkShowPass.Add_CheckedChanged({
         $uiState.ShowPassword = $chkShowPass.Checked
         Update-InfoBox -Status $uiState.Status
     })
 
-    $btnStart.Add_Click({
+    # The code of the Start button. It is kept in a variable (instead of directly inside
+    # $btnStart.Add_Click) so that Invoke-ManagerButtonAction, further below, can run it
+    # inside a safety net that turns an unexpected error into a friendly message (B4-R5).
+    $startClickBody = {
         $useVolumes = $chkVolumes.Checked
         $rebuild    = $chkRebuild.Checked
         $highComp   = $chkHigh.Checked
@@ -1663,8 +1750,63 @@ function Show-ContainerManager {
             return
         }
 
-        if ($portOverride -and $State.Ports.Used -contains $portOverride) {
-            [System.Windows.Forms.MessageBox]::Show("Port $portOverride is already in use. Choose another.", 'Port conflict', 'OK', 'Error') | Out-Null
+        # Ask Docker NOW instead of trusting lists collected when this window opened, which
+        # may be minutes or hours old (F18/F39/F34). This one 'docker ps' tells us:
+        #  - whether Docker answers at all (Docker Desktop stopped, or the network/VPN to the
+        #    workstation dropped). Before, a failing check simply looked like "image missing"
+        #    and started a long image build that could only fail;
+        #  - whether our container is running after all (for example started from another
+        #    IMPACT window or another PC);
+        #  - which ports are in use right now, and which other containers of this user run.
+        $ctxStart = Get-DockerContextArgs -State $State
+        $psNowRaw = & docker @ctxStart ps --format '{{.Names}}\t{{.Ports}}' 2>&1
+        $psNowExit = $LASTEXITCODE
+        if ($psNowExit -ne 0) {
+            $psNowError = ((@($psNowRaw) | ForEach-Object { "$_" }) -join "`n").Trim()
+            Write-Log "Start: Docker is not reachable (exit $psNowExit): $psNowError" 'Warn'
+            $State.Metadata.DockerReachable = $false
+            Update-InfoBox -Status 'UNKNOWN'
+            $dockerFix = if ($State.ContainerLocation -eq 'LOCAL') { 'Start Docker Desktop and wait until it reports that the engine is running, then click Start again.' } else { "Check your network or VPN connection to the workstation ($($State.RemoteHostIp)), then click Start again." }
+            [System.Windows.Forms.MessageBox]::Show("Docker is not reachable, so the container cannot be started.`n`n$dockerFix",'Docker not reachable','OK','Warning') | Out-Null
+            return
+        }
+        $State.Metadata.DockerReachable = $true
+        $runningNow = @()
+        $freshUsedPorts = @()
+        foreach ($psLine in @($psNowRaw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" })) {
+            $psParts = @($psLine -split "`t", 2)
+            if ($psParts[0].Trim()) { $runningNow += $psParts[0].Trim() }
+            if ($psParts.Count -ge 2) {
+                # Same pattern as Get-UsedPorts in the module (any host address, F13).
+                foreach ($m in [regex]::Matches($psParts[1], ':(\d{4,5})->8787/tcp')) {
+                    if ($freshUsedPorts -notcontains $m.Groups[1].Value) { $freshUsedPorts += $m.Groups[1].Value }
+                }
+            }
+        }
+        $State.Ports.Used = $freshUsedPorts
+
+        if ($runningNow -contains $State.ContainerName) {
+            [System.Windows.Forms.MessageBox]::Show("A container named '$($State.ContainerName)' is already running (perhaps started from another IMPACT window or on another PC).`n`nClick Back and continue again: IMPACT then connects to the running container.",'Already running','OK','Information') | Out-Null
+            return
+        }
+        if ($uiState.Status -eq 'UNKNOWN') {
+            # Docker answers again and our container is not running, so STOPPED is now known.
+            Update-InfoBox -Status 'STOPPED'
+            $lblStatus.Text = ''
+        }
+
+        # F93: Get-NextAvailablePort returns the first port of the range even when every port
+        # is taken, so check that case and explain it instead of a plain "port conflict".
+        $freePort = Get-NextAvailablePort -UsedPorts $freshUsedPorts
+        if ($freshUsedPorts -contains $freePort) {
+            $portWhere = if ($State.ContainerLocation -eq 'LOCAL') { 'on this computer' } else { 'on the workstation' }
+            [System.Windows.Forms.MessageBox]::Show("All RStudio ports (8787-8799) are already in use by other containers $portWhere.`n`nStop one of them (or ask a colleague to stop theirs), then click Start again.",'No free port','OK','Warning') | Out-Null
+            return
+        }
+        if ($freshUsedPorts -contains $portOverride) {
+            # Enter a free port for the user, so a second click on Start simply works.
+            $txtPort.Text = $freePort
+            [System.Windows.Forms.MessageBox]::Show("Port $portOverride is already in use by another container.`n`nPort $freePort is free and has been entered in the Port box. Click Start again to use it.", 'Port conflict', 'OK', 'Warning') | Out-Null
             return
         }
 
@@ -1675,9 +1817,12 @@ function Show-ContainerManager {
             }
         }
 
-        $otherRunning = $State.Metadata.ExistingContainers | Where-Object { $_.Name -ne $State.ContainerName -and $_.Status -match '^Up' }
-        if ($otherRunning -and $otherRunning.Count -gt 0) {
-            $names = ($otherRunning | ForEach-Object { $_.Name }) -join ', '
+        # This user's other running containers, from the fresh 'docker ps' above (names end
+        # with "_<user>", see Get-ContainerStatus). @() keeps .Count safe under StrictMode.
+        $userSuffix = "_$($State.UserName)"
+        $otherRunning = @($runningNow | Where-Object { $_ -ne $State.ContainerName -and $_.EndsWith($userSuffix, [System.StringComparison]::OrdinalIgnoreCase) })
+        if ($otherRunning.Count -gt 0) {
+            $names = $otherRunning -join ', '
             $choice = [System.Windows.Forms.MessageBox]::Show("Other containers are running: $names`nContinue starting another?",'Other containers running','YesNo','Warning')
             if ($choice -ne [System.Windows.Forms.DialogResult]::Yes) { return }
         }
@@ -1685,7 +1830,10 @@ function Show-ContainerManager {
         $projectRoot = if ($State.ContainerLocation -eq 'LOCAL') { $State.Paths.LocalRepo } else { $State.Paths.RemoteRepo }
         if (-not $projectRoot) { [System.Windows.Forms.MessageBox]::Show('Repository path missing; restart and select again.','Missing path','OK','Error') | Out-Null; return }
         $dockerSetup = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $projectRoot 'docker_setup' } else { "$projectRoot/docker_setup" }
-        if ($State.ContainerLocation -eq 'LOCAL' -and -not (Test-Path $dockerSetup)) {
+        # -LiteralPath (here and below): a folder name such as 'IMPACTncd_Germany [v2]'
+        # contains [ ], which -Path reads as a wildcard pattern, so existing files and
+        # folders were reported as missing (B2-R3).
+        if ($State.ContainerLocation -eq 'LOCAL' -and -not (Test-Path -LiteralPath $dockerSetup)) {
             [System.Windows.Forms.MessageBox]::Show("docker_setup folder not found at $dockerSetup","Missing docker_setup",'OK','Error') | Out-Null; return
         }
 
@@ -1693,11 +1841,11 @@ function Show-ContainerManager {
         if (-not [System.IO.Path]::IsPathRooted($simDesign)) {
             $simDesign = ($projectRoot.TrimEnd('/','\') + '/' + ($simDesign -replace '\\','/')) -replace '/+','/'
             if ($State.ContainerLocation -eq 'LOCAL') {
-                $resolved = Resolve-Path -Path $simDesign -ErrorAction SilentlyContinue
+                $resolved = Resolve-Path -LiteralPath $simDesign -ErrorAction SilentlyContinue
                 if ($resolved) { $simDesign = $resolved.Path }
             }
         }
-        if ($State.ContainerLocation -eq 'LOCAL' -and -not (Test-Path $simDesign)) {
+        if ($State.ContainerLocation -eq 'LOCAL' -and -not (Test-Path -LiteralPath $simDesign)) {
             [System.Windows.Forms.MessageBox]::Show("YAML file not found at $simDesign",'Missing YAML','OK','Error') | Out-Null; return
         }
         if ($State.ContainerLocation -like 'REMOTE@*') {
@@ -1708,7 +1856,10 @@ function Show-ContainerManager {
             $yamlCheck = $null
             try {
                 $yamlHost = Get-RemoteHostString -State $State
-                $yamlCheck = & ssh -n -i $State.Paths.SshPrivate -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $yamlHost "test -f '$simDesign' && echo YAML_OK || echo YAML_MISSING" 2>$null
+                # ConvertTo-PosixShellLiteral quotes the path safely for the workstation's shell
+                # (a ' in the path broke the old '...' quoting, B4-R7).
+                $simDesignQ = ConvertTo-PosixShellLiteral -Value $simDesign
+                $yamlCheck = & ssh -n -i $State.Paths.SshPrivate -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $yamlHost "test -f $simDesignQ && echo YAML_OK || echo YAML_MISSING" 2>$null
             } catch {
                 Write-Log "Remote YAML check failed: $($_.Exception.Message)" 'Warn'
             }
@@ -1736,12 +1887,21 @@ function Show-ContainerManager {
             $isRemote = ($State.ContainerLocation -like 'REMOTE@*')
             if (-not $Path) {
                 $hint = if ($isRemote) { "`n`n(If the workstation connection dropped, simply try again.)" } else { '' }
-                [System.Windows.Forms.MessageBox]::Show("The setting '$Key' was not found (or is empty) in the YAML file:`n$simDesign`n`nAdd a line such as '${Key}: ./outputs' to that file and try again.$hint",'Setting missing in YAML','OK','Error') | Out-Null
+                # A fitting example per setting (B4-R4): suggesting ./outputs for synthpop_dir
+                # would mix the synthetic population with the results.
+                $example = if ($Key -eq 'synthpop_dir') { './inputs/synthpop' } else { './outputs' }
+                [System.Windows.Forms.MessageBox]::Show("The setting '$Key' was not found (or is empty) in the YAML file:`n$simDesign`n`nAdd a line such as '${Key}: $example' to that file and try again.$hint",'Setting missing in YAML','OK','Error') | Out-Null
                 return $false
             }
             $why = $null
             if (Test-AndCreateDirectory -State $State -Path $Path -PathKey $Key -Reason ([ref]$why)) { return $true }
             switch ($why) {
+                'NetworkPathInLocalMode' {
+                    # F36: Docker Desktop cannot mount network folders; without this check the
+                    # start failed only at 'docker run', after the (possibly long) image build.
+                    [System.Windows.Forms.MessageBox]::Show("The setting '$Key' in`n$simDesign`npoints to a network folder:`n$Path`n`nDocker Desktop cannot use network folders (\\server\... or a mapped network drive). Use a folder on a local drive of this computer, for example a folder inside the repository.",'Network Folder Not Supported','OK','Error') | Out-Null
+                    return $false
+                }
                 'PosixPathInLocalMode' {
                     [System.Windows.Forms.MessageBox]::Show("The setting '$Key' in`n$simDesign`nuses a Linux-style path:`n$Path`n`nLocal runs need a Windows path, for example ./outputs or C:\IMPACT\outputs. Use sim_design_local.yaml for local runs.",'Path error','OK','Error') | Out-Null
                     return $false
@@ -1771,160 +1931,9 @@ function Show-ContainerManager {
         if (-not (Confirm-YamlFolder -Key 'output_dir' -Path $outputDir)) { return }
         if (-not (Confirm-YamlFolder -Key 'synthpop_dir' -Path $synthDir)) { return }
 
-        # Build image name
-        $imageName = $State.SelectedRepo.ToLower()
-
-        # Check image exists unless rebuild
-        $imageExists = $false
-        if (-not $rebuild) {
-            $imgCmd = (Get-DockerContextArgs -State $State) + @('images','--format','{{.Repository}}')
-            try {
-                $imgs = & docker @imgCmd 2>$null | Where-Object { $_ -eq $imageName }
-                $imageExists = [bool]$imgs
-            } catch { $imageExists = $false }
-        }
-
-        $dockerfileMain = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup 'Dockerfile.IMPACTncdGER' } else { "$dockerSetup/Dockerfile.IMPACTncdGER" }
-        $dockerContext  = $projectRoot
-        if (-not $dockerContext) {
-            [System.Windows.Forms.MessageBox]::Show('Repository path missing; cannot build image.','Missing path','OK','Error') | Out-Null
-            return
-        }
-
-        if (-not $imageExists) {
-            Write-Log "Building image $imageName (streaming output)..." 'Info'
-
-            # Wraps one command-line argument in double quotes when needed. Start-Process joins
-            # its -ArgumentList items with plain spaces and adds no quotes, so an item containing
-            # a space (for example a key file under 'C:\Users\Max Mustermann\.ssh') used to reach
-            # ssh as two separate arguments, and the build failed. This follows the standard
-            # Windows rules: a " inside becomes \" and backslashes right before a " are doubled.
-            function ConvertTo-QuotedArgument {
-                param([string]$Value)
-                if ($Value -and $Value -notmatch '[\s"]') { return $Value }
-                $escaped = $Value -replace '(\\*)"', '$1$1\"'
-                $escaped = $escaped -replace '(\\+)$', '$1$1'
-                return '"' + $escaped + '"'
-            }
-
-            # Runs one 'docker build' and returns $true when it succeeded. LOCAL builds run docker
-            # on this PC from inside the build context folder; REMOTE builds run docker on the
-            # workstation over SSH. Start-Process -NoNewWindow is kept (instead of '& docker')
-            # because it streams the build log live into the console window, which is where the
-            # user can follow the progress. One helper replaces four copies of the same code.
-            function Invoke-StartImageBuild {
-                param([string]$Dockerfile, [string]$Tag, [string]$Context, [bool]$WithRepoArg)
-                try {
-                    if ($State.ContainerLocation -eq 'LOCAL') {
-                        $buildArgs = @('build')
-                        if ($WithRepoArg) { $buildArgs += @('--build-arg', "REPO_NAME=$($State.SelectedRepo)") }
-                        $buildArgs += @('-f', $Dockerfile, '-t', $Tag, '--no-cache', '--progress=plain', '.')
-                        $argString = ($buildArgs | ForEach-Object { ConvertTo-QuotedArgument $_ }) -join ' '
-                        Push-Location $Context
-                        try {
-                            $p = Start-Process -FilePath 'docker' -ArgumentList $argString -Wait -PassThru -NoNewWindow
-                            return ($p.ExitCode -eq 0)
-                        } finally { Pop-Location }
-                    }
-                    $repoArg = if ($WithRepoArg) { "--build-arg REPO_NAME=$($State.SelectedRepo) " } else { '' }
-                    $cmd = "cd '$Context' && docker build $($repoArg)-f '$Dockerfile' -t '$Tag' --no-cache ."
-                    $sshArgs = @('-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',$State.Paths.SshPrivate,(Get-RemoteHostString -State $State),$cmd)
-                    $argString = ($sshArgs | ForEach-Object { ConvertTo-QuotedArgument $_ }) -join ' '
-                    $p = Start-Process -FilePath 'ssh' -ArgumentList $argString -Wait -NoNewWindow -PassThru
-                    return ($p.ExitCode -eq 0)
-                } catch {
-                    Write-Log "Could not run docker build: $($_.Exception.Message)" 'Warn'
-                    return $false
-                }
-            }
-
-            $buildSucceeded = $false
-            $buildStart = Get-Date
-            # A build can take a long time and blocks this window meanwhile, so switch to busy
-            # mode (buttons disabled, status text, wait cursor, closing refused). The 'finally'
-            # below always switches it off again, also on the early 'return' paths.
-            Set-ManagerBusy -Busy $true -Message 'Building the Docker image (30+ min). Progress: see the console window.'
-            try {
-                $buildSucceeded = Invoke-StartImageBuild -Dockerfile $dockerfileMain -Tag $imageName -Context $dockerContext -WithRepoArg $true
-
-                if (-not $buildSucceeded -and $State.ContainerLocation -like 'REMOTE@*') {
-                    # REMOTE build failed: try an automatic docker login from the repo .env and
-                    # retry once. This used to be guarded by $State.Metadata.RemoteLoginAttempted,
-                    # but that key was never created, and reading a missing key crashes under
-                    # StrictMode, so this whole recovery path could never run. It runs at most once
-                    # per Start click anyway, so no flag is needed.
-                    Write-Log 'Remote build failed; attempting automatic remote docker login from repo .env and retrying build.' 'Info'
-                    try {
-                        if (Ensure-RemoteDockerLogin -State $State -ProjectRoot $projectRoot) {
-                            Write-Log 'Remote docker login from .env succeeded; retrying build.' 'Info'
-                            $buildSucceeded = Invoke-StartImageBuild -Dockerfile $dockerfileMain -Tag $imageName -Context $dockerContext -WithRepoArg $true
-                            if ($buildSucceeded) { Write-Log 'Remote build succeeded after login; continuing.' 'Info' }
-                        } else {
-                            Write-Log 'Automatic remote docker login from .env did not provide credentials or failed.' 'Debug'
-                        }
-                    } catch { Write-Log "Remote login attempt failed: $($_.Exception.Message)" 'Warn' }
-                }
-
-                # Only fall back to the prerequisite build if the image is STILL not built. Before,
-                # this ran even after the login retry had succeeded, starting two more long builds
-                # and possibly reporting a failure for an image that was already built.
-                if (-not $buildSucceeded) {
-                    Write-Log 'Main image build failed; attempting prerequisite build fallback.' 'Warn'
-                    $prereqDockerfile = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup 'Dockerfile.prerequisite.IMPACTncdGER' } else { "$dockerSetup/Dockerfile.prerequisite.IMPACTncdGER" }
-                    $prereqContext = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup '.' } else { "$dockerSetup" }
-                    $preSuccess = Invoke-StartImageBuild -Dockerfile $prereqDockerfile -Tag "$imageName-prerequisite" -Context $prereqContext -WithRepoArg $false
-
-                    if (-not $preSuccess) {
-                        [System.Windows.Forms.MessageBox]::Show('Docker build failed (including prerequisite fallback).','Build failed','OK','Error') | Out-Null
-                        return
-                    }
-
-                    # Retry main build after prerequisite
-                    $buildSucceeded = Invoke-StartImageBuild -Dockerfile $dockerfileMain -Tag $imageName -Context $dockerContext -WithRepoArg $true
-                }
-
-                $elapsed = (Get-Date) - $buildStart
-                Write-Log "Docker build duration: $([int]$elapsed.TotalSeconds)s" 'Info'
-                Write-Log "Docker build success=$buildSucceeded" 'Debug'
-                if (-not $buildSucceeded) {
-                    [System.Windows.Forms.MessageBox]::Show('Docker build failed. See console output for details.','Build failed','OK','Error') | Out-Null
-                    return
-                }
-            } finally {
-                Set-ManagerBusy -Busy $false
-            }
-        }
-
-        # Capture git baseline best-effort
-        $State.Metadata.GitBaseline = $null
-        try {
-            if ($State.ContainerLocation -eq 'LOCAL') {
-                # 'git -C <folder>' runs git in that folder without changing PowerShell's current
-                # folder. The old Push-Location/Pop-Location pair skipped Pop-Location when git
-                # failed (for example git not installed), which left the current folder at the
-                # repository root; a later 'docker build ... .' then uploaded the whole repository
-                # as build context.
-                $hash = git -C $projectRoot rev-parse HEAD 2>$null
-                $status = git -C $projectRoot status --porcelain 2>$null
-                $State.Metadata.GitBaseline = @{ Repo=$projectRoot; Commit=$hash; Status=$status; Timestamp=Get-Date }
-            } else {
-                $remoteHost = Get-RemoteHostString -State $State
-                $keyPath = $State.Paths.SshPrivate
-                $hash = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cd '$projectRoot' && git rev-parse HEAD" 2>$null
-                $status = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cd '$projectRoot' && git status --porcelain" 2>$null
-                $State.Metadata.GitBaseline = @{ Repo=$projectRoot; Commit=$hash; Status=$status; Timestamp=Get-Date }
-            }
-            Write-Log "Captured git baseline: commit=$hash" 'Debug'
-        } catch {
-            Write-Log "Git baseline capture failed: $($_.Exception.Message)" 'Debug'
-            $State.Metadata.GitBaseline = $null
-        }
-
-        # $outputDir and $synthDir were resolved and checked before the image build (see Confirm-YamlFolder above)
-
-        $State.Paths.OutputDir = $outputDir
-        $State.Paths.SynthpopDir = $synthDir
-
+        # The checks below used to run only AFTER the image build, which can take 30+
+        # minutes, so a colleague who then answered No (or was refused) had waited for
+        # nothing (B3-R2). They only need the folders resolved above, so they run first now.
         $repoMountSource = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $projectRoot } else { $projectRoot }
 
         # F12 (partial): warn when another running container already uses this repository
@@ -1960,6 +1969,293 @@ function Show-ContainerManager {
         } catch {
             Write-Log "Shared repository check failed (continuing): $($_.Exception.Message)" 'Debug'
         }
+
+        # F48: names include the container name (repo + user), so two repos no longer share volumes.
+        $volNames = Get-ImpactVolumeNames -ContainerName $State.ContainerName
+        $volOut = $volNames.Output
+        $volSyn = $volNames.Synthpop
+        $ctxPrefix = Get-DockerContextArgs -State $State
+
+        # F02: volumes with these names may be left over from an earlier session that was
+        # never copied back (crash, reboot, Docker restart, or a failed Stop). They may hold
+        # the ONLY copy of results, so never delete them silently: copy them out first, or
+        # ask the user.
+        # B3-R1: this check now runs in BOTH modes. It used to run only with 'Use Docker
+        # Volumes' ticked, and that box starts unticked when nothing is running, so after a
+        # crash a plain Start silently ignored the old volumes and wrote new results straight
+        # into the same folders. In bind mode the start simply continues without volumes
+        # after the copy (or the discard).
+        $volPairs = @(
+            @{ Name = $volOut; HostDir = $outputDir },
+            @{ Name = $volSyn; HostDir = $synthDir }
+        )
+        $leftovers = @()
+        foreach ($vp in $volPairs) {
+            $vi = Get-ImpactVolumeInfo -State $State -VolumeName $vp.Name
+            if ($null -eq $vi.Exists) {
+                [System.Windows.Forms.MessageBox]::Show("Could not check the Docker volume '$($vp.Name)':`n$($vi.Error)`n`nCheck that Docker is running and try again.",'Volume check failed','OK','Error') | Out-Null
+                return
+            }
+            if ($vi.Exists) {
+                if ($vi.UsedBy.Count -gt 0) {
+                    [System.Windows.Forms.MessageBox]::Show("The Docker volume '$($vp.Name)' is still used by: $($vi.UsedBy -join ', ').`n`nStop or remove that container first.",'Volume in use','OK','Error') | Out-Null
+                    return
+                }
+                # Prefer the folder recorded when the volume was created: the YAML may point
+                # somewhere else now.
+                $target = if ($vi.TargetDir) { $vi.TargetDir } else { $vp.HostDir }
+                $leftovers += [pscustomobject]@{ Name = $vp.Name; Target = $target }
+            }
+        }
+        if ($leftovers.Count -gt 0) {
+            $leftList = ($leftovers | ForEach-Object { "  - $($_.Name)`n      -> $($_.Target)" }) -join "`n"
+            $leftMsg = "Docker volumes from an earlier session of '$($State.ContainerName)' still exist:`n`n$leftList`n`nThey may contain results that were never copied back (for example after a crash, a reboot or a failed Stop).`n`nYes: copy their contents into the folders shown above, then start (recommended). Files in those folders that are newer than the copy in the volume are kept.`nNo: delete them WITHOUT copying, then start.`nCancel: do nothing."
+            $leftChoice = [System.Windows.Forms.MessageBox]::Show($leftMsg, 'Earlier results found', [System.Windows.Forms.MessageBoxButtons]::YesNoCancel, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button1)
+            if ($leftChoice -eq [System.Windows.Forms.DialogResult]::Yes) {
+                # Copying large results can take a while: busy mode (see Set-ManagerBusy).
+                Set-ManagerBusy -Busy $true -Message 'Copying earlier results from the Docker volumes...'
+                try {
+                    foreach ($lo in $leftovers) {
+                        $lblStatus.Text = "Copying earlier results from $($lo.Name)..."
+                        $form.Refresh()
+                        # -KeepNewerOnHost (B3-R1): files written into the folder AFTER that
+                        # earlier session (for example by a run without volumes) are newer and
+                        # must not be replaced by the older copy from the volume.
+                        $syncLeft = Sync-ImpactVolumeToHost -State $State -VolumeName $lo.Name -HostDir $lo.Target -KeepNewerOnHost
+                        if (-not $syncLeft.Success) {
+                            [System.Windows.Forms.MessageBox]::Show("$($syncLeft.Message)`n`nNothing was deleted: the volume still holds the data. The container was not started.",'Copy failed','OK','Error') | Out-Null
+                            return
+                        }
+                    }
+                } finally {
+                    Set-ManagerBusy -Busy $false
+                }
+            } elseif ($leftChoice -eq [System.Windows.Forms.DialogResult]::No) {
+                $confirmDiscard = [System.Windows.Forms.MessageBox]::Show("Really delete these volumes and everything in them? This cannot be undone.`n`n$leftList", 'Delete earlier results?', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+                if ($confirmDiscard -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+            } else {
+                return
+            }
+            # Only reached when the copy succeeded or the user explicitly chose to discard.
+            $rmLeftOut = & docker @ctxPrefix (@('volume','rm') + @($leftovers | ForEach-Object { $_.Name })) 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                [System.Windows.Forms.MessageBox]::Show("Could not remove the old Docker volumes:`n$rmLeftOut",'Volume error','OK','Error') | Out-Null
+                return
+            }
+            Write-Log "Removed earlier volumes: $(($leftovers | ForEach-Object { $_.Name }) -join ', ')" 'Info'
+        }
+
+        if ($useVolumes) {
+            # F17: the rsync-alpine helper is needed to copy results back at Stop. Check that it
+            # really exists BEFORE any volume is created; the old code ignored a failed build,
+            # so the problem only appeared hours later when Stop could not copy the results.
+            Write-Log 'Checking/building rsync-alpine helper image.' 'Debug'
+            if (-not (Initialize-RsyncHelperImage -State $State)) {
+                [System.Windows.Forms.MessageBox]::Show("The helper image needed for 'Use Docker Volumes' (rsync-alpine) could not be prepared. Usually Docker could not download the small Alpine Linux image (no internet access, a proxy, or a Docker Hub download limit).`n`nUntick 'Use Docker Volumes' to start without volumes, or check the network and try again.",'Volume helper missing','OK','Error') | Out-Null
+                return
+            }
+        }
+
+        # Build image name. ToLowerInvariant, not ToLower: with a Turkish regional format
+        # ToLower() turns 'I' into a dotless i, which Docker rejects as an image name (B2-R4).
+        $imageName = $State.SelectedRepo.ToLowerInvariant()
+
+        # Check image exists unless rebuild
+        $imageExists = $false
+        if (-not $rebuild) {
+            $imgCmd = (Get-DockerContextArgs -State $State) + @('images','--format','{{.Repository}}')
+            # Check the exit code (B4-R3): when 'docker images' itself fails (Docker or the
+            # connection to the workstation went away), that used to look like "image
+            # missing" and started a full image build that could only fail.
+            $imgOut = @(& docker @imgCmd 2>$null)
+            $imgExit = $LASTEXITCODE
+            if ($imgExit -ne 0) {
+                Write-Log "docker images failed (exit $imgExit); not starting a build." 'Warn'
+                [System.Windows.Forms.MessageBox]::Show("Docker is not reachable (Docker Desktop on this PC, or Docker on the workstation), so IMPACT cannot check whether the image already exists.`n`nCheck that Docker is running and that the network or VPN connection works, then click Start again.",'Docker not reachable','OK','Error') | Out-Null
+                return
+            }
+            $imageExists = [bool]($imgOut | Where-Object { "$_".Trim() -eq $imageName })
+        }
+
+        $dockerfileMain = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup 'Dockerfile.IMPACTncdGER' } else { "$dockerSetup/Dockerfile.IMPACTncdGER" }
+        $dockerContext  = $projectRoot
+        if (-not $dockerContext) {
+            [System.Windows.Forms.MessageBox]::Show('Repository path missing; cannot build image.','Missing path','OK','Error') | Out-Null
+            return
+        }
+
+        if (-not $imageExists) {
+            Write-Log "Building image $imageName (streaming output)..." 'Info'
+
+            # Wraps one command-line argument in double quotes when needed. Start-Process joins
+            # its -ArgumentList items with plain spaces and adds no quotes, so an item containing
+            # a space (for example a key file under 'C:\Users\Max Mustermann\.ssh') used to reach
+            # ssh as two separate arguments, and the build failed. This follows the standard
+            # Windows rules: a " inside becomes \" and backslashes right before a " are doubled.
+            function ConvertTo-QuotedArgument {
+                param([string]$Value)
+                if ($Value -and $Value -notmatch '[\s"]') { return $Value }
+                $escaped = $Value -replace '(\\*)"', '$1$1\"'
+                $escaped = $escaped -replace '(\\+)$', '$1$1'
+                return '"' + $escaped + '"'
+            }
+
+            # Runs one 'docker build' and returns $true when it succeeded. LOCAL builds run docker
+            # on this PC from inside the build context folder; REMOTE builds run docker on the
+            # workstation over SSH. Start-Process -NoNewWindow is kept (instead of '& docker')
+            # because it streams the build log live into the console window, which is where the
+            # user can follow the progress. One helper replaces four copies of the same code.
+            # -NoCache $false lets a RETRY reuse the layers that the failed attempt built a few
+            # minutes earlier, instead of starting from zero again (B4-R2).
+            function Invoke-StartImageBuild {
+                param([string]$Dockerfile, [string]$Tag, [string]$Context, [bool]$WithRepoArg, [bool]$NoCache = $true)
+                try {
+                    if ($State.ContainerLocation -eq 'LOCAL') {
+                        # '--context local' (from Get-DockerContextArgs) builds on the SAME Docker
+                        # engine that the image check and 'docker run' use. Without it the build
+                        # went to the global (or DOCKER_CONTEXT) engine, so the image could be
+                        # built where it was not looked for, and every Start rebuilt it (B4-R8).
+                        $buildArgs = @(Get-DockerContextArgs -State $State) + @('build')
+                        if ($WithRepoArg) { $buildArgs += @('--build-arg', "REPO_NAME=$($State.SelectedRepo)") }
+                        $buildArgs += @('-f', $Dockerfile, '-t', $Tag)
+                        if ($NoCache) { $buildArgs += '--no-cache' }
+                        $buildArgs += @('--progress=plain', '.')
+                        $argString = ($buildArgs | ForEach-Object { ConvertTo-QuotedArgument $_ }) -join ' '
+                        # -LiteralPath: brackets in a folder name are not wildcards (B2-R3).
+                        Push-Location -LiteralPath $Context
+                        try {
+                            $p = Start-Process -FilePath 'docker' -ArgumentList $argString -Wait -PassThru -NoNewWindow
+                            return ($p.ExitCode -eq 0)
+                        } finally { Pop-Location }
+                    }
+                    # Every value is quoted for the workstation's shell with ConvertTo-PosixShellLiteral
+                    # (B4-R7). REPO_NAME used to be unquoted, so a name with a space was split by the shell.
+                    $repoArg = if ($WithRepoArg) { "--build-arg $(ConvertTo-PosixShellLiteral -Value "REPO_NAME=$($State.SelectedRepo)") " } else { '' }
+                    $cacheArg = if ($NoCache) { ' --no-cache' } else { '' }
+                    $cmd = "cd $(ConvertTo-PosixShellLiteral -Value $Context) && docker build $($repoArg)-f $(ConvertTo-PosixShellLiteral -Value $Dockerfile) -t $(ConvertTo-PosixShellLiteral -Value $Tag)$cacheArg ."
+                    $sshArgs = @('-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=30','-o','BatchMode=yes','-o','PasswordAuthentication=no','-o','PubkeyAuthentication=yes','-o','IdentitiesOnly=yes','-i',$State.Paths.SshPrivate,(Get-RemoteHostString -State $State),$cmd)
+                    $argString = ($sshArgs | ForEach-Object { ConvertTo-QuotedArgument $_ }) -join ' '
+                    $p = Start-Process -FilePath 'ssh' -ArgumentList $argString -Wait -NoNewWindow -PassThru
+                    return ($p.ExitCode -eq 0)
+                } catch {
+                    Write-Log "Could not run docker build: $($_.Exception.Message)" 'Warn'
+                    return $false
+                }
+            }
+
+            $buildSucceeded = $false
+            $buildStart = Get-Date
+            # A build can take a long time and blocks this window meanwhile, so switch to busy
+            # mode (buttons disabled, status text, wait cursor, closing refused). The 'finally'
+            # below always switches it off again, also on the early 'return' paths.
+            Set-ManagerBusy -Busy $true -Message 'Building the Docker image (30+ min). Progress: see the console window.'
+            try {
+                $buildSucceeded = Invoke-StartImageBuild -Dockerfile $dockerfileMain -Tag $imageName -Context $dockerContext -WithRepoArg $true
+
+                if (-not $buildSucceeded -and $State.ContainerLocation -like 'REMOTE@*') {
+                    # REMOTE build failed: try an automatic docker login from the repo .env and
+                    # retry once. This used to be guarded by $State.Metadata.RemoteLoginAttempted,
+                    # but that key was never created, and reading a missing key crashes under
+                    # StrictMode, so this whole recovery path could never run. It runs at most once
+                    # per Start click anyway, so no flag is needed.
+                    Write-Log 'Remote build failed; attempting automatic remote docker login from repo .env and retrying build.' 'Info'
+                    try {
+                        if (Ensure-RemoteDockerLogin -State $State -ProjectRoot $projectRoot) {
+                            Write-Log 'Remote docker login from .env succeeded; retrying build.' 'Info'
+                            # While already busy this only updates the status text.
+                            Set-ManagerBusy -Busy $true -Message 'Retrying the image build after docker login. Progress: see the console window.'
+                            # Reuse the layers the first attempt already built (B4-R2).
+                            $buildSucceeded = Invoke-StartImageBuild -Dockerfile $dockerfileMain -Tag $imageName -Context $dockerContext -WithRepoArg $true -NoCache $false
+                            if ($buildSucceeded) { Write-Log 'Remote build succeeded after login; continuing.' 'Info' }
+                        } else {
+                            Write-Log 'Automatic remote docker login from .env did not provide credentials or failed.' 'Debug'
+                        }
+                    } catch { Write-Log "Remote login attempt failed: $($_.Exception.Message)" 'Warn' }
+                }
+
+                # Only fall back to the prerequisite build if the image is STILL not built. Before,
+                # this ran even after the login retry had succeeded, starting two more long builds
+                # and possibly reporting a failure for an image that was already built.
+                if (-not $buildSucceeded) {
+                    # B4-R2: the fallback runs two more long builds (prerequisite image, then the
+                    # main image again), so ask first instead of silently blocking the window for
+                    # another hour. 'Yes' is the default, as the fallback used to run automatically.
+                    $fallbackAnswer = [System.Windows.Forms.MessageBox]::Show("Building the Docker image failed. The console window shows why.`n`nIMPACT can try a fallback: build the prerequisite image first, then the main image again. This can take another 30-60 minutes.`n`nTry the fallback build now?",'Image build failed',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Warning,[System.Windows.Forms.MessageBoxDefaultButton]::Button1)
+                    if ($fallbackAnswer -ne [System.Windows.Forms.DialogResult]::Yes) {
+                        Write-Log 'Image build failed; user declined the prerequisite fallback build.' 'Warn'
+                        [System.Windows.Forms.MessageBox]::Show('Docker build failed. See console output for details.','Build failed','OK','Error') | Out-Null
+                        return
+                    }
+                    Write-Log 'Main image build failed; attempting prerequisite build fallback.' 'Warn'
+                    Set-ManagerBusy -Busy $true -Message 'Fallback: building the prerequisite image. Progress: see the console window.'
+                    $prereqDockerfile = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup 'Dockerfile.prerequisite.IMPACTncdGER' } else { "$dockerSetup/Dockerfile.prerequisite.IMPACTncdGER" }
+                    $prereqContext = if ($State.ContainerLocation -eq 'LOCAL') { Join-Path $dockerSetup '.' } else { "$dockerSetup" }
+                    $preSuccess = Invoke-StartImageBuild -Dockerfile $prereqDockerfile -Tag "$imageName-prerequisite" -Context $prereqContext -WithRepoArg $false
+
+                    if (-not $preSuccess) {
+                        [System.Windows.Forms.MessageBox]::Show('Docker build failed (including prerequisite fallback).','Build failed','OK','Error') | Out-Null
+                        return
+                    }
+
+                    # Retry main build after prerequisite. The cache is allowed here (B4-R2):
+                    # layers based on the new prerequisite image are rebuilt anyway, the rest is reused.
+                    Set-ManagerBusy -Busy $true -Message 'Fallback: building the main image again. Progress: see the console window.'
+                    $buildSucceeded = Invoke-StartImageBuild -Dockerfile $dockerfileMain -Tag $imageName -Context $dockerContext -WithRepoArg $true -NoCache $false
+                }
+
+                $elapsed = (Get-Date) - $buildStart
+                Write-Log "Docker build duration: $([int]$elapsed.TotalSeconds)s" 'Info'
+                Write-Log "Docker build success=$buildSucceeded" 'Debug'
+                if (-not $buildSucceeded) {
+                    [System.Windows.Forms.MessageBox]::Show('Docker build failed. See console output for details.','Build failed','OK','Error') | Out-Null
+                    return
+                }
+            } finally {
+                Set-ManagerBusy -Busy $false
+            }
+        }
+
+        # Busy mode for the rest of Start as well: creating and filling the volumes, 'docker
+        # run' and the set-up steps inside the container all block this window (several ssh
+        # round trips on the workstation). Same pattern as the image build above; the
+        # 'finally' at the end of this part always switches busy mode off again, also on the
+        # early 'return' paths. The code between 'try {' and '} finally {' is deliberately not
+        # indented one level deeper, to keep this change small and easy to compare.
+        Set-ManagerBusy -Busy $true -Message 'Starting the container. Please wait...'
+        try {
+
+        # Capture git baseline best-effort
+        $State.Metadata.GitBaseline = $null
+        try {
+            if ($State.ContainerLocation -eq 'LOCAL') {
+                # 'git -C <folder>' runs git in that folder without changing PowerShell's current
+                # folder. The old Push-Location/Pop-Location pair skipped Pop-Location when git
+                # failed (for example git not installed), which left the current folder at the
+                # repository root; a later 'docker build ... .' then uploaded the whole repository
+                # as build context.
+                $hash = git -C $projectRoot rev-parse HEAD 2>$null
+                $status = git -C $projectRoot status --porcelain 2>$null
+                $State.Metadata.GitBaseline = @{ Repo=$projectRoot; Commit=$hash; Status=$status; Timestamp=Get-Date }
+            } else {
+                $remoteHost = Get-RemoteHostString -State $State
+                $keyPath = $State.Paths.SshPrivate
+                # The workstation folder name is quoted safely for its shell (B4-R7): plain '...'
+                # broke on a ' in the name and let a crafted folder name run shell commands.
+                $projectRootQ = ConvertTo-PosixShellLiteral -Value $projectRoot
+                $hash = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cd $projectRootQ && git rev-parse HEAD" 2>$null
+                $status = & ssh -n -i $keyPath -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o ConnectTimeout=15 -o BatchMode=yes $remoteHost "cd $projectRootQ && git status --porcelain" 2>$null
+                $State.Metadata.GitBaseline = @{ Repo=$projectRoot; Commit=$hash; Status=$status; Timestamp=Get-Date }
+            }
+            Write-Log "Captured git baseline: commit=$hash" 'Debug'
+        } catch {
+            Write-Log "Git baseline capture failed: $($_.Exception.Message)" 'Debug'
+            $State.Metadata.GitBaseline = $null
+        }
+
+        # $outputDir and $synthDir were resolved and checked before the image build (see Confirm-YamlFolder above)
+
+        $State.Paths.OutputDir = $outputDir
+        $State.Paths.SynthpopDir = $synthDir
 
         # Resolve the actual uid/gid of the host user so the container's rstudio
         # user matches.  This prevents the container from changing ownership of
@@ -2025,82 +2321,13 @@ function Show-ContainerManager {
         }
 
         if ($useVolumes) {
-            # F48: names include the container name (repo + user), so two repos no longer share volumes.
-            $volNames = Get-ImpactVolumeNames -ContainerName $State.ContainerName
-            $volOut = $volNames.Output
-            $volSyn = $volNames.Synthpop
             # Not yet recorded in the state: $removeFreshVolumes must not touch these volumes
             # before they were really created by this click.
             $State.Metadata.VolumeOutput = $null
             $State.Metadata.VolumeSynthpop = $null
 
-            $ctxPrefix = Get-DockerContextArgs -State $State
-
-            # F17: the rsync-alpine helper is needed to copy results back at Stop. Check that it
-            # really exists BEFORE any volume is created; the old code ignored a failed build,
-            # so the problem only appeared hours later when Stop could not copy the results.
-            Write-Log 'Checking/building rsync-alpine helper image.' 'Debug'
-            if (-not (Initialize-RsyncHelperImage -State $State)) {
-                [System.Windows.Forms.MessageBox]::Show("The helper image needed for 'Use Docker Volumes' (rsync-alpine) could not be prepared. Usually Docker could not download the small Alpine Linux image (no internet access, a proxy, or a Docker Hub download limit).`n`nUntick 'Use Docker Volumes' to start without volumes, or check the network and try again.",'Volume helper missing','OK','Error') | Out-Null
-                return
-            }
-
-            # F02: volumes with these names may be left over from an earlier session that was
-            # never copied back (crash, reboot, Docker restart, or a failed Stop). They may hold
-            # the ONLY copy of results, so never delete them silently: copy them out first, or
-            # ask the user.
-            $volPairs = @(
-                @{ Name = $volOut; HostDir = $outputDir },
-                @{ Name = $volSyn; HostDir = $synthDir }
-            )
-            $leftovers = @()
-            foreach ($vp in $volPairs) {
-                $vi = Get-ImpactVolumeInfo -State $State -VolumeName $vp.Name
-                if ($null -eq $vi.Exists) {
-                    [System.Windows.Forms.MessageBox]::Show("Could not check the Docker volume '$($vp.Name)':`n$($vi.Error)`n`nCheck that Docker is running and try again.",'Volume check failed','OK','Error') | Out-Null
-                    return
-                }
-                if ($vi.Exists) {
-                    if ($vi.UsedBy.Count -gt 0) {
-                        [System.Windows.Forms.MessageBox]::Show("The Docker volume '$($vp.Name)' is still used by: $($vi.UsedBy -join ', ').`n`nStop or remove that container first.",'Volume in use','OK','Error') | Out-Null
-                        return
-                    }
-                    # Prefer the folder recorded when the volume was created: the YAML may point
-                    # somewhere else now.
-                    $target = if ($vi.TargetDir) { $vi.TargetDir } else { $vp.HostDir }
-                    $leftovers += [pscustomobject]@{ Name = $vp.Name; Target = $target }
-                }
-            }
-            if ($leftovers.Count -gt 0) {
-                $leftList = ($leftovers | ForEach-Object { "  - $($_.Name)`n      -> $($_.Target)" }) -join "`n"
-                $leftMsg = "Docker volumes from an earlier session of '$($State.ContainerName)' still exist:`n`n$leftList`n`nThey may contain results that were never copied back (for example after a crash, a reboot or a failed Stop).`n`nYes: copy their contents into the folders shown above, then start (recommended).`nNo: delete them WITHOUT copying, then start.`nCancel: do nothing."
-                $leftChoice = [System.Windows.Forms.MessageBox]::Show($leftMsg, 'Earlier results found', [System.Windows.Forms.MessageBoxButtons]::YesNoCancel, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button1)
-                if ($leftChoice -eq [System.Windows.Forms.DialogResult]::Yes) {
-                    foreach ($lo in $leftovers) {
-                        $lblStatus.Text = "Copying earlier results from $($lo.Name)..."
-                        $form.Refresh()
-                        $syncLeft = Sync-ImpactVolumeToHost -State $State -VolumeName $lo.Name -HostDir $lo.Target
-                        if (-not $syncLeft.Success) {
-                            $lblStatus.Text = ''
-                            [System.Windows.Forms.MessageBox]::Show("$($syncLeft.Message)`n`nNothing was deleted: the volume still holds the data. The container was not started.",'Copy failed','OK','Error') | Out-Null
-                            return
-                        }
-                    }
-                    $lblStatus.Text = ''
-                } elseif ($leftChoice -eq [System.Windows.Forms.DialogResult]::No) {
-                    $confirmDiscard = [System.Windows.Forms.MessageBox]::Show("Really delete these volumes and everything in them? This cannot be undone.`n`n$leftList", 'Delete earlier results?', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
-                    if ($confirmDiscard -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-                } else {
-                    return
-                }
-                # Only reached when the copy succeeded or the user explicitly chose to discard.
-                $rmLeftOut = & docker @ctxPrefix (@('volume','rm') + @($leftovers | ForEach-Object { $_.Name })) 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    [System.Windows.Forms.MessageBox]::Show("Could not remove the old Docker volumes:`n$rmLeftOut",'Volume error','OK','Error') | Out-Null
-                    return
-                }
-                Write-Log "Removed earlier volumes: $(($leftovers | ForEach-Object { $_.Name }) -join ', ')" 'Info'
-            }
+            # (The volume names, the rsync-alpine helper check and the check for volumes left
+            # over from an earlier session now run BEFORE the image build, see above.)
 
             # Create the volumes. The label records the host folder each one belongs to, so a
             # later Start can copy leftovers to the right place even if the YAML changed.
@@ -2171,7 +2398,9 @@ function Show-ContainerManager {
         # volume names) as Docker labels. A GUI that is closed and reopened reads them back
         # (Get-ContainerRuntimeInfo), for LOCAL and REMOTE alike, so Stop can still copy the
         # results to the right folders.
-        $dockerArgs += @(Get-ImpactContainerLabelArgs -UseVolumes $useVolumes -OutputDir $outputDir -SynthpopDir $synthDir -VolumeOutput $State.Metadata.VolumeOutput -VolumeSynthpop $State.Metadata.VolumeSynthpop)
+        # F84: -RepoPath also records WHICH repository folder is mounted, so a reopened GUI
+        # can notice when the user selected a different clone with the same folder name.
+        $dockerArgs += @(Get-ImpactContainerLabelArgs -UseVolumes $useVolumes -OutputDir $outputDir -SynthpopDir $synthDir -VolumeOutput $State.Metadata.VolumeOutput -VolumeSynthpop $State.Metadata.VolumeSynthpop -RepoPath $projectRoot)
 
         # Only the private key comes from the host. github.com's host key is
         # written inside the container below (Get-ContainerSshSetupCommand).
@@ -2240,7 +2469,14 @@ function Show-ContainerManager {
         #    fast-forward isn't possible. We override at global level so git pull
         #    works like GitKraken / vanilla-git (merge when not fast-forwardable).
         # 3. safe.directory='*' is a safety net for any remaining ownership edge cases.
-        $gitCfgCmd = "git config --global user.name '$($State.UserName)' && git config --global user.email '$($State.UserName)@users.noreply.github.com' && git config --global pull.ff true && git config --global pull.rebase false && git config --global --add safe.directory '*' && echo GIT_CONFIGURED"
+        # 4. url...insteadOf (B5-R2): the container only has the user's SSH key (see
+        #    GIT_SSH_COMMAND), no HTTPS login. A repository cloned with an https://github.com
+        #    address (typical for GitHub Desktop clones) could therefore never push, or pull a
+        #    private repository, from RStudio's Git pane. This setting makes git inside the
+        #    container use SSH for github.com instead. It is stored in the container's own
+        #    /home/rstudio/.gitconfig only: the repository's .git/config and the settings on
+        #    this PC or the workstation are not changed, so GitHub Desktop keeps working.
+        $gitCfgCmd = "git config --global user.name '$($State.UserName)' && git config --global user.email '$($State.UserName)@users.noreply.github.com' && git config --global pull.ff true && git config --global pull.rebase false && git config --global --add safe.directory '*' && git config --global url.git@github.com:.insteadOf https://github.com/ && echo GIT_CONFIGURED"
         $gitCfgCtx = (Get-DockerContextArgs -State $State) + @('exec', '--user', 'rstudio', $State.ContainerName, 'sh', '-c', $gitCfgCmd)
         $gitConfigured = $false
         for ($attempt = 1; $attempt -le 3 -and -not $gitConfigured; $attempt++) {
@@ -2268,7 +2504,7 @@ function Show-ContainerManager {
             Write-Log "Container $($State.ContainerName) stopped right after starting." 'Error'
             # The fresh volumes only hold copies of host files, so they can go.
             & $removeFreshVolumes
-            [System.Windows.Forms.MessageBox]::Show("The container stopped right after it was started, so RStudio is not available.`n`nCheck the console window and the log file (~/.impact_gui/logs/impact.log) for details. Ticking 'Rebuild image' and starting again often helps.",'Container stopped','OK','Error') | Out-Null
+            [System.Windows.Forms.MessageBox]::Show("The container stopped right after it was started, so RStudio is not available.`n`nCheck the console window and the log file for details:`n$(Get-ImpactLogPathText)`n`nTicking 'Rebuild image' and starting again often helps.",'Container stopped','OK','Error') | Out-Null
             return
         } elseif ($psAfterExit -ne 0) {
             # Docker could not be asked (for example a short network problem); carry on as before.
@@ -2290,6 +2526,13 @@ function Show-ContainerManager {
             Write-RemoteContainerMetadata -State $State -Port $portStore -UseVolumes $useVolumes
         }
 
+        } finally {
+            # End of busy mode for the start steps (see 'Starting the container' above). The
+            # Start/Stop buttons are switched below, AFTER this, because Set-ManagerBusy
+            # restores the button states it saved when busy mode began.
+            Set-ManagerBusy -Busy $false
+        }
+
         # F32: the recovered password/port/volume details belonged to the previous container.
         # Forget them so the info box shows the password this container really uses.
         $State.Metadata.Recovered = @{ Password = $null; Port = $null; UseVolumes = $false; OutputDir = $null; SynthpopDir = $null; VolumeOutput = $null; VolumeSynthpop = $null }
@@ -2309,17 +2552,26 @@ function Show-ContainerManager {
         $hostDisplay = if ($State.ContainerLocation -eq 'LOCAL') { "http://localhost:$($State.Metadata.ActivePort)" } else { "http://$($State.RemoteHostIp):$($State.Metadata.ActivePort)" }
         # F85: never print the password to the console (it stays visible during screen-sharing).
         Write-Host "Container ready: $hostDisplay (user: rstudio, password: the one you entered at login)" -ForegroundColor Green
-    })
+    }
 
-    $btnStop.Add_Click({
+    # The code of the Stop button, kept in a variable for the same reason as $startClickBody.
+    $stopClickBody = {
         $ctxArgs = Get-DockerContextArgs -State $State
         $runCmd = $ctxArgs + @('ps','--filter',"name=^$($State.ContainerName)$",'--format','{{.Names}}')
-        $exists = & docker $runCmd 2>$null
+        # Busy mode while Docker is asked: over a bad connection to the workstation this can
+        # take up to 30 seconds, and the window would otherwise just look frozen.
+        Set-ManagerBusy -Busy $true -Message 'Checking the container...'
+        try {
+            $exists = & docker $runCmd 2>$null
+            $psExitCode = $LASTEXITCODE
+        } finally {
+            Set-ManagerBusy -Busy $false
+        }
         # F18: a non-zero exit code means Docker (or the ssh connection to the workstation)
         # could not be reached, so we do NOT know whether the container still runs. Say so,
         # and leave state and buttons unchanged so the user can simply try again. (Before,
         # this looked the same as "container gone" and the UI wrongly showed STOPPED.)
-        if ($LASTEXITCODE -ne 0) {
+        if ($psExitCode -ne 0) {
             $where = if ($State.ContainerLocation -eq 'LOCAL') { 'Check that Docker Desktop is running.' } else { 'Check your network / VPN connection to the workstation.' }
             [System.Windows.Forms.MessageBox]::Show("Could not reach Docker, so it is unknown whether the container is still running.`n`n$where Then click Stop again.",'Docker not reachable','OK','Warning') | Out-Null
             return
@@ -2342,6 +2594,43 @@ function Show-ContainerManager {
                        "Tip: save your files in RStudio and let simulations finish first."
             $stopAnswer = [System.Windows.Forms.MessageBox]::Show($stopMsg, 'Stop container?', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
             if ($stopAnswer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        }
+
+        # Stopping, copying the results back and removing the volumes can take minutes, so
+        # all of it runs in busy mode (buttons disabled, closing refused). The Start/Stop
+        # buttons and the final status text are set AFTER the 'finally' below, because
+        # Set-ManagerBusy restores the button states it saved when busy mode began. The code
+        # between 'try {' and '} finally {' is deliberately not indented one level deeper,
+        # to keep this change small and easy to compare.
+        $volumeProblem = $null
+        # The volumes that are KEPT because their results were not copied back.
+        $keptVolumes = @()
+        Set-ManagerBusy -Busy $true -Message 'Stopping the container. Please wait...'
+        try {
+
+        if (-not $alreadyGone) {
+            # B3-R5: ask the container once more how it was started, right before it is
+            # deleted. When the GUI reconnected to a running container and that first
+            # 'docker inspect' failed, volume mode looked "off", and Stop skipped the copy
+            # while the results stayed in the volumes without a word. Only answers that
+            # really came back are used; everything else keeps what is already known.
+            $rt = Get-ContainerRuntimeInfo -State $State
+            if ($null -ne $rt.UseVolumes) {
+                $State.Metadata.ActiveUseVolumes = [bool]$rt.UseVolumes
+                if ($rt.UseVolumes) {
+                    $fallbackNames = Get-ImpactVolumeNames -ContainerName $State.ContainerName
+                    $State.Metadata.VolumeOutput = if ($rt.VolumeOutput) { $rt.VolumeOutput } elseif ($State.Metadata['VolumeOutput']) { $State.Metadata['VolumeOutput'] } else { $fallbackNames.Output }
+                    $State.Metadata.VolumeSynthpop = if ($rt.VolumeSynthpop) { $rt.VolumeSynthpop } elseif ($State.Metadata['VolumeSynthpop']) { $State.Metadata['VolumeSynthpop'] } else { $fallbackNames.Synthpop }
+                }
+                if ($rt.OutputDir) { $State.Paths.OutputDir = $rt.OutputDir }
+                if ($rt.SynthpopDir) { $State.Paths.SynthpopDir = $rt.SynthpopDir }
+            }
+            # F84: check git changes in the folder the container really mounts.
+            $labelRepo = Get-DifferentLabelRepoPath -LabelPath $rt.RepoPath -SelectedPath $State.Metadata.ActiveRepoPath
+            if ($labelRepo) {
+                Write-Log "Container $($State.ContainerName) uses repository folder '$labelRepo'; git changes are checked there." 'Warn'
+                $State.Metadata.ActiveRepoPath = $labelRepo
+            }
 
             $stopCmd = $ctxArgs + @('stop',$State.ContainerName)
             Write-Log "Stopping container $($State.ContainerName)" 'Info'
@@ -2357,46 +2646,55 @@ function Show-ContainerManager {
         # fallback any more: it describes the next start, not the container being stopped.
         $useVolumesForStop = [bool]$State.Metadata.ActiveUseVolumes
         Write-Log "Stop clicked; volumesUsed=$useVolumesForStop" 'Debug'
-        $volumeProblem = $null
         if ($useVolumesForStop) {
-            $volOut = $State.Metadata.VolumeOutput
-            $volSyn = $State.Metadata.VolumeSynthpop
-            # F01: the volumes are deleted ONLY when both copies succeeded. Before, they were
+            # ['...'] instead of .Name: under StrictMode a missing key would throw.
+            $volOut = $State.Metadata['VolumeOutput']
+            $volSyn = $State.Metadata['VolumeSynthpop']
+            # F01: a volume is deleted ONLY after its copy succeeded. Before, they were
             # always deleted, even when the copy failed or the target folder was unknown
             # (a resumed session), which lost all results of the run.
             if (-not $volOut -or -not $volSyn) {
                 $volumeProblem = 'The names of the Docker volumes are unknown.'
+                $keptVolumes = @(@($volOut, $volSyn) | Where-Object { $_ })
             } elseif (-not $State.Paths.OutputDir -or -not $State.Paths.SynthpopDir) {
                 $volumeProblem = 'The folders to copy the results back to are unknown (the container was probably started by an older version of this tool).'
+                $keptVolumes = @($volOut, $volSyn)
             } else {
                 $lblStatus.Text = 'Copying results from the Docker volumes back to your folders...'
                 $form.Refresh()
                 $syncOut = Sync-ImpactVolumeToHost -State $State -VolumeName $volOut -HostDir $State.Paths.OutputDir
                 $syncSyn = Sync-ImpactVolumeToHost -State $State -VolumeName $volSyn -HostDir $State.Paths.SynthpopDir
-                if ($syncOut.Success -and $syncSyn.Success) {
-                    $toRemove = @()
-                    if (-not $syncOut.Missing) { $toRemove += $volOut }
-                    if (-not $syncSyn.Missing) { $toRemove += $volSyn }
-                    if ($toRemove.Count -gt 0) {
-                        # Retry briefly: '--rm' may still be removing the stopped container,
-                        # and a volume cannot be removed while a container uses it.
-                        # '-f' only ignores volumes that are already gone.
-                        $removed = $false
-                        $rmOut = $null
-                        for ($i = 1; $i -le 5 -and -not $removed; $i++) {
-                            $rmOut = & docker @ctxArgs (@('volume','rm','-f') + $toRemove) 2>&1
-                            if ($LASTEXITCODE -eq 0) { $removed = $true } else { Start-Sleep -Seconds 1 }
-                        }
-                        if ($removed) {
-                            Write-Log "Removed volumes $($toRemove -join ', ') after a successful copy." 'Info'
-                        } else {
-                            # Not a data loss: everything was copied. The volumes only use disk space.
-                            Write-Log "Results were copied, but volumes $($toRemove -join ', ') could not be removed: $rmOut" 'Warn'
-                        }
+                # B3-R1 (c): decide for EACH volume on its own. Before, both volumes were kept
+                # when only one copy failed, so the volume that HAD been copied was copied
+                # again at a later Start, over files that may have changed since.
+                $toRemove = @()
+                $syncProblems = @()
+                foreach ($sv in @(@{ Name = $volOut; Result = $syncOut }, @{ Name = $volSyn; Result = $syncSyn })) {
+                    if ($sv.Result.Success) {
+                        if (-not $sv.Result.Missing) { $toRemove += $sv.Name }
+                    } else {
+                        $keptVolumes += $sv.Name
+                        $syncProblems += $sv.Result.Message
                     }
-                } else {
-                    $volumeProblem = (@($syncOut, $syncSyn) | Where-Object { -not $_.Success } | ForEach-Object { $_.Message }) -join "`n"
                 }
+                if ($toRemove.Count -gt 0) {
+                    # Retry briefly: '--rm' may still be removing the stopped container,
+                    # and a volume cannot be removed while a container uses it.
+                    # '-f' only ignores volumes that are already gone.
+                    $removed = $false
+                    $rmOut = $null
+                    for ($i = 1; $i -le 5 -and -not $removed; $i++) {
+                        $rmOut = & docker @ctxArgs (@('volume','rm','-f') + $toRemove) 2>&1
+                        if ($LASTEXITCODE -eq 0) { $removed = $true } else { Start-Sleep -Seconds 1 }
+                    }
+                    if ($removed) {
+                        Write-Log "Removed volumes $($toRemove -join ', ') after a successful copy." 'Info'
+                    } else {
+                        # Not a data loss: everything was copied. The volumes only use disk space.
+                        Write-Log "Results were copied, but volumes $($toRemove -join ', ') could not be removed: $rmOut" 'Warn'
+                    }
+                }
+                if ($syncProblems.Count -gt 0) { $volumeProblem = $syncProblems -join "`n" }
             }
         }
 
@@ -2411,6 +2709,11 @@ function Show-ContainerManager {
         # freed is not rejected as 'already in use'.
         $State.Ports.Used = @(Get-UsedPorts -ContextArgs $ctxArgs)
 
+        } finally {
+            # End of busy mode for the stop steps (see 'Stopping the container' above).
+            Set-ManagerBusy -Busy $false
+        }
+
         Update-InfoBox -Status 'STOPPED'
         $btnStart.Enabled = $true
         $btnStop.Enabled  = $false
@@ -2418,31 +2721,66 @@ function Show-ContainerManager {
 
         if ($volumeProblem) {
             # Shown before the git dialog because it is about possible data loss.
-            $volList = (@($State.Metadata.VolumeOutput, $State.Metadata.VolumeSynthpop) | Where-Object { $_ }) -join ', '
+            $volList = if ($keptVolumes.Count -gt 0) { $keptVolumes -join ', ' } else { '(names unknown)' }
             Write-Log "Results were NOT copied back; volumes kept: $volList. Reason: $volumeProblem" 'Error'
             # The next Start only recognises volumes named the current way; volumes of a
             # container started by an older version need manual help.
             $expectedNames = Get-ImpactVolumeNames -ContainerName $State.ContainerName
-            $nextStep = if ($State.Metadata.VolumeOutput -eq $expectedNames.Output -and $State.Metadata.VolumeSynthpop -eq $expectedNames.Synthpop) {
-                "The next time you click Start with 'Use Docker Volumes' ticked, the tool offers to copy them into your folders. If that does not work, ask the maintainer for help and quote the volume names above."
+            $otherNamed = @($keptVolumes | Where-Object { $_ -ne $expectedNames.Output -and $_ -ne $expectedNames.Synthpop })
+            $nextStep = if ($keptVolumes.Count -gt 0 -and $otherNamed.Count -eq 0) {
+                "The next time you click Start, the tool offers to copy them into your folders. If that does not work, ask the maintainer for help and quote the volume names above."
             } else {
                 "Please do not delete them. Ask the maintainer to copy them for you and quote the volume names above."
             }
-            [System.Windows.Forms.MessageBox]::Show("Your results were NOT copied back to your folders, so the Docker volumes were kept (nothing was deleted):`n`n  $volList`n`nReason:`n$volumeProblem`n`n$nextStep",'Results still in Docker volumes','OK','Error') | Out-Null
+            [System.Windows.Forms.MessageBox]::Show("Your results were NOT copied back to your folders, so these Docker volumes were kept (nothing was deleted):`n`n  $volList`n`nReason:`n$volumeProblem`n`n$nextStep",'Results still in Docker volumes','OK','Error') | Out-Null
         }
 
+        # B5-R1 / B3-R3: Invoke-GitChangeDetection returns {Success; Outcome; Message}. The
+        # result used to be thrown away, so the status line said 'All done' even after a
+        # failed commit or push, and a colleague then believed the work was on GitHub. The
+        # filter keeps only that result object, in case anything else was written to the
+        # output as well. Busy mode again: a push can take a while.
+        $gitResult = $null
         if ($State.Metadata.ActiveRepoPath) {
-            Invoke-GitChangeDetection -State $State -RepoPath $State.Metadata.ActiveRepoPath -IsRemote $State.Metadata.ActiveIsRemote
+            Set-ManagerBusy -Busy $true -Message 'Checking your repository for changes to commit...'
+            try {
+                $gitResult = @(Invoke-GitChangeDetection -State $State -RepoPath $State.Metadata.ActiveRepoPath -IsRemote $State.Metadata.ActiveIsRemote) |
+                    Where-Object { $_ -and $_.PSObject.Properties['Success'] } | Select-Object -Last 1
+            } finally {
+                Set-ManagerBusy -Busy $false
+            }
         }
 
         if ($volumeProblem) {
             $lblStatus.Text = 'Stopped. Results are still in Docker volumes (see the message).'
             Write-Host "Stopped, but results are still in Docker volumes: $volumeProblem" -ForegroundColor Yellow
+        } elseif ($gitResult -and (-not $gitResult.Success -or $gitResult.Outcome -eq 'Unavailable')) {
+            # 'Unavailable' counts as Success (nothing broke), but nothing was checked or
+            # committed either, so it must not be reported as 'All done'.
+            $lblStatus.Text = "Container stopped. $($gitResult.Message)"
+            Write-Host "Container stopped. $($gitResult.Message)" -ForegroundColor Yellow
         } else {
             $lblStatus.Text = 'All done. You can close this window or start another container.'
             Write-Host "All done. You can close this window or start another container." -ForegroundColor Green
         }
-    })
+    }
+
+    # Safety net for the Start and Stop buttons (B4-R5). Under StrictMode, with
+    # $ErrorActionPreference = 'Stop', any error nobody expected (for example reading a
+    # setting that does not exist) used to show the raw .NET "Unhandled exception"
+    # Continue/Quit dialog, which looks like a crash, and its details were not logged.
+    # Now the error is written to the log file and a plain message says where it is.
+    # 'return' inside the button code still works as before.
+    function Invoke-ManagerButtonAction {
+        param([string]$ActionDescription, [scriptblock]$ActionCode)
+        try {
+            & $ActionCode
+        } catch {
+            Show-ImpactUnexpectedError -Action $ActionDescription -ErrorInfo $_
+        }
+    }
+    $btnStart.Add_Click({ Invoke-ManagerButtonAction -ActionDescription 'starting the container' -ActionCode $startClickBody })
+    $btnStop.Add_Click({ Invoke-ManagerButtonAction -ActionDescription 'stopping the container' -ActionCode $stopClickBody })
 
     $btnClose.Add_Click({ $form.Close() })
 
@@ -2454,10 +2792,60 @@ function Show-ContainerManager {
     return 'close'
 }
 
+# Where the log file is, as text for messages (F82, B6a-R2). Same rule as
+# Initialize-Logging in the module: $env:IMPACT_LOG_FILE if it is set, otherwise
+# ~/.impact_gui/logs/impact.log. The old messages always showed the '~' form, which was
+# wrong when IMPACT_LOG_FILE was set and means nothing to most colleagues.
+function Get-ImpactLogPathText {
+    if ($env:IMPACT_LOG_DISABLE -and $env:IMPACT_LOG_DISABLE -match '^(1|true|yes)$') {
+        return '(no log file: logging is turned off by IMPACT_LOG_DISABLE)'
+    }
+    $logPath = if ($env:IMPACT_LOG_FILE) { $env:IMPACT_LOG_FILE } else { Join-Path $HOME '.impact_gui/logs/impact.log' }
+    # GetFullPath turns the mix of / and \ into one clean Windows path for display.
+    try { $logPath = [System.IO.Path]::GetFullPath($logPath) } catch { }
+    return $logPath
+}
+
+# Shows a plain-language message for an error that nobody expected, and writes the full
+# details (message, where in the script it happened) to the log file (B4-R5). Used by the
+# Start/Stop safety net in the container manager and by the window-wide safety net that
+# is set up at the bottom of this script. -ErrorInfo takes a PowerShell error record
+# (from a catch block) or a .NET exception (from the window's ThreadException event).
+function Show-ImpactUnexpectedError {
+    param([string]$Action, $ErrorInfo)
+    try {
+        $errorRecord = $null
+        if ($ErrorInfo -is [System.Management.Automation.ErrorRecord]) {
+            $errorRecord = $ErrorInfo
+        } elseif ($ErrorInfo -is [System.Management.Automation.IContainsErrorRecord]) {
+            $errorRecord = $ErrorInfo.ErrorRecord
+        }
+        $exception = if ($errorRecord) { $errorRecord.Exception } else { $ErrorInfo }
+        $errorText = if ($exception -is [System.Exception]) { $exception.Message } else { "$ErrorInfo" }
+        $details = if ($errorRecord) { (($errorRecord | Out-String).Trim() + "`n" + $errorRecord.ScriptStackTrace) } else { "$exception" }
+        Write-Log "Unexpected error while ${Action}: $errorText`n$details" 'Error'
+        [System.Windows.Forms.MessageBox]::Show("Something unexpected went wrong while ${Action}:`n`n$errorText`n`nThe details were written to the log file:`n$(Get-ImpactLogPathText)`n`nYou can try again. If it keeps happening, please send that log file to the IMPACT maintainer.",'IMPACT - Unexpected error','OK','Error') | Out-Null
+    } catch {
+        # Last resort: never let the safety net itself crash the window.
+        try { Write-Host "Unexpected error while ${Action}: $ErrorInfo" -ForegroundColor Red } catch { }
+    }
+}
+
 # Coordinator: orchestrates all steps with clear sequencing and early validation.
 function Invoke-ImpactGui {
     Write-Log 'Starting IMPACT Docker GUI workflow.' 'Info'
-    Ensure-PowerShell7 -PS7RequestedFlag:$PS7Requested.IsPresent
+    try {
+        Ensure-PowerShell7 -PS7RequestedFlag:$PS7Requested.IsPresent
+    } catch {
+        # B6a-R2: Ensure-PowerShell7 shows its own clear message box (PowerShell too old, or
+        # missing) right before each of these deliberate stops. Mark the error as "the user
+        # has already been told", so the fatal-error handler at the bottom of this script
+        # does not show a second, confusing box. Other, unexpected errors are not marked.
+        if ($_.Exception.Message -match 'PowerShell 7|relaunch under pwsh') {
+            try { $_.Exception.Data['ImpactUserNotified'] = $true } catch { }
+        }
+        throw
+    }
     $state = New-SessionState
 
     $state.Metadata.BuildInfo = Get-BuildInfo
@@ -2512,18 +2900,49 @@ function Invoke-ImpactGui {
     }
 }
 
+# Window-wide safety net (B4-R5). An error inside ANY window event handler (a click, a
+# text change, closing a dialog) that is not caught there reaches Windows Forms. Without
+# a handler, Windows Forms shows its raw "Unhandled exception has occurred" dialog with
+# Continue/Quit, which looks like a crash to colleagues and writes nothing to our log.
+# With this handler the error is logged and explained in plain words, and the window
+# keeps working. CatchException sends such errors to the handler (it can only be set
+# before the first window exists; if that is too late, the default already does the same).
+try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    try { [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException) } catch { }
+    [System.Windows.Forms.Application]::add_ThreadException([System.Threading.ThreadExceptionEventHandler]{
+        param($eventSource, $threadErrorArgs)
+        Show-ImpactUnexpectedError -Action 'handling an action in the IMPACT window' -ErrorInfo $threadErrorArgs.Exception
+    })
+} catch {
+    Write-Log "Could not install the window error handler: $($_.Exception.Message)" 'Debug'
+}
+
 try {
     Invoke-ImpactGui
 } catch {
     # Top-level catch to prevent the EXE from closing immediately and to surface diagnostics.
     $ex = $_.Exception
-    Write-Log ("Unhandled exception: {0}`n{1}" -f $ex.Message, $ex.StackTrace) 'Error'
+    Write-Log ("Unhandled exception: {0}`n{1}`n{2}" -f $ex.Message, $_.ScriptStackTrace, $ex.StackTrace) 'Error'
     Write-Host "A fatal error occurred: $($ex.Message)" -ForegroundColor Red
-    try {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-        [System.Windows.Forms.MessageBox]::Show("IMPACT encountered a fatal error:\n$($ex.Message)\nSee the log (~/.impact_gui/logs/impact.log) for details.", 'IMPACT - Fatal error', 'OK', 'Error') | Out-Null
-    } catch { }
-    Write-Host "`nPress Enter to exit..." -ForegroundColor Yellow
-    Read-Host | Out-Null
+    # F82 / B6a-R2: real line breaks ("`n"; "\n" is not a line break in PowerShell) and the
+    # real log file path. No second box when the user has already seen an explanation
+    # (see Invoke-ImpactGui), and no extra "Press Enter" when the box was shown: IMPACT.bat
+    # already waits for a key press after an error.
+    $alreadyTold = $false
+    try { $alreadyTold = [bool]$ex.Data['ImpactUserNotified'] } catch { }
+    $boxShown = $false
+    if (-not $alreadyTold) {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+            [System.Windows.Forms.MessageBox]::Show("IMPACT encountered a fatal error and has to close:`n`n$($ex.Message)`n`nDetails are in the log file:`n$(Get-ImpactLogPathText)", 'IMPACT - Fatal error', 'OK', 'Error') | Out-Null
+            $boxShown = $true
+        } catch { }
+    }
+    if (-not $boxShown -and -not $alreadyTold) {
+        # No message box could be shown, so keep the console open long enough to read it.
+        Write-Host "`nPress Enter to exit..." -ForegroundColor Yellow
+        Read-Host | Out-Null
+    }
     exit 1
 }
