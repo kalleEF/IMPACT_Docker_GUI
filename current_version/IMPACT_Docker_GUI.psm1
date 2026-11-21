@@ -1126,7 +1126,10 @@ function Get-GitPushFailureHint {
         return 'GitHub asked for a user name and password (HTTPS remote), which this tool cannot type in. Push from RStudio instead.'
     }
     if ($o -match 'not on a branch|detached HEAD') {
-        return 'You are not on a branch (detached HEAD), so there is nothing to push. Switch to a branch in the RStudio Git pane first.'
+        # Advise CREATING a branch, not switching to one: switching away from a detached
+        # HEAD leaves its commits behind (only reachable through the reflog), so for a
+        # non-expert they would be lost. A new branch keeps them.
+        return "You are not on a branch (detached HEAD), so there is nothing to push. Put your work on a new branch first: in the RStudio Git pane click 'New Branch' (or run 'git switch -c <new-branch-name>' in the RStudio Terminal), then push."
     }
     return 'Git reported an error. The details are shown below.'
 }
@@ -1135,24 +1138,50 @@ function Get-GitRepositoryState {
     # Returns an object describing the repository:
     #   HasChanges / StatusText / Branch / Remote  (as before)
     #   Ahead               number of commits on this branch that are not on its
-    #                       upstream (GitHub) branch yet; 0 when unknown
+    #                       upstream (GitHub) branch yet; 0 when unknown. For a
+    #                       branch that was never pushed (no upstream) it counts the
+    #                       commits that are on no GitHub branch at all.
     #   HasUpstream         $false when the branch was never pushed (no upstream)
+    #   Detached            $true when no branch is checked out ("detached HEAD")
     #   Conflicts           files git still marks as conflicted (UU, AA, ...)
     #   OperationInProgress '' or 'merge' / 'rebase' / 'cherry-pick' / 'revert'
     # Returns $null when the status could not be read at all.
     param(
         [pscustomobject]$State,
         [string]$RepoPath,
-        [bool]$IsRemote
+        [bool]$IsRemote,
+        # Optional: when the function returns $null, this receives a short code saying
+        # why, so the caller can tell the user what really happened:
+        #   'GitMissing'   git is not installed on this computer (LOCAL mode only)
+        #   'Unreachable'  the workstation could not be reached over SSH
+        #   'ReadFailed'   git ran but could not read the status (not a repository,
+        #                  "dubious ownership", folder missing, ...)
+        # Usage: $why = $null; Get-GitRepositoryState ... -Reason ([ref]$why)
+        [ref]$Reason
     )
+    # Stores the reason code, but only if the caller asked for it (an unused [ref] is $null).
+    $setReason = { param([string]$Code) if ($null -ne $Reason) { $Reason.Value = $Code } }
     if (-not $RepoPath) { return $null }
     Write-Log "Checking git status for repo at $RepoPath (remote=$IsRemote)" 'Info'
+
+    # LOCAL mode needs git on THIS computer. Colleagues who only use GitHub Desktop
+    # often have no git.exe on PATH. Before, the missing command was caught further
+    # down and logged only at Debug level, so the commit dialog silently never
+    # appeared and nobody knew why. Now it is a visible warning with what to do.
+    # (REMOTE mode runs git on the workstation, so this PC does not need it.)
+    if (-not $IsRemote -and -not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Write-Log "git was not found on this computer (it is not on PATH), so the changes in $RepoPath cannot be checked or committed when the container stops. Commit them in the RStudio Git pane or with GitHub Desktop, or install Git for Windows." 'Warn'
+        & $setReason 'GitMissing'
+        return $null
+    }
 
     # Defaults, so every variable exists below even if a branch does not set it (StrictMode).
     $statusLines = @()
     $branch = ''
+    $symRef = ''
     $remote = ''
     $aheadText = ''
+    $localAheadText = ''
     $opNames = @()
     try {
         if ($IsRemote) {
@@ -1175,12 +1204,22 @@ function Get-GitRepositoryState {
             #    when the branch has no upstream (it was never pushed).
             #  - OP: lists the files git creates while a merge / rebase / cherry-pick /
             #    revert is unfinished, so we can refuse to commit in that state.
+            #  - core.quotePath=false: git prints file names with umlauts as they are,
+            #    instead of as octal codes (a u-umlaut became "\303\274"), so the
+            #    commit dialog shows names the colleague can recognise.
+            #  - SYMREF: the branch name from 'git symbolic-ref'. It prints nothing when
+            #    no branch is checked out (detached HEAD), see $detached below.
+            #  - LOCALAHEAD: only for a branch WITHOUT upstream (never pushed): how many
+            #    of its commits are on no GitHub branch at all, so they can be offered
+            #    for pushing too.
             $repoQ = ConvertTo-PosixShellLiteral -Value $RepoPath
             $cmd = "cd $repoQ || exit 1; " +
-                   "echo __IMPACT_STATUS__; git status --porcelain=v1 || echo __IMPACT_GITFAIL__; " +
+                   "echo __IMPACT_STATUS__; git -c core.quotePath=false status --porcelain=v1 || echo __IMPACT_GITFAIL__; " +
                    "echo __IMPACT_BRANCH__; git rev-parse --abbrev-ref HEAD 2>/dev/null; " +
+                   "echo __IMPACT_SYMREF__; git symbolic-ref -q --short HEAD 2>/dev/null; " +
                    "echo __IMPACT_REMOTE__; git remote get-url origin 2>/dev/null; " +
                    "echo __IMPACT_AHEAD__; git rev-list --count '@{u}..HEAD' 2>/dev/null; " +
+                   "echo __IMPACT_LOCALAHEAD__; git rev-parse -q --verify '@{u}' >/dev/null 2>&1 || git rev-list --count HEAD --not --remotes 2>/dev/null; " +
                    "echo __IMPACT_OP__; gd=`$(git rev-parse --git-dir 2>/dev/null) && for p in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do test -e `"`$gd/`$p`" && echo `$p; done; true"
             # Reset first: a mocked or failed call must not leave an old exit code behind.
             $global:LASTEXITCODE = 0
@@ -1188,24 +1227,29 @@ function Get-GitRepositoryState {
             $sshExit = $LASTEXITCODE
             $section = ''
             $gitFailed = $false
-            $parts = @{ STATUS = @(); BRANCH = @(); REMOTE = @(); AHEAD = @(); OP = @() }
+            $parts = @{ STATUS = @(); BRANCH = @(); SYMREF = @(); REMOTE = @(); AHEAD = @(); LOCALAHEAD = @(); OP = @() }
             foreach ($raw in @($out | ForEach-Object { "$_" -split "`n" })) {
                 $line = $raw.TrimEnd("`r")
                 if ($line -eq '__IMPACT_GITFAIL__') { $gitFailed = $true; continue }
-                if ($line -match '^__IMPACT_(STATUS|BRANCH|REMOTE|AHEAD|OP)__$') { $section = $matches[1]; continue }
+                if ($line -match '^__IMPACT_(STATUS|BRANCH|SYMREF|REMOTE|AHEAD|LOCALAHEAD|OP)__$') { $section = $matches[1]; continue }
                 if (-not $section -or -not $line.Trim()) { continue }
                 $parts[$section] += $line
             }
             if (-not $section -or $gitFailed) {
                 # No marker at all means ssh or 'cd' failed; GITFAIL means git status failed.
+                # ssh itself exits with 255 when it cannot connect or log in; any other
+                # code means the workstation answered but the folder or git failed.
                 Write-Log "Could not read the git status of $RepoPath on the workstation (ssh exit=$sshExit). Skipping the commit check." 'Warn'
+                & $setReason $(if (-not $section -and $sshExit -eq 255) { 'Unreachable' } else { 'ReadFailed' })
                 return $null
             }
             # "$(...)" (not [string]) so an empty section gives '' instead of $null.
             $statusLines = @($parts.STATUS)
             $branch = "$(@($parts.BRANCH) | Select-Object -First 1)"
+            $symRef = "$(@($parts.SYMREF) | Select-Object -First 1)"
             $remote = "$(@($parts.REMOTE) | Select-Object -First 1)"
             $aheadText = "$(@($parts.AHEAD) | Select-Object -First 1)"
+            $localAheadText = "$(@($parts.LOCALAHEAD) | Select-Object -First 1)"
             $opNames = @($parts.OP)
         } else {
             # -LiteralPath: a folder name with [brackets] is not treated as a wildcard.
@@ -1213,19 +1257,33 @@ function Get-GitRepositoryState {
             Push-Location -LiteralPath $RepoPath
             try {
                 $global:LASTEXITCODE = 0
-                $statusLines = @(git status --porcelain=v1 2>$null)
+                # core.quotePath=false: show umlauts in file names as they are (see the
+                # remote command above).
+                $statusLines = @(git -c core.quotePath=false status --porcelain=v1 2>$null)
                 if ($LASTEXITCODE -ne 0) {
                     # Not a repository, "dubious ownership", ...: say so instead of
                     # silently reporting "no changes".
                     Write-Log "Could not read the git status of $RepoPath (git exit=$LASTEXITCODE). Skipping the commit check." 'Warn'
+                    & $setReason 'ReadFailed'
                     return $null
                 }
                 # "$(...)" (not [string]) so a command with no output gives '' instead of $null.
                 $branch = "$(git rev-parse --abbrev-ref HEAD 2>$null)"
+                # 'HEAD' is printed both when no branch is checked out (detached HEAD) and
+                # in a brand-new repository without commits; only then do we ask
+                # symbolic-ref, which tells the two apart (see $detached below).
+                if ($branch.Trim() -eq 'HEAD') { $symRef = "$(git symbolic-ref -q --short HEAD 2>$null)" }
                 $remote = "$(git remote get-url origin 2>$null)"
                 # '@{u}' must be quoted: unquoted, PowerShell would read @{ as a hashtable.
                 # Prints nothing (and fails) when the branch has no upstream.
                 $aheadText = "$(git rev-list --count '@{u}..HEAD' 2>$null)"
+                # A branch that was never pushed has no upstream, so the count above is
+                # empty although its commits are not on GitHub. Count the commits that
+                # are on no GitHub branch at all instead (only when there is a branch
+                # and an origin to push to).
+                if (-not $aheadText.Trim() -and $branch.Trim() -and $branch.Trim() -ne 'HEAD' -and $remote.Trim()) {
+                    $localAheadText = "$(git rev-list --count HEAD --not --remotes 2>$null)"
+                }
                 # Look for the files git leaves behind while an operation is unfinished.
                 $gitDir = "$(git rev-parse --git-dir 2>$null)"
                 if ($gitDir) {
@@ -1242,27 +1300,45 @@ function Get-GitRepositoryState {
         $statusLines = @($statusLines | ForEach-Object { "$_".TrimEnd("`r") } | Where-Object { $_.Trim() })
         # Porcelain codes for files that still have merge conflicts (see 'git help status').
         $conflicts = @($statusLines | Where-Object { $_ -match '^(DD|AU|UD|UA|DU|AA|UU) ' } | ForEach-Object { $_.Substring(3) })
+        # Detached HEAD: rev-parse says 'HEAD' AND symbolic-ref names no branch. In a
+        # brand-new repository (no commits yet) symbolic-ref does name the branch, so we
+        # use that name instead of 'HEAD'.
+        $branch = $branch.Trim()
+        $symRef = $symRef.Trim()
+        $detached = $false
+        if ($branch -eq 'HEAD') {
+            if ($symRef) { $branch = $symRef } else { $detached = $true }
+        }
         $ahead = 0
         $hasUpstream = [int]::TryParse($aheadText.Trim(), [ref]$ahead)
+        if (-not $hasUpstream -and -not $detached -and $branch -and $remote.Trim()) {
+            # Never-pushed branch: use the count of commits that are on no GitHub branch.
+            $localAhead = 0
+            if ([int]::TryParse($localAheadText.Trim(), [ref]$localAhead)) { $ahead = $localAhead }
+        }
         $operation = ''
         if ($opNames -contains 'rebase-merge' -or $opNames -contains 'rebase-apply') { $operation = 'rebase' }
         elseif ($opNames -contains 'MERGE_HEAD') { $operation = 'merge' }
         elseif ($opNames -contains 'CHERRY_PICK_HEAD') { $operation = 'cherry-pick' }
         elseif ($opNames -contains 'REVERT_HEAD') { $operation = 'revert' }
 
-        Write-Log "Git status (remote=$IsRemote) lines: $([string]::Join(';', $statusLines)) branch=$branch remote=$remote ahead=$ahead upstream=$hasUpstream op=$operation" 'Debug'
+        Write-Log "Git status (remote=$IsRemote) lines: $([string]::Join(';', $statusLines)) branch=$branch detached=$detached remote=$remote ahead=$ahead upstream=$hasUpstream op=$operation" 'Debug'
         return [pscustomobject]@{
             HasChanges          = ($statusLines.Count -gt 0)
             StatusText          = ($statusLines -join "`n")
-            Branch              = $branch.Trim()
+            Branch              = $branch
             Remote              = $remote.Trim()
             Ahead               = $ahead
             HasUpstream         = $hasUpstream
+            Detached            = $detached
             Conflicts           = $conflicts
             OperationInProgress = $operation
         }
     } catch {
-        Write-Log "Git status retrieval failed: $($_.Exception.Message)" 'Debug'
+        # Warn (not Debug): Debug lines are easy to miss, and this means the colleague's
+        # changes were NOT checked or committed.
+        Write-Log "Git status retrieval failed: $($_.Exception.Message)" 'Warn'
+        & $setReason 'ReadFailed'
         return $null
     }
 }
@@ -1420,8 +1496,21 @@ function Invoke-GitChangeDetection {
     $where = if ($IsRemote) { 'in the repository on the workstation' } else { 'in the repository on this computer' }
 
     Write-Log "Detecting git changes at $RepoPath (remote=$IsRemote)" 'Info'
-    $gitState = Get-GitRepositoryState -State $State -RepoPath $RepoPath -IsRemote $IsRemote
-    if (-not $gitState) { return (& $newResult $true 'Unavailable' 'The git status could not be read, so nothing was committed.') }
+    $stateProblem = $null
+    $gitState = Get-GitRepositoryState -State $State -RepoPath $RepoPath -IsRemote $IsRemote -Reason ([ref]$stateProblem)
+    if (-not $gitState) {
+        # Success is $false here: the colleague's changes were NOT checked, so the Stop
+        # button must not report "All done" (it would suggest the work is on GitHub).
+        # No message box, because this can repeat on every Stop (for example for
+        # colleagues who always commit in RStudio and have no git on this PC); the
+        # caller shows the message in the status line instead.
+        $unavailableText = switch ($stateProblem) {
+            'GitMissing'  { 'Your changes were NOT checked or committed: git is not installed on this computer. Commit them in the RStudio Git pane (or with GitHub Desktop), or install Git for Windows.' }
+            'Unreachable' { 'Your changes were NOT checked or committed: the workstation could not be reached. They are still saved there; commit them in the RStudio Git pane next time.' }
+            default       { 'Your changes were NOT checked or committed: git could not read the status of the repository (details are in the log). Commit them in the RStudio Git pane next time.' }
+        }
+        return (& $newResult $false 'Unavailable' $unavailableText)
+    }
 
     # Refuse to commit while git is in the middle of a merge / rebase, or while files
     # still have conflicts. 'git add -A' would mark conflicted files as resolved and
@@ -1445,9 +1534,25 @@ function Invoke-GitChangeDetection {
         return (& $newResult $false 'Blocked' "Not committed: unfinished git $opName.")
     }
 
+    # Refuse to commit when no branch is checked out ("detached HEAD", for example after
+    # checking out an older commit or a tag). A commit made there belongs to no branch:
+    # the push would be refused anyway, and after switching to a branch the new commit
+    # can only be found again through git's reflog, so for a non-expert it is lost.
+    # PSObject.Properties: older callers and test doubles may not have this property,
+    # and StrictMode throws when reading a missing one.
+    $isDetached = [bool]($gitState.PSObject.Properties['Detached'] -and $gitState.Detached)
+    if ($isDetached -and $gitState.HasChanges) {
+        $why = "Nothing was committed or pushed, because no branch is checked out $where (git calls this a 'detached HEAD'). A commit made now would belong to no branch and would be easy to lose. Your files are unchanged.`r`n`r`nTo keep your changes: start the container again, click 'New Branch' in the RStudio Git pane and give the branch a name (your changes move with you), then commit and push there."
+        Write-Log $why 'Warn'
+        if (-not $script:NonInteractive) { [System.Windows.Forms.MessageBox]::Show($why, 'Git: not on a branch', 'OK', 'Warning') | Out-Null }
+        return (& $newResult $false 'Blocked' 'Not committed: no branch is checked out (detached HEAD).')
+    }
+
     $doCommit = $false
     $doPush = $false
     $msg = ''
+    # Text for a successful push; changed below when only older commits are pushed.
+    $pushedText = 'Changes are committed and pushed to GitHub.'
     if (-not $gitState.HasChanges) {
         if ($gitState.Ahead -le 0) { return (& $newResult $true 'NoChanges' 'No uncommitted changes.') }
         # Clean working tree, but commits made earlier (for example with Commit in
@@ -1461,12 +1566,30 @@ function Invoke-GitChangeDetection {
             return (& $newResult $true 'Skipped' "$n commit(s) are still not on GitHub.")
         }
         $doPush = $true
+        $pushedText = 'Your commits are pushed to GitHub.'
     } else {
         $dialogResult = Show-GitCommitDialog -ChangesText $gitState.StatusText
-        if (-not $dialogResult) { Write-Log 'User skipped git commit/push.' 'Info'; return (& $newResult $true 'Skipped' 'Changes were not committed.') }
-        $doCommit = $true
-        $msg = [string]$dialogResult.Message
-        $doPush = [bool]$dialogResult.Push
+        if ($dialogResult) {
+            $doCommit = $true
+            $msg = [string]$dialogResult.Message
+            $doPush = [bool]$dialogResult.Push
+        } else {
+            Write-Log 'User skipped git commit/push.' 'Info'
+            # Skipping the new changes should not also hide commits that were made
+            # earlier and are still not on GitHub: offer to push those on their own.
+            # (Before, Skip returned straight away and they were never mentioned.)
+            $n = $gitState.Ahead
+            if ($n -le 0) { return (& $newResult $true 'Skipped' 'Changes were not committed.') }
+            Write-Log "$n earlier commit(s) on branch '$($gitState.Branch)' are not on GitHub yet." 'Warn'
+            if ($script:NonInteractive) { return (& $newResult $true 'Skipped' "Changes were not committed, and $n earlier commit(s) are not on GitHub yet.") }
+            $answer = [System.Windows.Forms.MessageBox]::Show("Your new changes were not committed.`r`n`r`nBut you also have $n earlier commit(s) saved $where that are not on GitHub yet.`r`n`r`nPush those earlier commits to GitHub now? (The new, uncommitted changes stay on disk and are not uploaded.)", 'Unpushed commits', 'YesNo', 'Question')
+            if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
+                Write-Log 'User chose not to push the unpushed commits.' 'Info'
+                return (& $newResult $true 'Skipped' "Changes were not committed, and $n earlier commit(s) are still not on GitHub.")
+            }
+            $doPush = $true
+            $pushedText = 'Your earlier commits are pushed to GitHub; the new changes were not committed.'
+        }
     }
 
     try {
@@ -1554,7 +1677,7 @@ function Invoke-GitChangeDetection {
             return (& $newResult $false 'PushFailed' 'Committed, but the push to GitHub failed.')
         }
         Write-Log 'Git push to GitHub completed.' 'Info'
-        return (& $newResult $true 'Pushed' 'Changes are committed and pushed to GitHub.')
+        return (& $newResult $true 'Pushed' $pushedText)
     } catch {
         Write-Log "Git commit/push error: $($_.Exception.Message)" 'Error'
         if (-not $script:NonInteractive) {

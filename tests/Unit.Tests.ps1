@@ -2029,3 +2029,12 @@ Describe 'Build-DockerRunCommand port binding, labels and custom params' -Tag Un
         $a[-1] | Should -Be 'test-image'
     }
 }
+
+Describe 'Get-GitPushFailureHint for a detached HEAD' -Tag Unit {
+    It 'Advises creating a new branch (switching away would leave the commits behind)' {
+        $hint = InModuleScope 'IMPACT_Docker_GUI' { Get-GitPushFailureHint -Output 'fatal: You are not on a branch (detached HEAD), so there is nothing to push.' }
+        $hint | Should -Match 'New Branch'
+        $hint | Should -Match 'git switch -c'
+        $hint | Should -Not -Match 'Switch to a branch'
+    }
+}
