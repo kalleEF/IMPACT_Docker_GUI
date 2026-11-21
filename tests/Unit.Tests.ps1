@@ -1826,3 +1826,83 @@ Describe 'Test-AndCreateDirectory (-Reason and -Create)' -Tag Unit {
         $why | Should -Be 'CreateFailed'
     }
 }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Git commit flow helpers: shell quoting, git output text, push error hints
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'ConvertTo-PosixShellLiteral' -Tag Unit {
+    It 'Wraps plain text in single quotes' {
+        InModuleScope 'IMPACT_Docker_GUI' { ConvertTo-PosixShellLiteral -Value 'my repo' } | Should -Be "'my repo'"
+    }
+
+    It 'Writes an apostrophe as close-quote, escaped quote, open-quote' {
+        InModuleScope 'IMPACT_Docker_GUI' { ConvertTo-PosixShellLiteral -Value "Bob's repo" } | Should -Be "'Bob'\''s repo'"
+    }
+
+    It 'Leaves $, backticks and a trailing backslash as plain text inside the quotes' {
+        $value = 'cost $100 `x` $(echo hi) \'
+        $quoted = InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ V = $value } { param($V) ConvertTo-PosixShellLiteral -Value $V }
+        $quoted | Should -Be ("'" + $value + "'")
+    }
+
+    It 'Survives a real POSIX shell unchanged (when sh is available)' {
+        # -First 1: PATH can list more than one sh (for example /usr/bin and /bin).
+        $sh = Get-Command sh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $sh) { Set-ItResult -Skipped -Because 'no POSIX sh on this machine'; return }
+        $value = "O'Brien: cost `$5 ``x`` `$(echo INJECTED) `"q`" \"
+        $quoted = InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ V = $value } { param($V) ConvertTo-PosixShellLiteral -Value $V }
+        $echoed = & $sh.Source -c "printf '%s' $quoted"
+        $echoed | Should -BeExactly $value
+    }
+}
+
+Describe 'ConvertTo-GitOutputText' -Tag Unit {
+    It 'Joins stdout strings and stderr records, dropping the RemoteException placeholder of empty stderr lines' {
+        $text = InModuleScope 'IMPACT_Docker_GUI' {
+            $errLine  = [System.Management.Automation.ErrorRecord]::new([System.Management.Automation.RemoteException]::new('fatal: boom'), 'NativeCommandError', 'NotSpecified', $null)
+            $errEmpty = [System.Management.Automation.ErrorRecord]::new([System.Management.Automation.RemoteException]::new(''), 'NativeCommandErrorMessage', 'NotSpecified', $null)
+            ConvertTo-GitOutputText -Output @('To github.com:o/r.git', $errLine, $errEmpty)
+        }
+        $text | Should -Be "To github.com:o/r.git`nfatal: boom"
+        $text | Should -Not -Match 'RemoteException'
+    }
+
+    It 'Returns an empty string for no output' {
+        InModuleScope 'IMPACT_Docker_GUI' { ConvertTo-GitOutputText -Output $null } | Should -Be ''
+    }
+}
+
+Describe 'Get-GitPushFailureHint' -Tag Unit {
+    It 'Explains a key that GitHub does not accept' {
+        $hint = InModuleScope 'IMPACT_Docker_GUI' { Get-GitPushFailureHint -Output 'git@github.com: Permission denied (publickey).' -KeyName 'KEYX' }
+        $hint | Should -Match 'KEYX'
+        $hint | Should -Match 'settings/keys'
+    }
+
+    It 'Explains that someone else pushed first (non-fast-forward)' {
+        $out = " ! [rejected]        main -> main (fetch first)`nerror: failed to push some refs"
+        $hint = InModuleScope 'IMPACT_Docker_GUI' -Parameters @{ O = $out } { param($O) Get-GitPushFailureHint -Output $O }
+        $hint | Should -Match 'Someone else pushed'
+    }
+
+    It 'Explains missing write access' {
+        $hint = InModuleScope 'IMPACT_Docker_GUI' { Get-GitPushFailureHint -Output 'ERROR: Permission to org/repo.git denied to bob.' }
+        $hint | Should -Match 'write access'
+    }
+
+    It 'Explains a protected branch (remote rejected) rather than a non-fast-forward' {
+        $hint = InModuleScope 'IMPACT_Docker_GUI' { Get-GitPushFailureHint -Output ' ! [remote rejected] main -> main (protected branch hook declined)' }
+        $hint | Should -Match 'protected'
+    }
+
+    It 'Explains network problems' {
+        $hint = InModuleScope 'IMPACT_Docker_GUI' { Get-GitPushFailureHint -Output 'ssh: Could not resolve hostname github.com: Name or service not known' }
+        $hint | Should -Match 'could not be reached'
+    }
+
+    It 'Falls back to a generic sentence' {
+        $hint = InModuleScope 'IMPACT_Docker_GUI' { Get-GitPushFailureHint -Output 'something unexpected' }
+        $hint | Should -Match 'details are shown below'
+    }
+}
