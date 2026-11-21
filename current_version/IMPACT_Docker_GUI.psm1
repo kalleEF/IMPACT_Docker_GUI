@@ -82,22 +82,48 @@ function Write-Log {
 #  Build / version info
 # ══════════════════════════════════════════════════════════════════════════════
 function Get-BuildInfo {
+    # The footer shows these values so that a screenshot identifies which copy of the
+    # tool a colleague is running. They must therefore describe THIS copy of the tool,
+    # not the moment it was started or some other git repository around it.
     $version = '2.0.0'
-    $built = (Get-Date).ToString('s')
+    $built = $null
     $commit = $null
     $dirty = $false
+    $moduleDir = $PSScriptRoot
+
+    # Version: read it from the module manifest (.psd1) next to this file, so it only
+    # has to be changed in one place. Falls back to the default above.
+    try {
+        $manifestPath = if ($moduleDir) { Join-Path $moduleDir 'IMPACT_Docker_GUI.psd1' } else { $null }
+        if ($manifestPath -and (Test-Path -LiteralPath $manifestPath)) {
+            $manifest = Import-PowerShellDataFile -LiteralPath $manifestPath -ErrorAction Stop
+            if ($manifest.ContainsKey('ModuleVersion') -and $manifest.ModuleVersion) { $version = [string]$manifest.ModuleVersion }
+        }
+    } catch { }
+
+    # Built: the last time the module file was changed (when this release was built or
+    # copied). Previously this was Get-Date, i.e. simply the time the tool was launched.
+    try {
+        $moduleFile = if ($moduleDir) { Join-Path $moduleDir 'IMPACT_Docker_GUI.psm1' } else { $null }
+        if ($moduleFile -and (Test-Path -LiteralPath $moduleFile)) {
+            $built = (Get-Item -LiteralPath $moduleFile -ErrorAction Stop).LastWriteTime.ToString('s')
+        }
+    } catch { }
+    if (-not $built) { $built = (Get-Date).ToString('s') }
 
     try {
         $git = Get-Command git -ErrorAction SilentlyContinue
-        if ($git) {
-            $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD.Path }
-            if ($scriptDir) { Push-Location $scriptDir }
-            try {
-                $commit = git rev-parse --short HEAD 2>$null
-                $status = git status --porcelain 2>$null
+        if ($git -and $moduleDir) {
+            # Only report a commit if the module file is tracked by the git repository it
+            # sits in. If the tool folder was copied into some unrelated repository, that
+            # repository's commit says nothing about this tool. 'git -C' avoids changing
+            # the current location (no Push-/Pop-Location to clean up on errors).
+            & git -C $moduleDir ls-files --error-unmatch 'IMPACT_Docker_GUI.psm1' 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $commit = & git -C $moduleDir rev-parse --short HEAD 2>$null
+                $status = & git -C $moduleDir status --porcelain -- . 2>$null
                 if ($status) { $dirty = $true }
-            } catch { }
-            if ($scriptDir) { Pop-Location }
+            }
         }
     } catch { $commit = $null }
 
@@ -155,72 +181,84 @@ function New-SessionState {
 # ══════════════════════════════════════════════════════════════════════════════
 #  PowerShell 7 guard
 # ══════════════════════════════════════════════════════════════════════════════
+function Test-PowerShellVersionSupported {
+    <#
+    .SYNOPSIS Pure helper for Ensure-PowerShell7: is this PowerShell edition/version new enough?
+    .NOTES    PowerShell 7.3 is the minimum because older versions pass arguments to
+              native programs in the "legacy" way: an empty argument such as the empty
+              passphrase in 'ssh-keygen -N ""' is silently dropped, so ssh-keygen took
+              the next argument ('-q') as the passphrase and created an encrypted key.
+              Embedded double quotes (docker inspect templates) were also mangled.
+    #>
+    param(
+        [string]$Edition,
+        [version]$Version
+    )
+    if ($Edition -ne 'Core' -or -not $Version) { return $false }
+    return ($Version -ge [version]'7.3')
+}
+
 function Ensure-PowerShell7 {
     param([bool]$PS7RequestedFlag = $false)
 
+    # $PSVersionTable.PSVersion is a SemanticVersion in PowerShell 7 and cannot be
+    # compared with [version] directly, so build a plain Major.Minor version first.
+    $currentVersion = [version]('{0}.{1}' -f $PSVersionTable.PSVersion.Major, $PSVersionTable.PSVersion.Minor)
     $isCore = $PSVersionTable.PSEdition -eq 'Core'
-    $isSevenPlus = $isCore -and $PSVersionTable.PSVersion.Major -ge 7
-    if ($isSevenPlus) { return }
+    if (Test-PowerShellVersionSupported -Edition $PSVersionTable.PSEdition -Version $currentVersion) { return }
 
+    if ($isCore) {
+        # We ARE in PowerShell 7, but an old one (7.0 - 7.2). Do not try to restart:
+        # the 'pwsh' found on PATH is almost certainly this same old version, which
+        # would restart itself again and again. Ask the user to update instead.
+        $tooOldMsg = "Your PowerShell version ($($PSVersionTable.PSVersion)) is too old. IMPACT needs PowerShell 7.3 or newer.`n`nTo update, open a terminal and run:`n`n    winget upgrade Microsoft.PowerShell`n`nor install the latest version from https://aka.ms/powershell-release`n`nThen start IMPACT again."
+        if (-not $script:NonInteractive) {
+            try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue } catch { }
+            try { [System.Windows.Forms.MessageBox]::Show($tooOldMsg,'PowerShell update required','OK','Error') | Out-Null } catch { }
+        }
+        Write-Log "PowerShell $($PSVersionTable.PSVersion) is too old; 7.3 or newer is required." 'Error'
+        throw "PowerShell 7.3 or newer is required (found $($PSVersionTable.PSVersion))."
+    }
+
+    # Below here we run in Windows PowerShell 5.1 (Desktop edition).
     $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
-    if ($pwsh) {
+    if ($pwsh -and -not $PS7RequestedFlag) {
         Write-Log 'PowerShell 7 is required. Restarting under pwsh...' 'Warn'
-        $invokedPath = $null
-        try { $invokedPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { }
-        if (-not $invokedPath) { $invokedPath = $MyInvocation.MyCommand.Path }
-        if (-not $invokedPath) {
-            $candidate = [Environment]::GetCommandLineArgs() | Select-Object -First 1
-            if ($candidate -and $candidate -notmatch '\r|\n') { $invokedPath = $candidate }
-        }
-        if (-not $invokedPath) {
-            $candidate = $MyInvocation.MyCommand.Definition
-            if ($candidate -and $candidate -notmatch '\r|\n') { $invokedPath = $candidate }
-        }
-        if ($invokedPath) { try { $invokedPath = [System.IO.Path]::GetFullPath($invokedPath) } catch { Write-Log "Could not normalize invoked path: $invokedPath" 'Warn' } }
 
-        # $PSCommandPath inside a .psm1 module points to the module file itself,
-        # NOT the calling launcher script. Skip it if it ends in .psm1.
-        $scriptPath = $PSCommandPath
-        if ($scriptPath -and $scriptPath -match '\.psm1$') {
-            Write-Log "Ignoring PSCommandPath ($scriptPath) because it points to the module, not the launcher." 'Debug'
-            $scriptPath = $null
+        # Find the launcher script. Inside a module, $PSCommandPath is the .psm1 itself
+        # and the process path is powershell.exe, so neither can be used (the old code
+        # ended up restarting powershell.exe instead of the GUI). The launcher always
+        # imports this module from its own folder, so the script sits next to it.
+        $scriptPath = $null
+        if ($PSScriptRoot) { $scriptPath = Join-Path $PSScriptRoot 'IMPACT_Docker_GUI_v2.ps1' }
+        if (-not $scriptPath -or -not (Test-Path -LiteralPath $scriptPath)) {
+            $notFoundMsg = "IMPACT could not restart itself in PowerShell 7 because the file 'IMPACT_Docker_GUI_v2.ps1' was not found next to the module.`n`nPlease start IMPACT by double-clicking IMPACT.bat in the IMPACT folder."
+            if (-not $script:NonInteractive) {
+                try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue } catch { }
+                try { [System.Windows.Forms.MessageBox]::Show($notFoundMsg,'IMPACT - please use IMPACT.bat','OK','Error') | Out-Null } catch { }
+            }
+            Write-Log "Cannot relaunch under pwsh: launcher script not found at '$scriptPath'." 'Error'
+            throw 'Unable to relaunch under pwsh (launcher script not found).'
         }
-        if (-not $scriptPath -and $invokedPath -match '\.exe$') {
-            $candidate = [System.IO.Path]::ChangeExtension($invokedPath, '.ps1')
-            if (Test-Path $candidate) { $scriptPath = $candidate }
-        }
-        if (-not $scriptPath -and $invokedPath) {
-            $exeDir = Split-Path -Parent $invokedPath
-            $fallback = Join-Path $exeDir 'IMPACT_Docker_GUI_v2.ps1'
-            if (Test-Path $fallback) { $scriptPath = $fallback }
-        }
-        if ($scriptPath) { try { $scriptPath = [System.IO.Path]::GetFullPath($scriptPath) } catch { Write-Log "Could not normalize script path: $scriptPath" 'Warn' } }
+        try { $scriptPath = [System.IO.Path]::GetFullPath($scriptPath) } catch { Write-Log "Could not normalize script path: $scriptPath" 'Warn' }
 
-        if (-not $invokedPath -and -not $scriptPath) {
-            Write-Log 'Cannot determine executable or script path; aborting PS7 relaunch.' 'Error'
-            throw 'Unable to relaunch under pwsh (no path).'
-        }
+        # Always relaunch with -File. The path is wrapped in double quotes by hand because
+        # Windows PowerShell's Start-Process joins the arguments with plain spaces, and
+        # user folders such as 'C:\Users\Max Mustermann' contain spaces.
+        # -PS7Requested tells the new process that it was started by this relaunch.
+        $pwshArgs = @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$scriptPath`"",'-PS7Requested')
+        Write-Log "Relaunching under pwsh with script: $scriptPath" 'Info'
 
-        $args = @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass')
-        if ($scriptPath -and (Test-Path $scriptPath)) {
-            $args += '-File'
-            $args += "`"$scriptPath`""
-            Write-Log "Relaunching under pwsh with script: $scriptPath" 'Info'
-        } else {
-            $args += '-Command'
-            $args += "& '" + $invokedPath + "'"
-            Write-Log "Relaunching under pwsh by invoking: $invokedPath" 'Info'
-        }
-
-        if (-not $PS7RequestedFlag) { $args += '-PS7Requested' }
-
-        Start-Process -FilePath $pwsh.Source -ArgumentList $args -WorkingDirectory $PWD.Path -NoNewWindow -Wait | Out-Null
-        exit
+        $proc = Start-Process -FilePath $pwsh.Source -ArgumentList $pwshArgs -WorkingDirectory $PWD.Path -NoNewWindow -Wait -PassThru
+        # Pass the exit code of the PowerShell 7 process on, so IMPACT.bat can see failures.
+        $exitCode = 0
+        if ($proc) { $exitCode = $proc.ExitCode }
+        exit $exitCode
     }
 
     if (-not $script:NonInteractive) {
         try { Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue } catch { }
-        try { [System.Windows.Forms.MessageBox]::Show('PowerShell 7 (pwsh) is required. Please install PowerShell 7 and try again.','PowerShell 7 required','OK','Error') | Out-Null } catch { }
+        try { [System.Windows.Forms.MessageBox]::Show("PowerShell 7 (version 7.3 or newer) is required. Please install it from https://aka.ms/powershell-release (or run: winget install Microsoft.PowerShell) and try again.",'PowerShell 7 required','OK','Error') | Out-Null } catch { }
     }
     Write-Log 'PowerShell 7 (pwsh) is required but not installed.' 'Error'
     throw 'PowerShell 7 (pwsh) is required.'
@@ -239,19 +277,28 @@ function Get-RemoteHostString {
 function Set-DockerSSHEnvironment {
     param([pscustomobject]$State)
     if ($State.ContainerLocation -like 'REMOTE@*') {
-        if (-not $env:DOCKER_SSH_OPTS -or [string]::IsNullOrEmpty($env:DOCKER_SSH_OPTS)) {
-            $keyPath = $State.Paths.SshPrivate
-            if (-not $keyPath) { $keyPath = "$HOME/.ssh/id_ed25519_$($State.UserName)" }
-            $env:DOCKER_SSH_OPTS = "-i `"$keyPath`" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=30"
-            Write-Log "Prepared DOCKER_SSH_OPTS for remote Docker access." 'Info'
-        }
+        # Always rebuild DOCKER_SSH_OPTS and DOCKER_HOST from the CURRENT state. They used
+        # to be set only once per session, so after going Back and choosing another
+        # workstation (or user), docker kept talking to the OLD host with the old key
+        # while the ssh calls already went to the new one.
+        $keyPath = $State.Paths.SshPrivate
+        if (-not $keyPath) { $keyPath = "$HOME/.ssh/id_ed25519_$($State.UserName)" }
+        $env:DOCKER_SSH_OPTS = "-i `"$keyPath`" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=30"
+        Write-Log "Prepared DOCKER_SSH_OPTS for remote Docker access." 'Debug'
         if ($State.Flags.UseDirectSsh) {
             $remoteHost = Get-RemoteHostString -State $State
-            if (-not $env:DOCKER_HOST -or $env:DOCKER_HOST -notmatch 'ssh://') {
-                $env:DOCKER_HOST = "ssh://$remoteHost"
+            $wantedDockerHost = "ssh://$remoteHost"
+            if ($env:DOCKER_HOST -ne $wantedDockerHost) {
+                $env:DOCKER_HOST = $wantedDockerHost
                 Write-Log "Using direct SSH Docker host at $remoteHost" 'Info'
             }
             Write-Log "Direct SSH Docker mode active; DOCKER_HOST=$env:DOCKER_HOST" 'Debug'
+        } elseif ($env:DOCKER_HOST -and $env:DOCKER_HOST -match '^ssh://') {
+            # A Docker context is used for this workstation now. Remove the ssh:// value
+            # left over from an earlier direct-SSH fallback, otherwise docker commands
+            # without an explicit --context would still go to that earlier host.
+            $env:DOCKER_HOST = $null
+            Write-Log 'Cleared leftover ssh:// DOCKER_HOST because a Docker context is in use.' 'Debug'
         }
     } else {
         Write-Log 'Using local Docker engine (no remote SSH context).' 'Info'
@@ -386,7 +433,10 @@ function Read-RemoteContainerMetadata {
 function Get-DockerCredentialsFromDotEnv {
     param(
         [string]$EnvPath,
-        [string]$EnvContent
+        # [string[]] instead of [string]: output of a native command such as 'ssh cat'
+        # arrives as one string per line. A [string] parameter would glue those lines
+        # together with SPACES, so the key=value pairs could no longer be found.
+        [string[]]$EnvContent
     )
 
     if (-not $EnvContent) {
@@ -395,8 +445,11 @@ function Get-DockerCredentialsFromDotEnv {
         } else { return $null }
     }
 
+    # Join the lines with real line breaks before splitting them again below.
+    $envText = $EnvContent -join "`n"
+
     $map = @{}
-    foreach ($line in ($EnvContent -split "`n")) {
+    foreach ($line in ($envText -split "`n")) {
         $l = $line.Trim()
         if (-not $l -or $l.StartsWith('#')) { continue }
         if ($l -notmatch '=') { continue }
@@ -448,19 +501,37 @@ function Ensure-RemoteDockerLogin {
     }
     if (-not $envContent) { Write-Log 'No .env content found on remote.' 'Debug'; return $false }
 
-    $creds = Get-DockerCredentialsFromDotEnv -EnvContent $envContent
-    if (-not $creds) { Write-Log 'No Docker credentials found in repo .env.' 'Debug'; return $false }
+    # ssh returns one string per line; join them with line breaks so every
+    # KEY=value line is parsed on its own (see Get-DockerCredentialsFromDotEnv).
+    $creds = Get-DockerCredentialsFromDotEnv -EnvContent ($envContent -join "`n")
+    if (-not $creds) { Write-Log 'No Docker credentials found in repo .env.' 'Info'; return $false }
 
     if (-not $creds.Username -or -not $creds.Password) { Write-Log 'Incomplete credentials in .env; cannot login.' 'Debug'; return $false }
 
     $user = $creds.Username; $pw = $creds.Password; $registry = $creds.Registry
+
+    # The user name and registry come from a file in the repository and are placed
+    # inside a command that the remote shell runs. Only allow plain characters so a
+    # quote or '$(...)' in the file cannot change that command.
+    if ($user -notmatch '^[A-Za-z0-9._@+-]+$' -or ($registry -and $registry -notmatch '^[A-Za-z0-9.:/-]+$')) {
+        Write-Log 'Docker user name or registry in repo .env contains unsupported characters; skipping automatic login.' 'Warn'
+        return $false
+    }
+
+    # Without a server name, 'docker login' always logs in to Docker Hub. For GHCR or a
+    # custom registry the server must be given, otherwise that token is sent to Docker Hub.
+    $registryArg = ''
+    if ($registry -and $registry -notin @('docker.io','index.docker.io','registry-1.docker.io')) { $registryArg = " '$registry'" }
     Write-Log ("Attempting remote docker login using .env (user={0} registry={1})" -f $user, $registry) 'Info'
 
     try {
-        $pwB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($pw))
-        $cmd = "echo $pwB64 | base64 -d | docker login -u '$user' --password-stdin 2>&1 || true"
-        $sshArgs = @('-n','-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=15','-o','BatchMode=yes','-o','IdentitiesOnly=yes','-i',"$keyPath",$remoteHost,$cmd)
-        $out = & ssh @sshArgs
+        # The password is sent through ssh's standard input (piped below) instead of being
+        # part of the remote command line. Command lines are visible to every user of the
+        # workstation (ps, /proc), and the old base64 encoding there was no protection.
+        # Note: no '-n' here, because '-n' would cut off that standard input.
+        $cmd = "docker login$registryArg -u '$user' --password-stdin 2>&1"
+        $sshArgs = @('-o','StrictHostKeyChecking=accept-new','-o','ConnectTimeout=15','-o','BatchMode=yes','-o','IdentitiesOnly=yes','-i',"$keyPath",$remoteHost,$cmd)
+        $out = $pw | & ssh @sshArgs 2>&1
         $outText = if ($out -is [System.Array]) { ($out -join "`n") } else { [string]$out }
         if ($outText -match 'Login Succeeded') { Write-Log 'Remote docker login succeeded (masked).' 'Info'; return $true }
         Write-Log ("Remote docker login output (masked): {0}" -f ($outText -replace [regex]::Escape($pw),'***')) 'Debug'
@@ -498,24 +569,11 @@ function Get-ContainerRuntimeInfo {
     return $info
 }
 
-function Get-NextAvailablePort {
-    param(
-        [string[]]$UsedPorts = @(),
-        [int]$RangeStart = 8787,
-        [int]$RangeEnd   = 8799
-    )
-    for ($p = $RangeStart; $p -le $RangeEnd; $p++) {
-        if ($UsedPorts -notcontains [string]$p) {
-            return [string]$p
-        }
-    }
-    # All ports in range occupied — return the default; conflict check at start time will catch it
-    return [string]$RangeStart
-}
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  Port helpers
 # ══════════════════════════════════════════════════════════════════════════════
+# (Get-NextAvailablePort used to be defined twice in this file; the second copy
+# silently replaced the first. Only this one copy is kept.)
 function Get-NextAvailablePort {
     param(
         [string[]]$UsedPorts = @(),
@@ -527,6 +585,10 @@ function Get-NextAvailablePort {
             return [string]$p
         }
     }
+    # Every port in the range is taken. Still return the first port (callers expect a
+    # value for the Port box; the start-time conflict check then reports the clash),
+    # but say clearly in the console/log WHY no free port was suggested.
+    Write-Log "All ports $RangeStart-$RangeEnd are already in use. Stop another container first, then try again." 'Warn'
     return [string]$RangeStart
 }
 
@@ -545,6 +607,17 @@ function Test-PortValue {
     }
     if ($Port -notmatch '^\d+$') {
         return @{ Valid = $false; ErrorMessage = 'Port must be a number.' }
+    }
+    # More than 5 digits can never be a valid port. Checking this BEFORE the [int]
+    # conversion matters: a very long number would overflow [int] and throw an
+    # exception inside the Port box's TextChanged handler.
+    if ($Port.Length -gt 5) {
+        return @{ Valid = $false; ErrorMessage = "Port must be between $RangeStart and $RangeEnd." }
+    }
+    # A leading zero ('08787') would be read as 8787 here, but the "port already in
+    # use" checks compare the TEXT, so '08787' would slip past them.
+    if ($Port.Length -gt 1 -and $Port.StartsWith('0')) {
+        return @{ Valid = $false; ErrorMessage = 'Port must not start with 0.' }
     }
     $portInt = [int]$Port
     if ($portInt -lt $RangeStart -or $portInt -gt $RangeEnd) {
@@ -598,8 +671,22 @@ function Format-DockerError {
 
     $lower = $RawError.ToLower()
 
-    if ($lower -match 'port is already allocated' -or $lower -match 'address already in use') {
-        if ($RawError -match '(\d{4,5})') {
+    # Port problems. The port number is taken from right after the bind address
+    # ("0.0.0.0:8788", "127.0.0.1:8788" or "[::]:8788"). The old pattern took the first
+    # 4-5 digit number ANYWHERE in the text, which was usually part of the container ID
+    # or the endpoint hash printed before it, or digits in the user name.
+    $portPattern = '(?:0\.0\.0\.0|127\.0\.0\.1|\[::\]):(\d{2,5})\b'
+    # Docker Desktop on Windows reports a port that Windows has reserved (Hyper-V/WSL)
+    # as "forbidden by its access permissions". Without this check it fell into the
+    # 'permission' branch below and wrongly blamed Docker permissions.
+    if ($lower -match 'forbidden by its access permissions') {
+        if ($RawError -match $portPattern) {
+            return "Port $($matches[1]) is blocked or reserved by Windows. Choose a different port."
+        }
+        return 'The selected port is blocked or reserved by Windows. Choose a different port.'
+    }
+    if ($lower -match 'port is already allocated' -or $lower -match 'address already in use' -or $lower -match 'only one usage of each socket address') {
+        if ($RawError -match $portPattern) {
             return "Port $($matches[1]) is already in use. Choose a different port."
         }
         return 'The selected port is already in use. Choose a different port.'
@@ -1032,7 +1119,15 @@ function Test-StartupPrerequisites {
     if (-not $dockerCmd) {
         Write-Log 'Docker CLI not found. Install Docker Desktop (Windows) or ensure docker is on PATH.' 'Error'
         if (-not $script:NonInteractive) {
-            [System.Windows.Forms.MessageBox]::Show('Docker CLI not found.`n`nInstall Docker Desktop (Windows) and ensure "docker" is on PATH, then retry.','Docker missing','OK','Error') | Out-Null
+            # Double quotes are required here: inside single quotes PowerShell shows `n
+            # literally instead of starting a new line.
+            # Docker Desktop (admin rights + licence) is only needed to run containers on
+            # this PC; for the remote workstation the docker command-line tool is enough.
+            $dockerMsg = "The Docker command-line tool (docker) was not found on this computer.`n`n" +
+                "- To run containers on THIS computer: install Docker Desktop.`n" +
+                "- To work ONLY on the remote workstation: Docker Desktop is not needed. The Docker command-line tool (docker.exe) in a folder on your PATH is enough.`n`n" +
+                "Then start IMPACT again."
+            [System.Windows.Forms.MessageBox]::Show($dockerMsg,'Docker missing','OK','Error') | Out-Null
         }
         return $false
     }
@@ -1040,23 +1135,41 @@ function Test-StartupPrerequisites {
 
     $sshCmd = Get-Command ssh -ErrorAction SilentlyContinue
     if (-not $sshCmd) {
-        Write-Log 'OpenSSH client not found on PATH. Attempting auto-install.' 'Warn'
-        $installAttempted = $false
+        # On many (managed) PCs the Windows OpenSSH client IS installed, only its folder
+        # is missing from PATH. Using it directly needs no admin rights at all.
+        $builtinSshDir = $null
+        if ($env:WINDIR) { $builtinSshDir = Join-Path $env:WINDIR 'System32\OpenSSH' }
+        if ($builtinSshDir -and (Test-Path -LiteralPath (Join-Path $builtinSshDir 'ssh.exe'))) {
+            Write-Log "OpenSSH client found at $builtinSshDir but that folder is not on PATH; adding it for this session." 'Warn'
+            $env:PATH = "$builtinSshDir;$env:PATH"
+            $sshCmd = Get-Command ssh -ErrorAction SilentlyContinue
+        }
+    }
+    if (-not $sshCmd) {
+        Write-Log 'OpenSSH client not found on PATH. Offering to install it.' 'Warn'
         try {
-            $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Client*' -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($cap -and $cap.State -ne 'Installed' -and -not $script:NonInteractive) {
+            # Ask FIRST, then check and install inside the elevated process.
+            # The old code first ran Get-WindowsCapability here, without admin rights. That
+            # command needs admin rights, so it returned nothing and the install offer
+            # never appeared.
+            if (-not $script:NonInteractive) {
                 $installChoice = [System.Windows.Forms.MessageBox]::Show(
-                    "The OpenSSH Client is not installed on this machine.`n`nThe tool needs ssh, ssh-keygen, and ssh-agent to function.`n`nInstall it now? (requires Administrator - a UAC prompt will appear)",
+                    "The OpenSSH Client is not installed on this machine.`n`nThe tool needs ssh, ssh-keygen, and ssh-agent to function.`n`nInstall it now? (requires Administrator rights - a Windows permission (UAC) prompt will appear)",
                     'Install OpenSSH Client?',
                     [System.Windows.Forms.MessageBoxButtons]::YesNo,
                     [System.Windows.Forms.MessageBoxIcon]::Question)
                 if ($installChoice -eq [System.Windows.Forms.DialogResult]::Yes) {
                     Write-Log 'User agreed to install OpenSSH Client. Launching elevated install.' 'Info'
-                    $capName = $cap.Name
-                    $elevatedCmd = "Add-WindowsCapability -Online -Name '$capName' -ErrorAction Stop"
-                    $pwshPath = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
-                    $proc = Start-Process $pwshPath -ArgumentList '-NoProfile','-NoLogo','-Command',$elevatedCmd -Verb RunAs -Wait -PassThru -ErrorAction Stop
-                    $installAttempted = $true
+                    $elevatedCmd = "try { Get-WindowsCapability -Online -Name 'OpenSSH.Client*' -ErrorAction Stop | Where-Object { `$_.State -ne 'Installed' } | Add-WindowsCapability -Online -ErrorAction Stop | Out-Null; exit 0 } catch { Write-Error `$_; exit 1 }"
+                    # -EncodedCommand avoids any quoting problems when the command is handed
+                    # to the elevated process.
+                    $encodedCmd = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($elevatedCmd))
+                    # Windows PowerShell is used for this step because the Windows capability
+                    # (DISM) commands are always built into it on Windows 10/11.
+                    $installShell = if (Get-Command powershell.exe -ErrorAction SilentlyContinue) { 'powershell.exe' } else { 'pwsh' }
+                    # Start-Process -Verb RunAs throws if the UAC prompt is cancelled or the
+                    # user has no admin rights; that is handled in the catch below.
+                    $proc = Start-Process $installShell -ArgumentList '-NoProfile','-NoLogo','-NonInteractive','-EncodedCommand',$encodedCmd -Verb RunAs -Wait -PassThru -ErrorAction Stop
                     if ($proc.ExitCode -eq 0) {
                         Write-Log 'OpenSSH Client installed successfully via elevated process.' 'Info'
                         $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
@@ -1070,7 +1183,7 @@ function Test-StartupPrerequisites {
                 }
             }
         } catch {
-            Write-Log "OpenSSH auto-install failed: $($_.Exception.Message)" 'Warn'
+            Write-Log "OpenSSH install could not be run (permission prompt cancelled or no administrator rights?): $($_.Exception.Message)" 'Warn'
         }
 
         $sshCmd = Get-Command ssh -ErrorAction SilentlyContinue
@@ -1078,7 +1191,7 @@ function Test-StartupPrerequisites {
             $manualMsg = "OpenSSH Client (ssh) is required but not installed."
             Write-Log 'OpenSSH client still not found after install attempt.' 'Error'
             if (-not $script:NonInteractive) {
-                $fullMsg = $manualMsg + "`n`nTo install manually, run this in an Administrator PowerShell:`n`n  Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0`n`nThen restart this tool."
+                $fullMsg = $manualMsg + "`n`nInstalling it needs administrator rights. If you do not have them, please ask your IT department to install the Windows feature 'OpenSSH Client'.`n`nWith administrator rights, run this in an Administrator PowerShell:`n`n  Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0`n`nThen restart this tool."
                 [System.Windows.Forms.MessageBox]::Show($fullMsg, 'SSH missing', 'OK', 'Error') | Out-Null
             }
             return $false
@@ -1102,6 +1215,17 @@ function Ensure-Prerequisites {
 
     Write-Log "Detected PowerShell $($PSVersionTable.PSVersion) (Major=$($PSVersionTable.PSVersion.Major))" 'Debug'
 
+    # docker, ssh and git print their text as UTF-8. PowerShell decodes the output of
+    # such programs with [Console]::OutputEncoding, which on Windows defaults to the old
+    # DOS code page (e.g. 850 on German PCs). Umlauts in passwords or repository names
+    # read back from docker/ssh were therefore shown as pairs of garbage characters.
+    # Switch this process to UTF-8 (without a byte-order mark).
+    try {
+        [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    } catch {
+        Write-Log "Could not switch console output encoding to UTF-8: $($_.Exception.Message)" 'Debug'
+    }
+
     if (-not (Test-StartupPrerequisites -State $State)) { return $false }
 
     $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')
@@ -1121,12 +1245,87 @@ function Ensure-Prerequisites {
         Write-Log 'Could not adjust console colors.' 'Debug'
     }
 
+    # git on this PC is optional (only LOCAL mode uses it, to offer commit/push when a
+    # container is stopped), so a missing git must not block the tool. But without this
+    # note the commit dialog would simply never appear and nobody would know why.
+    # The check runs after Clear-Host so the warning stays visible in the console.
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Write-Log 'Git was not found on this computer (it is not on PATH). In LOCAL mode IMPACT therefore cannot offer to commit/push your changes when you stop the container. Commit from the Git tab in RStudio instead, or install Git for Windows (https://git-scm.com/download/win).' 'Warn'
+    }
+
     return $true
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Credential Dialog
 # ══════════════════════════════════════════════════════════════════════════════
+function Resolve-GitHubUsernameInput {
+    <#
+    .SYNOPSIS Cleans up the text typed into the "GitHub username" box and checks its
+              format locally, before GitHub is asked. Pure logic (no UI, no network),
+              so it can be unit tested.
+    .OUTPUTS  [pscustomobject] @{ UserName = <cleaned lowercase name or $null>;
+                                  Problem  = <message for the user or $null> }
+    #>
+    param([string]$InputText)
+
+    $name = if ($null -ne $InputText) { $InputText } else { '' }
+    # Remove all spaces and use lowercase. GitHub names are not case sensitive, and the
+    # tool uses the name in file names and container names.
+    $name = ($name -replace '\s+', '').ToLowerInvariant()
+    # Accept a pasted profile link such as 'https://github.com/jdoe?tab=repositories'
+    # by keeping only the part right after 'github.com/'.
+    if ($name -match '^(?:https?://)?(?:www\.)?github\.com/([^/?#]+)') { $name = $matches[1] }
+    # Accept the '@jdoe' form that GitHub uses for mentions.
+    $name = $name.TrimStart('@')
+
+    if (-not $name) {
+        return [pscustomobject]@{ UserName = $null; Problem = 'Please enter your GitHub username.' }
+    }
+    # Many people log in to github.com with their e-mail address, so they type it here.
+    if ($name.Contains('@')) {
+        return [pscustomobject]@{ UserName = $null; Problem = "'$name' looks like an e-mail address. Please enter your GitHub USERNAME instead.`n`nTo find it, log in to github.com and click your profile picture (top right): the name shown there is your username. It is also the last part of your profile address github.com/<username>." }
+    }
+    # GitHub usernames contain only letters, digits and hyphens (at most 39 characters).
+    # Underscores are allowed too, because company-managed GitHub accounts use them.
+    # This check also keeps characters such as ? # / $ or quotes out of the file paths,
+    # container names and shell commands that are built from the username later on.
+    if ($name -notmatch '^[a-z0-9][a-z0-9_-]{0,38}$') {
+        return [pscustomobject]@{ UserName = $null; Problem = "'$name' is not a valid GitHub username. GitHub usernames contain only letters, digits and hyphens (at most 39 characters)." }
+    }
+    return [pscustomobject]@{ UserName = $name; Problem = $null }
+}
+
+function Get-RStudioPasswordProblem {
+    <#
+    .SYNOPSIS Checks the password chosen for RStudio Server. Returns $null when it is
+              acceptable, otherwise a message for the user. Pure logic (unit tested).
+    .NOTES    This password is the ONLY protection of the RStudio web page, which can be
+              reached over the network and holds the user's GitHub SSH key. Before, any
+              non-empty text (even '1') was accepted.
+    #>
+    param(
+        [string]$Password,
+        [string]$UserName
+    )
+    $minLength = 8
+    if ([string]::IsNullOrWhiteSpace($Password)) {
+        return 'Please choose a password for RStudio.'
+    }
+    if ($Password.Length -lt $minLength) {
+        return "The RStudio password must be at least $minLength characters long."
+    }
+    if ($UserName -and $Password -ieq $UserName) {
+        return 'The RStudio password must not be the same as your username.'
+    }
+    # A few passwords that attackers always try first (-contains ignores upper/lower case).
+    $tooCommon = @('password','passwort','12345678','123456789','1234567890','87654321','11111111','00000000','qwertyui','qwertzui','abcdefgh','iloveyou','rstudio1','rstudio123')
+    if ($tooCommon -contains $Password) {
+        return 'This password is too easy to guess. Please choose another one.'
+    }
+    return $null
+}
+
 function Show-CredentialDialog {
     param([pscustomobject]$State)
 
@@ -1137,19 +1336,39 @@ function Show-CredentialDialog {
             Write-Log 'NonInteractive: UserName/Password not pre-set on state.' 'Error'
             return 'cancel'
         }
-        $State.UserName = ($State.UserName -replace '\s+', '').ToLower()
-        if (-not (Test-GitHubUsername -UserName $State.UserName)) {
-            Write-Log "NonInteractive: '$($State.UserName)' is not a valid GitHub username." 'Error'
+        # Same clean-up and format check as in the interactive dialog below.
+        $nameCheck = Resolve-GitHubUsernameInput -InputText $State.UserName
+        if ($nameCheck.Problem) {
+            Write-Log "NonInteractive: '$($State.UserName)' is not a valid GitHub username: $($nameCheck.Problem)" 'Error'
             return 'cancel'
         }
-        return 'next'
+        $State.UserName = $nameCheck.UserName
+        # Headless/CI runs only get a warning for a weak password, so automated tests with
+        # fixed test passwords keep working. Real users always go through the dialog.
+        $pwProblem = Get-RStudioPasswordProblem -Password $State.Password -UserName $State.UserName
+        if ($pwProblem) { Write-Log "NonInteractive: weak RStudio password: $pwProblem" 'Warn' }
+        $ghCheck = Test-GitHubUsername -UserName $State.UserName -Detailed
+        if ($ghCheck.Status -eq 'Exists') { return 'next' }
+        if ($ghCheck.Status -eq 'Unknown') {
+            # GitHub could not be asked (offline, proxy, rate limit). That says nothing
+            # about the username itself, so do not block the run; just record it.
+            Write-Log "NonInteractive: could not verify GitHub username '$($State.UserName)'; continuing. $($ghCheck.Message)" 'Warn'
+            return 'next'
+        }
+        Write-Log "NonInteractive: '$($State.UserName)' is not a valid GitHub username. $($ghCheck.Message)" 'Error'
+        return 'cancel'
     }
 
     Write-Log 'Collecting credentials - opening dialog.' 'Info'
 
+    # When the user comes back here with "Back" from the location step, the state already
+    # holds credentials that were checked before. They are shown again (pre-filled), and
+    # Cancel then keeps them instead of closing the whole application.
+    $hadPreviousCredentials = [bool]($State.UserName -and $State.Password)
+
     $form = New-Object System.Windows.Forms.Form -Property @{
         Text = 'Remote Access - IMPACT NCD Germany'
-        Size = New-Object System.Drawing.Size(540,320)
+        Size = New-Object System.Drawing.Size(540,390)
         StartPosition = 'CenterScreen'
         FormBorderStyle = 'FixedDialog'
         MaximizeBox = $false
@@ -1159,47 +1378,75 @@ function Show-CredentialDialog {
 
     $rtbInstruction = New-Object System.Windows.Forms.RichTextBox -Property @{
         Location = New-Object System.Drawing.Point(14,12)
-        Size = New-Object System.Drawing.Size(500,130)
+        Size = New-Object System.Drawing.Size(500,200)
         Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Regular)
         ReadOnly = $true
         BorderStyle = 'None'
         BackColor = $form.BackColor
         ScrollBars = 'None'
     }
-    $rtbInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 9, [System.Drawing.FontStyle]::Bold)
-    $rtbInstruction.AppendText('Please enter your GitHub username and a password!')
-    $rtbInstruction.AppendText("`n`n")
-    $rtbInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 9, [System.Drawing.FontStyle]::Bold)
-    $rtbInstruction.SelectionColor = [System.Drawing.Color]::DarkRed
-    $rtbInstruction.AppendText('Important:')
-    $rtbInstruction.SelectionColor = [System.Drawing.Color]::Black
-    $rtbInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 9, [System.Drawing.FontStyle]::Regular)
-    $rtbInstruction.AppendText("`nThe username must be your GitHub username. It is used for SSH key generation, git identity inside the container, and container management.`nThe password will be used to login to your RStudio Server session.`n`n")
-    $rtbInstruction.SelectionFont = New-Object System.Drawing.Font('Microsoft Sans Serif', 8, [System.Drawing.FontStyle]::Regular)
-    $rtbInstruction.SelectionColor = [System.Drawing.Color]::DarkGray
-    $rtbInstruction.AppendText('(Username will be validated against GitHub and normalized to lowercase)')
+    # Apply the theme to the box FIRST. Style-InfoBox sets one font and colour for ALL
+    # text in the box; when it ran after the text had been added (as before), it wiped
+    # out the bold and coloured parts. The colours now come from the dark theme palette,
+    # because the old Black and DarkRed text was hard to read on the dark background.
+    # The box is also taller than before so that the last line is no longer cut off.
     Style-InfoBox -Box $rtbInstruction
+    $palette = Get-ThemePalette
+    $fontHeading = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+    $fontBold    = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $fontRegular = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Regular)
+    $fontSmall   = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Regular)
+
+    # The wording makes clear that the password is a NEW one for RStudio and NOT the
+    # GitHub password. People typed their GitHub password here, and this password can be
+    # read by colleagues (docker inspect, files of the shared workstation account).
+    $rtbInstruction.SelectionFont = $fontHeading
+    $rtbInstruction.SelectionColor = $palette.Text
+    $rtbInstruction.AppendText("Enter your GitHub username and choose a NEW password for RStudio.`n`n")
+    $rtbInstruction.SelectionFont = $fontBold
+    $rtbInstruction.SelectionColor = $palette.AccentAlt
+    $rtbInstruction.AppendText('GitHub username: ')
+    $rtbInstruction.SelectionFont = $fontRegular
+    $rtbInstruction.SelectionColor = $palette.Text
+    $rtbInstruction.AppendText("your GitHub username (not your e-mail address). It is used for your SSH key, your git identity and your container name.`n")
+    $rtbInstruction.SelectionFont = $fontBold
+    $rtbInstruction.SelectionColor = $palette.AccentAlt
+    $rtbInstruction.AppendText('RStudio password: ')
+    $rtbInstruction.SelectionFont = $fontRegular
+    $rtbInstruction.SelectionColor = $palette.Text
+    $rtbInstruction.AppendText("a NEW password of at least 8 characters. You will use it to log in to RStudio Server in your web browser.`n")
+    $rtbInstruction.SelectionFont = $fontBold
+    $rtbInstruction.SelectionColor = $palette.Danger
+    $rtbInstruction.AppendText("Do NOT use your GitHub password (or any password you use elsewhere): colleagues with access to the workstation can read this password.`n")
+    $rtbInstruction.SelectionFont = $fontSmall
+    $rtbInstruction.SelectionColor = $palette.Muted
+    $rtbInstruction.AppendText('(The username is checked on github.com and converted to lowercase.)')
     $form.Controls.Add($rtbInstruction)
 
-    $labelUser = New-Object System.Windows.Forms.Label -Property @{ Text = 'Username'; Location = New-Object System.Drawing.Point(14,150); Size = New-Object System.Drawing.Size(100,22) }
+    # Labels are wider than before (150 px) so 'RStudio password' fits; the text boxes
+    # moved right and down accordingly.
+    $labelUser = New-Object System.Windows.Forms.Label -Property @{ Text = 'GitHub username'; Location = New-Object System.Drawing.Point(14,220); Size = New-Object System.Drawing.Size(150,22) }
     Style-Label -Label $labelUser -Style ([System.Drawing.FontStyle]::Bold)
     $form.Controls.Add($labelUser)
-    $textUser = New-Object System.Windows.Forms.TextBox -Property @{ Location = New-Object System.Drawing.Point(120,148); Size = New-Object System.Drawing.Size(360,26) }
+    $textUser = New-Object System.Windows.Forms.TextBox -Property @{ Location = New-Object System.Drawing.Point(170,218); Size = New-Object System.Drawing.Size(330,26) }
     Style-TextBox -TextBox $textUser
+    # Pre-fill with what was entered earlier (when coming back with "Back").
+    if ($State.UserName) { $textUser.Text = [string]$State.UserName }
     $form.Controls.Add($textUser)
 
-    $labelPass = New-Object System.Windows.Forms.Label -Property @{ Text = 'Password'; Location = New-Object System.Drawing.Point(14,185); Size = New-Object System.Drawing.Size(100,22) }
+    $labelPass = New-Object System.Windows.Forms.Label -Property @{ Text = 'RStudio password'; Location = New-Object System.Drawing.Point(14,255); Size = New-Object System.Drawing.Size(150,22) }
     Style-Label -Label $labelPass -Style ([System.Drawing.FontStyle]::Bold)
     $form.Controls.Add($labelPass)
-    $textPass = New-Object System.Windows.Forms.TextBox -Property @{ Location = New-Object System.Drawing.Point(120,183); Size = New-Object System.Drawing.Size(360,26); UseSystemPasswordChar = $true }
+    $textPass = New-Object System.Windows.Forms.TextBox -Property @{ Location = New-Object System.Drawing.Point(170,253); Size = New-Object System.Drawing.Size(330,26); UseSystemPasswordChar = $true }
     Style-TextBox -TextBox $textPass
+    if ($State.Password) { $textPass.Text = [string]$State.Password }
     $form.Controls.Add($textPass)
 
-    $buttonOK = New-Object System.Windows.Forms.Button -Property @{ Text = 'Continue'; Location = New-Object System.Drawing.Point(120,228); Size = New-Object System.Drawing.Size(110,34) }
+    $buttonOK = New-Object System.Windows.Forms.Button -Property @{ Text = 'Continue'; Location = New-Object System.Drawing.Point(170,298); Size = New-Object System.Drawing.Size(110,34) }
     Style-Button -Button $buttonOK -Variant 'primary'
     $form.Controls.Add($buttonOK)
 
-    $buttonCancel = New-Object System.Windows.Forms.Button -Property @{ Text = 'Cancel'; Location = New-Object System.Drawing.Point(240,228); Size = New-Object System.Drawing.Size(110,34); DialogResult = [System.Windows.Forms.DialogResult]::Cancel }
+    $buttonCancel = New-Object System.Windows.Forms.Button -Property @{ Text = 'Cancel'; Location = New-Object System.Drawing.Point(290,298); Size = New-Object System.Drawing.Size(110,34); DialogResult = [System.Windows.Forms.DialogResult]::Cancel }
     Style-Button -Button $buttonCancel -Variant 'secondary'
     $form.Controls.Add($buttonCancel)
 
@@ -1207,47 +1454,76 @@ function Show-CredentialDialog {
     $form.CancelButton = $buttonCancel
     $form.Add_Shown({ $textUser.Focus() })
 
+    # Filled by the Continue handler once everything is valid. A hashtable is used
+    # because the handler runs in its own scope: a plain variable assigned there would
+    # not be visible here after the dialog closes.
+    $accepted = @{ UserName = $null }
+
     $buttonOK.Add_Click({
-        if ([string]::IsNullOrWhiteSpace($textUser.Text)) {
-            [System.Windows.Forms.MessageBox]::Show('Please enter a username.', 'Error', 'OK', 'Error') | Out-Null
-            $textUser.Focus()
+        # 1) Quick local checks (no network needed).
+        $nameCheck = Resolve-GitHubUsernameInput -InputText $textUser.Text
+        if ($nameCheck.Problem) {
+            [System.Windows.Forms.MessageBox]::Show($nameCheck.Problem, 'Check your GitHub username', 'OK', 'Warning') | Out-Null
+            [void]$textUser.Focus(); $textUser.SelectAll()
             return
         }
-        if ([string]::IsNullOrWhiteSpace($textPass.Text)) {
-            [System.Windows.Forms.MessageBox]::Show('Please enter a password.', 'Error', 'OK', 'Error') | Out-Null
-            $textPass.Focus()
+        $pwProblem = Get-RStudioPasswordProblem -Password $textPass.Text -UserName $nameCheck.UserName
+        if ($pwProblem) {
+            [System.Windows.Forms.MessageBox]::Show($pwProblem, 'Choose another RStudio password', 'OK', 'Warning') | Out-Null
+            [void]$textPass.Focus(); $textPass.SelectAll()
             return
         }
+
+        # 2) Ask GitHub whether this user exists. This now happens while the dialog is
+        #    still open, so a typo can simply be corrected here. Before, the check ran
+        #    after the dialog had closed, and any failure closed the whole application.
+        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        $buttonOK.Enabled = $false
+        try {
+            $ghCheck = Test-GitHubUsername -UserName $nameCheck.UserName -Detailed
+        } finally {
+            $form.Cursor = [System.Windows.Forms.Cursors]::Default
+            $buttonOK.Enabled = $true
+        }
+
+        if ($ghCheck.Status -eq 'Unknown') {
+            # GitHub could not be asked (no network, proxy, too many checks from this
+            # network). That does not mean the name is wrong, so let the user decide
+            # instead of claiming the username does not exist.
+            $answer = [System.Windows.Forms.MessageBox]::Show(
+                "IMPACT could not check the username '$($nameCheck.UserName)' on GitHub:`n`n$($ghCheck.Message)`n`nContinue anyway with '$($nameCheck.UserName)'?`n`nChoose 'No' to correct the username or to try the check again.",
+                'GitHub check not possible', 'YesNo', 'Warning')
+            if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
+                [void]$textUser.Focus()
+                return
+            }
+            Write-Log "GitHub username '$($nameCheck.UserName)' could not be verified; user chose to continue." 'Warn'
+        } elseif ($ghCheck.Status -ne 'Exists') {
+            # NotFound or Organization: explain and keep the dialog open for a correction.
+            [System.Windows.Forms.MessageBox]::Show($ghCheck.Message, 'Check your GitHub username', 'OK', 'Warning') | Out-Null
+            [void]$textUser.Focus(); $textUser.SelectAll()
+            return
+        }
+
+        $accepted.UserName = $nameCheck.UserName
         $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $form.Close()
     })
 
     $result = $form.ShowDialog()
     Write-Log "Credential dialog result: $result" 'Debug'
-    if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
+    if ($result -ne [System.Windows.Forms.DialogResult]::OK -or -not $accepted.UserName) {
+        if ($hadPreviousCredentials) {
+            # Reached via "Back": keep the credentials that were already checked and
+            # continue, which brings the user back to the location step.
+            Write-Log 'Credential dialog closed without changes; keeping the previously entered credentials.' 'Info'
+            return 'next'
+        }
         Write-Log 'User cancelled the credential dialog.' 'Warn'
         return 'cancel'
     }
 
-    $originalUsername = $textUser.Text.Trim()
-    $normalizedUsername = ($originalUsername -replace '\s+', '').ToLower()
-    if ([string]::IsNullOrWhiteSpace($normalizedUsername)) {
-        [System.Windows.Forms.MessageBox]::Show('Username cannot be empty after removing spaces.', 'Invalid Username', 'OK', 'Error') | Out-Null
-        Write-Log 'Username empty after normalization; aborting.' 'Error'
-        return 'cancel'
-    }
-
-    # Validate that the username is a real GitHub account
-    Write-Log "Validating GitHub username '$normalizedUsername'..." 'Info'
-    if (-not (Test-GitHubUsername -UserName $normalizedUsername)) {
-        [System.Windows.Forms.MessageBox]::Show(
-            "The username '$normalizedUsername' was not found on GitHub.`n`nPlease enter your GitHub username (the one you log in to github.com with).",
-            'Invalid GitHub Username', 'OK', 'Warning') | Out-Null
-        Write-Log "GitHub username validation failed for '$normalizedUsername'; aborting." 'Warn'
-        return 'cancel'
-    }
-
-    $State.UserName = $normalizedUsername
+    $State.UserName = $accepted.UserName
     $State.Password = $textPass.Text
 
     Write-Log "Credentials collected for user $($State.UserName)" 'Info'
@@ -1525,7 +1801,7 @@ function Ensure-GitKeySetup {
     )
 
     try {
-        & ssh-keygen @sshKeyGenArgs
+        & { $PSNativeCommandArgumentPassing = 'Standard'; & ssh-keygen @sshKeyGenArgs }  # 'Standard' passes the empty -N '' passphrase through even if a profile switched to 'Legacy' (which drops it, so '-q' became the passphrase)
         $keyGenResult = $LASTEXITCODE
     } catch {
         Write-Log "ssh-keygen failed: $($_.Exception.Message)" 'Error'
@@ -1997,26 +2273,81 @@ function Remove-GitHubSshKey {
 <#
 .SYNOPSIS  Check whether a GitHub username exists via the public API.
 .PARAMETER UserName  The GitHub username to validate.
-.OUTPUTS   $true if the GitHub user exists, $false otherwise.
+.PARAMETER Detailed  Return an object that says WHY the check failed, instead of a
+                     plain $true/$false. A plain $false cannot tell "this user does not
+                     exist" apart from "GitHub could not be reached", and treating both
+                     as "not found" locked out colleagues who were offline, behind a
+                     proxy, or over GitHub's limit of 60 anonymous checks per hour (which
+                     a whole institute behind one internet address shares).
+.OUTPUTS   Without -Detailed: $true if the GitHub user exists, $false otherwise.
+           With -Detailed: [pscustomobject] @{ Status; Message } where Status is
+             'Exists'       the personal account exists,
+             'NotFound'     GitHub answered 404: there is no such account (typo?),
+             'Organization' the name belongs to an organisation, not a person,
+             'Unknown'      GitHub could not be asked (offline, proxy, rate limit, ...).
+           Message is a text for the user (empty for 'Exists').
 #>
 function Test-GitHubUsername {
-    param([Parameter(Mandatory)][string]$UserName)
+    param(
+        [Parameter(Mandatory)][string]$UserName,
+        [switch]$Detailed
+    )
     Write-Log "Validating GitHub username '$UserName'" 'Info'
+    $status = 'Unknown'
+    $message = ''
     try {
         $headers = @{ Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
-        $null = Invoke-RestMethod -Uri "https://api.github.com/users/$UserName" -Method Get -Headers $headers -ErrorAction Stop
-        Write-Log "GitHub username '$UserName' validated successfully." 'Info'
-        return $true
+        # EscapeDataString: characters such as ? # / must stay part of the name (and then
+        # give "not found") instead of changing the address that is asked; 'jdoe?x' used
+        # to be checked as 'jdoe'.
+        $uri = 'https://api.github.com/users/' + [uri]::EscapeDataString($UserName)
+        # -TimeoutSec: do not hang for minutes when the network is broken.
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -TimeoutSec 15 -ErrorAction Stop
+        # The same address also answers for organisations, which are not personal
+        # accounts. Read 'type' carefully: StrictMode throws on a missing property.
+        $accountType = $null
+        if ($response -is [System.Collections.IDictionary]) {
+            if ($response.Contains('type')) { $accountType = [string]$response['type'] }
+        } elseif ($null -ne $response -and $response.PSObject.Properties['type']) {
+            $accountType = [string]$response.type
+        }
+        if ($accountType -eq 'Organization') {
+            $status = 'Organization'
+            $message = "'$UserName' is a GitHub organisation, not a personal account. Please enter your own GitHub username."
+            Write-Log "GitHub name '$UserName' belongs to an organisation, not a user." 'Warn'
+        } else {
+            $status = 'Exists'
+            Write-Log "GitHub username '$UserName' validated successfully." 'Info'
+        }
     } catch {
         $statusCode = $null
         try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+        $errorText = $_.Exception.Message
         if ($statusCode -eq 404) {
+            # Only a real 404 answer from GitHub means "this user does not exist".
+            $status = 'NotFound'
+            $message = "The username '$UserName' was not found on GitHub. Please check the spelling.`n`nTo find your username, log in to github.com and click your profile picture (top right): the name shown there is your username. It is also the last part of your profile address github.com/<username>."
             Write-Log "GitHub username '$UserName' does not exist (404)." 'Warn'
         } else {
-            Write-Log "GitHub username validation failed: $($_.Exception.Message)" 'Warn'
+            # Everything else says nothing about the username itself.
+            $status = 'Unknown'
+            if ($statusCode -eq 403 -or $statusCode -eq 429) {
+                $message = "GitHub refused the check (HTTP $statusCode). This usually means that too many checks were made from your network within the last hour (GitHub's limit for anonymous checks). Try again later, or continue if you are sure the username is right."
+            } elseif ($statusCode -eq 407) {
+                $message = 'Your network proxy requires a login (HTTP 407), so GitHub could not be reached.'
+            } elseif ($statusCode) {
+                $message = "GitHub answered with an error (HTTP $statusCode). Details: $errorText"
+            } else {
+                $message = "github.com could not be reached (no internet connection, proxy or firewall?). Details: $errorText"
+            }
+            Write-Log "GitHub username validation failed (status=$statusCode): $errorText" 'Warn'
         }
-        return $false
     }
+
+    if ($Detailed) {
+        return [pscustomobject]@{ Status = $status; Message = $message }
+    }
+    return ($status -eq 'Exists')
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2047,6 +2378,9 @@ Export-ModuleMember -Function @(
     'Set-DockerSSHEnvironment'
     'Get-DockerContextArgs'
     'Get-DockerCredentialsFromDotEnv'
+    # Called by the GUI's remote build retry; it was missing here, so that call always
+    # failed with "command not found" (the GUI imports this .psm1, not the .psd1).
+    'Ensure-RemoteDockerLogin'
     'Convert-PathToDockerFormat'
     # Remote SSH
     'Test-RemoteSSHKeyFiles'
