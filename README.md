@@ -14,7 +14,7 @@ A Windows tool for building, starting and stopping **IMPACT NCD Germany** RStudi
 ## Quick start
 
 1. Install **PowerShell 7.3 or newer** once: `winget install --id Microsoft.PowerShell --source winget` (or the `.msi` from <https://aka.ms/powershell-release>).
-2. Double-click `current_version\IMPACT.bat` (or create a Desktop shortcut with `Create-Shortcut.bat`).
+2. Double-click `current_version\IMPACT.bat` (or create a Desktop shortcut with `Create-Shortcut.bat`). **Updating from an older version?** Run `Create-Shortcut.bat` once, because older shortcuts start PowerShell directly and skip the checks in `IMPACT.bat`.
 3. Enter your **GitHub username** and choose a **new RStudio password** (at least 8 characters, **not** your GitHub password).
 4. If a new SSH key was created, add the public key to GitHub (Settings, SSH and GPG keys).
 5. Choose **Local** or **Remote** and select your repository.

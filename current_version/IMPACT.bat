@@ -78,7 +78,14 @@ echo.
 choice /c OC /n /m "Press O to open the download page in your web browser, or C to close: "
 if errorlevel 2 exit /b 1
 start "" "https://aka.ms/powershell-release"
-exit /b 1
+REM Do not exit straight away. When IMPACT.bat was started by double-click or
+REM from the Desktop shortcut, exiting closes this window, and the install steps
+REM above (which file to choose, the winget command, signing out and back in)
+REM would disappear while the user is on the download page.
+echo.
+echo  The download page is opening in your web browser. Keep this window open
+echo  while you install PowerShell 7, so that you can follow the steps above.
+goto :pause_and_fail
 
 :pwsh_too_old
 echo.

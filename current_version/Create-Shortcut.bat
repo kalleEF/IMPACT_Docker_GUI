@@ -29,12 +29,21 @@ set "IMPACT_SHORTCUT_DIR=%~dp0"
 
 REM Windows PowerShell (powershell.exe) is part of every Windows 10/11 and is
 REM enough for this small job; PowerShell 7 is not needed to create the shortcut.
+REM
+REM CreateShortcut opens an IMPACT.lnk that already exists and keeps all of its
+REM old settings. Older versions of this file made a shortcut that started
+REM PowerShell directly, with the arguments "-NoProfile -ExecutionPolicy Bypass
+REM -File ...". If those arguments stayed, the new shortcut would hand them to
+REM IMPACT.bat, which passes them on to the GUI script, and IMPACT would stop at
+REM once ("A parameter cannot be found that matches parameter name 'NoProfile'").
+REM That is why the arguments are always cleared below.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
     "$dir = $env:IMPACT_SHORTCUT_DIR; " ^
     "$ws = New-Object -ComObject WScript.Shell; " ^
     "$desktop = $ws.SpecialFolders('Desktop'); " ^
     "$lnk = $ws.CreateShortcut([IO.Path]::Combine($desktop, 'IMPACT.lnk')); " ^
     "$lnk.TargetPath = [IO.Path]::Combine($dir, 'IMPACT.bat'); " ^
+    "$lnk.Arguments = ''; " ^
     "$lnk.WorkingDirectory = $dir; " ^
     "$icon = [IO.Path]::Combine($dir, 'IMPACT_icon.ico'); " ^
     "if (Test-Path -LiteralPath $icon) { $lnk.IconLocation = $icon }; " ^
@@ -45,8 +54,14 @@ set "SHORTCUT_EXIT=%errorlevel%"
 if not "%SHORTCUT_EXIT%"=="0" goto :failed
 
 REM Friendly hint only: the shortcut works, but IMPACT itself needs PowerShell 7.
+REM Look in the same two places as IMPACT.bat: on PATH and in the standard
+REM install folder. Right after installing PowerShell 7, Windows Explorer may
+REM still use the old PATH, so "where" alone would wrongly say it is missing.
+set "PWSH_FOUND="
 where pwsh.exe >nul 2>&1
-if errorlevel 1 echo Note: PowerShell 7 is not installed yet. When you start IMPACT, it explains how to install it.
+if not errorlevel 1 set "PWSH_FOUND=1"
+if exist "%ProgramFiles%\PowerShell\7\pwsh.exe" set "PWSH_FOUND=1"
+if not defined PWSH_FOUND echo Note: PowerShell 7 is not installed yet. When you start IMPACT, it explains how to install it.
 
 echo.
 echo Done! You can now start IMPACT with the IMPACT shortcut on your Desktop.

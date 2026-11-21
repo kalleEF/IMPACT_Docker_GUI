@@ -68,15 +68,15 @@ IMPACT_Docker_GUI.psm1    (module: logging, state, SSH/Docker/YAML/git helpers,
 
 1. `cd /d "%~dp0"`; stops with an explanation if `IMPACT_Docker_GUI_v2.ps1` or `IMPACT_Docker_GUI.psm1` is not next to it.
 2. Finds `pwsh.exe` with `where`, then `%ProgramFiles%\PowerShell\7\pwsh.exe` (Explorer may still have an old PATH right after installing).
-3. Missing: prints install instructions (`winget install --id Microsoft.PowerShell --source winget`, <https://aka.ms/powershell-release>, Microsoft Store, ask IT), offers to open the download page, exits 1. **No fallback to Windows PowerShell 5.1.**
+3. Missing: prints install instructions (`winget install --id Microsoft.PowerShell --source winget`, <https://aka.ms/powershell-release>, Microsoft Store, ask IT), offers to open the download page, then waits for a key press (so the instructions stay readable while the user is on the download page) and exits 1. **No fallback to Windows PowerShell 5.1.**
 4. Version check: `pwsh -Command` exits 3 when the version is below 7.3; the launcher then shows update instructions (`winget upgrade ...`) and pauses.
-5. Runs `pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File IMPACT_Docker_GUI_v2.ps1 %*`, saves `%errorlevel%` on the next line (outside any `( )` block, where cmd would expand it too early) and pauses on any non-zero code, also negative crash codes.
+5. Runs `pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File IMPACT_Docker_GUI_v2.ps1 %*`, saves `%errorlevel%` on the next line (outside any `( )` block, where cmd would expand it too early) and pauses on any non-zero code, also negative crash codes. Note: when a wizard step fails (for example `Ensure-GitKeySetup` returns `$false`), `Invoke-ImpactGui` just returns, so pwsh exits with 0 and the launcher does not pause (see KNOWN_BUGS).
 
 Both `.bat` files must have CRLF line endings; `.gitattributes` (`*.bat text eol=crlf`, `*.cmd text eol=crlf`) makes git write them that way into every checkout and into GitHub's ZIP download.
 
 ### `Create-Shortcut.bat`
 
-Creates `IMPACT.lnk` on the Desktop with `WScript.Shell` via Windows PowerShell (always present). Target `IMPACT.bat`, working directory and icon from the tool folder. The folder path is passed through the environment variable `IMPACT_SHORTCUT_DIR`, so paths containing `&` or `'` work. Prints a note when PowerShell 7 is not installed yet.
+Creates `IMPACT.lnk` on the Desktop with `WScript.Shell` via Windows PowerShell (always present). Target `IMPACT.bat`, working directory and icon from the tool folder. The folder path is passed through the environment variable `IMPACT_SHORTCUT_DIR`, so paths containing `&` or `'` work. `Arguments` is always set to empty: `CreateShortcut` on an existing `.lnk` keeps its old properties, and shortcuts from older versions had `-NoProfile -ExecutionPolicy Bypass -File ...` there, which `IMPACT.bat` would pass on to the `[CmdletBinding()]` script (parameter binding error, exit 1). Prints a note when PowerShell 7 is not installed yet; like `IMPACT.bat` it looks on PATH and in `%ProgramFiles%\PowerShell\7`.
 
 ### `Ensure-PowerShell7` (module)
 
@@ -266,7 +266,7 @@ Order of checks and actions:
 
 ### Busy mode (`Set-ManagerBusy`)
 
-Saves and disables Start/Stop/Back/Close, sets `Metadata.Busy`, shows a status text and the wait cursor and calls `$form.Refresh()` (no `DoEvents`, so no other click can run in the middle). `FormClosing` refuses to close while `Metadata['Busy']` is set ("Please wait"). Currently only the image build uses it; volume copies and `docker run` still block without busy mode.
+Saves and disables Start/Stop/Back/Close, sets `Metadata.Busy`, shows a status text and the wait cursor and calls `$form.Refresh()` (no `DoEvents`, so no other click can run in the middle). `FormClosing` refuses to close while `Metadata['Busy']` is set ("Please wait"). This does not protect the build itself: `Start-Process -Wait` blocks the UI thread, so `FormClosing` cannot run, Windows marks the window as not responding, and its "Close the program" choice kills pwsh in the middle of the build (the user guide tells users to choose **Wait**). Currently only the image build uses it; volume copies and `docker run` still block without busy mode.
 
 ---
 

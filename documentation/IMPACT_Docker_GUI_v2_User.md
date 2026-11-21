@@ -158,7 +158,9 @@ Entries for other hosts are never touched. The block for the workstation **is re
 - looks for PowerShell 7 (on PATH, then in `C:\Program Files\PowerShell\7`),
 - explains how to install or update PowerShell 7 if it is missing or older than 7.3,
 - starts the GUI,
-- keeps the window open with "Press any key to close this window..." if something went wrong, so you can read the message.
+- keeps the window open with "Press any key to close this window..." when IMPACT stops with an error or crashes, so you can read the message.
+
+Other problems are shown in a message box. A few problems in the first steps (for example "SSH key generation failed") are only written to the console and to the log file, and the window then closes. If the window closes without a message, look at the end of the log file (see [Logs](#logs-and-diagnostics)).
 
 On start, IMPACT checks that the `docker` and `ssh` programs exist, starts its log file and switches the console to UTF-8 (so umlauts display correctly). If Git for Windows is missing, a yellow warning in the console says that the commit offer is not available in local mode.
 
@@ -310,7 +312,7 @@ IMPACT checks everything that can be checked quickly **before** the long image b
    - **Setting missing in YAML**: add the line (for example `output_dir: ./outputs`) to the file.
    - **Path error**: a Linux-style path (`/mnt/...` or `~/...`) in local mode. Use `sim_design_local.yaml` with Windows or relative paths for local runs.
    - **Folder missing**: IMPACT offers to create it (on your PC, or inside the repository on the workstation). Folders outside the repository on the workstation (for example `/mnt/...`) are never created; ask the admin.
-7. **Image build** (only if the image does not exist yet, or **Rebuild image** is ticked). The window switches to "busy": the buttons are greyed out, the status line says `Building the Docker image (30+ min). Progress: see the console window.`, and the window cannot be closed (**Please wait**). Follow the progress in the console window. If the build fails, IMPACT automatically tries again:
+7. **Image build** (only if the image does not exist yet, or **Rebuild image** is ticked). The window switches to "busy": the buttons are greyed out, the status line says `Building the Docker image (30+ min). Progress: see the console window.`, and you should not close the IMPACT window. Follow the progress in the console window. Because the build runs on the window's own thread, Windows may show the window as "Not Responding". If Windows asks whether to close IMPACT because it is not responding, choose **Wait**. Closing it stops IMPACT in the middle of the build. If the build fails, IMPACT automatically tries again:
    - remote only: with a `docker login` using credentials from `docker_setup/.env` in the repository (if present),
    - then by building the prerequisite image (`Dockerfile.prerequisite.IMPACTncdGER`) and the main image again.
    This can take a long time. **Build failed** means all attempts failed; see the console output.
@@ -459,7 +461,7 @@ After the container is stopped, IMPACT looks at the repository (on your PC in lo
 | **"PowerShell 7 was not found"** (in the black window) | Install PowerShell 7 as shown in the window or in [One-time setup](#one-time-setup-on-a-new-pc). Then double-click `IMPACT.bat` again; if the message stays, sign out of Windows and back in once. |
 | **"Your PowerShell 7 is too old"** / **PowerShell update required** | Run `winget upgrade --id Microsoft.PowerShell --source winget`, or install the latest version from <https://aka.ms/powershell-release>. |
 | **"IMPACT_Docker_GUI_v2.ps1 or IMPACT_Docker_GUI.psm1 was not found"** | `IMPACT.bat` was copied away from the IMPACT folder. Use the one in the IMPACT folder, or create a Desktop shortcut with `Create-Shortcut.bat`. |
-| A window flashes and closes | Start `IMPACT.bat` from the IMPACT folder; it now always waits for a key press after an error. |
+| A window flashes and closes | Start `IMPACT.bat` from the IMPACT folder or with the Desktop shortcut. When IMPACT stops with an error or crashes, the window stays open until you press a key. Other problems are shown in a message box or written to the log file: if the window still closes without a message, look at the end of the log file (see [Logs](#logs-and-diagnostics)). If your Desktop shortcut was made by an older IMPACT version, run `Create-Shortcut.bat` once to renew it. |
 | **Docker missing** | For local mode install Docker Desktop. For remote-only use, the `docker.exe` command-line program on your PATH is enough. |
 | **Install OpenSSH Client?** / **SSH missing** | Click Yes and accept the Windows permission prompt. Without admin rights, ask IT to install the Windows feature "OpenSSH Client". |
 | **IMPACT encountered a fatal error** | Note the message, look at the log file (see [Logs](#logs-and-diagnostics)) and contact the maintainer. |
@@ -524,7 +526,7 @@ After the container is stopped, IMPACT looks at the repository (on your PC in lo
 | Problem | What to do |
 |---|---|
 | Dialogs open on the wrong monitor | Move the mouse to the monitor you want before the dialog opens; windows open on the monitor with the mouse pointer. |
-| The window says "Not Responding" during a build | Normal: the build runs on the window's thread. Watch the console window; the window comes back when the build is done. |
+| The window says "Not Responding" during a build | Normal: the build runs on the window's thread. Watch the console window; the window comes back when the build is done. If Windows asks whether to close IMPACT because it is not responding, choose **Wait**. Closing it stops IMPACT in the middle of the build. |
 
 ---
 
@@ -563,8 +565,9 @@ When you report a problem, send the log file and the footer line of the Containe
 
 ## Launcher and desktop shortcut
 
-- **`IMPACT.bat`** starts the tool. It needs PowerShell 7.3 or newer and explains how to install it if it is missing. It never falls back to the old Windows PowerShell. After an error it waits for a key press.
+- **`IMPACT.bat`** starts the tool. It needs PowerShell 7.3 or newer and explains how to install it if it is missing. It never falls back to the old Windows PowerShell. When IMPACT stops with an error or crashes, it waits for a key press; other problems are shown in a message box or written to the log file.
 - **`Create-Shortcut.bat`** creates `IMPACT.lnk` on your Desktop with the IMPACT icon. The shortcut starts `IMPACT.bat` in the IMPACT folder, so keep the folder where it is (run `Create-Shortcut.bat` again if you move it).
+- **Updating from an older IMPACT version:** run `Create-Shortcut.bat` once after updating, even if you already have an IMPACT shortcut. Older shortcuts start PowerShell directly, so they skip the checks in `IMPACT.bat`.
 - **To give the tool to a colleague**, copy the whole `current_version` folder: `IMPACT.bat`, `Create-Shortcut.bat`, `IMPACT_Docker_GUI_v2.ps1`, `IMPACT_Docker_GUI.psm1`, `IMPACT_Docker_GUI.psd1` and `IMPACT_icon.ico`. The Dockerfiles (`docker_setup`) and the YAML files are part of the model repository, not of the tool.
 
 ---
