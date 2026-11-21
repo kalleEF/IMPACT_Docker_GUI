@@ -99,7 +99,10 @@ function Ensure-RemotePreparation {
             return $false
         }
         if ($probeFailure -eq 'HostKeyChanged') {
-            $msg = "The workstation at $remoteIp identified itself with a different SSH host key than the one this PC remembers.`n`nThis is expected after the workstation was reinstalled, but it can also mean that the connection is being intercepted. For your safety IMPACT will not send your password.`n`nAsk the workstation admin whether the workstation was reinstalled. If it was, run this command in PowerShell and then start IMPACT again:`n  ssh-keygen -R $remoteIp`n`nIf IMPACT asked you for the workstation password before (it then used the Posh-SSH module), also run:`n  Remove-SSHTrustedHost -HostName $remoteIp"
+            $msg = "The workstation at $remoteIp identified itself with a different SSH host key than the one this PC remembers.`n`nThis is expected after the workstation was reinstalled, but it can also mean that the connection is being intercepted. For your safety IMPACT will not send your password.`n`nAsk the workstation admin whether the workstation was reinstalled. If it was, run this command in PowerShell and then start IMPACT again:`n  ssh-keygen -R $remoteIp`n`nIf IMPACT asked you for the workstation password before (it then used the Posh-SSH module), also run:`n  Remove-SSHTrustedHost -HostName $remoteIp`n(older Posh-SSH versions: Remove-SSHTrustedHost -SSHHost $remoteIp)"
+            # The second form is for Posh-SSH 2.x, which names the parameter -SSHHost
+            # (-HostName exists only from 3.x on); the Posh-SSH message further down lists
+            # both forms the same way.
             Write-Log "Host key of $remoteIp has changed; stopping before any password is sent: $probeOut" 'Error'
             [System.Windows.Forms.MessageBox]::Show($msg, 'Workstation identity changed', 'OK', 'Warning') | Out-Null
             return $false
@@ -189,6 +192,8 @@ echo 'SSH_KEY_COPIED'
         # be mistaken for a wrong password.
         $poshSshAuthFailed = $false
         $poshSshHostKeyRejected = $false
+        # Set when the workstation does not accept password logins at all (see the catch).
+        $poshSshPasswordLoginOff = $false
         $sshSession = $null
         $remoteTemp = "/tmp/ssh_key_temp_$($State.UserName)_$(Get-Date -Format 'HHmmss').pub"
         try {
@@ -320,7 +325,13 @@ echo SSH_KEY_COPIED
             # exchange.
             $exTypeNames = @($ex.GetType().Name; if ($ex.InnerException) { $ex.InnerException.GetType().Name })
             if ($exTypeNames -contains 'SshAuthenticationException') {
-                $poshSshAuthFailed = $true
+                # SSH.NET uses the same exception type when the workstation does not offer
+                # password login at all (the admin switched it off). The message then reads
+                # "No suitable authentication method found to complete authentication
+                # (publickey)". Counting that as a wrong password reopened the password
+                # dialog again and again (only Cancel ended it), so it gets its own message.
+                if ($poshSshErrorText -match 'No suitable authentication method') { $poshSshPasswordLoginOff = $true }
+                else { $poshSshAuthFailed = $true }
             } elseif ($exTypeNames -contains 'SshConnectionException' -and $poshSshErrorText -match 'Key exchange negotiation failed|HostKeyNotVerifiable|fingerprint|host key') {
                 $poshSshHostKeyRejected = $true
             }
@@ -340,6 +351,16 @@ echo SSH_KEY_COPIED
                 $msg = "Posh-SSH did not accept the identity (SSH host key) of the workstation at $remoteIp. This usually means the workstation was reinstalled, but it can also mean that the connection is being intercepted. For your safety IMPACT did not log in.`n`nAsk the workstation admin whether the workstation was reinstalled. If it was, run this command in PowerShell and then start IMPACT again:`n  Remove-SSHTrustedHost -HostName $remoteIp`n(older Posh-SSH versions: Remove-SSHTrustedHost -SSHHost $remoteIp)`n`nDetails: $poshSshErrorText"
                 Write-Log $msg 'Error'
                 [System.Windows.Forms.MessageBox]::Show($msg, 'Workstation identity changed', 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            if ($poshSshPasswordLoginOff) {
+                # No retry here: typing the password again cannot help. The admin can add the
+                # public key by hand; after that the key login at the top of this function
+                # works and no password is needed. (The .pub file is safe to send: it is the
+                # public half of the key, not the private key.)
+                $msg = "The workstation at $remoteIp does not accept password logins (the admin has switched them off), so IMPACT cannot copy your SSH key there by itself. Typing the password again will not help.`n`nPlease ask the workstation admin to add your public SSH key to the account '$remoteUser'. Send them this file (it is safe to share, it is not your private key):`n  $($State.Paths.SshPublic)`n`nThen start IMPACT again.`n`nDetails: $poshSshErrorText"
+                Write-Log $msg 'Error'
+                [System.Windows.Forms.MessageBox]::Show($msg, 'Password login not allowed', 'OK', 'Warning') | Out-Null
                 return $false
             }
             if ($poshSshAuthFailed) {
@@ -491,15 +512,34 @@ echo SSH_KEY_COPIED
             Write-Log "Remote private key copy may have failed: $pkOut" 'Warn'
             # Without the key on the workstation, Start is refused later with "close IMPACT
             # and start it again", and this step then fails silently again, so the user
-            # would loop without ever seeing why. If a key from an earlier session is
-            # already there, a failed refresh is harmless (it is the same key); if not,
-            # stop here and show the reason.
-            $keyPresentOut = $null
-            try { $keyPresentOut = & ssh @sshArgs "test -s $remoteKeyFile && echo KEY_PRESENT || echo KEY_ABSENT" 2>&1 } catch { $keyPresentOut = $_.Exception.Message }
-            if (-not ("$keyPresentOut" -match 'KEY_PRESENT')) {
+            # would loop without ever seeing why.
+            # A copy left by an earlier session is only good enough if it is the SAME key
+            # as on this PC. When this PC's IMPACT key was created again (for example after
+            # the local key file was deleted), the old copy on the workstation no longer
+            # matches, and git in the container would fail on Stop with "Permission denied
+            # (publickey)" with no hint why. So the workstation works out the public key of
+            # its copy ('ssh-keygen -y'; IMPACT keys have no passphrase) and we compare it
+            # with this PC's .pub file: key type and key only, because the comment at the
+            # end may differ. A missing copy, a different key or a failed check all stop
+            # here with the reason.
+            $localPubKey = ''
+            try { $localPubKey = (@("$(Get-Content -LiteralPath $State.Paths.SshPublic -Raw -ErrorAction Stop)".Trim() -split '\s+') | Select-Object -First 2) -join ' ' } catch { $localPubKey = '' }
+            $remotePubOut = $null
+            try { $remotePubOut = & ssh @sshArgs "ssh-keygen -y -f $remoteKeyFile 2>/dev/null || echo KEY_UNREADABLE" 2>&1 } catch { $remotePubOut = $_.Exception.Message }
+            # Only the line that looks like a public key ("ssh-ed25519 AAAA..."): ssh can add
+            # warning lines of its own to the output.
+            $remotePubLine = "$(@($remotePubOut) | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^(ssh|ecdsa|sk)-\S+\s+\S+' } | Select-Object -First 1)"
+            $remotePubKey = (@($remotePubLine -split '\s+') | Select-Object -First 2) -join ' '
+            if ($localPubKey -and $remotePubKey -ceq $localPubKey) {
+                Write-Log 'The workstation still has the same SSH key from an earlier session, so the failed refresh does no harm.' 'Info'
+            } else {
                 $pkDetail = (@($pkOut) | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -Last 3) -join ' '
                 if (-not $pkDetail) { $pkDetail = '(no error text)' }
-                $msg = "IMPACT could not copy your SSH key to the workstation ($remoteIp). Git inside the container needs it.`n`nDetails: $pkDetail`n`nPlease check the network or VPN connection and try again. If this keeps happening, ask the workstation admin whether the disk of the workstation is full or the folder ~/.ssh is not writable."
+                # Say so when an OLD, different key is still there: that is the case that used
+                # to pass silently and break the push later.
+                $staleNote = if ($remotePubLine -and $localPubKey) { "The workstation still has an older copy of your key that does not match the key on this PC, so git inside the container would be refused by GitHub.`n`n" } else { '' }
+                Write-Log "Remote key check: local=$localPubKey remote=$remotePubKey" 'Debug'
+                $msg = "IMPACT could not copy your SSH key to the workstation ($remoteIp). Git inside the container needs it.`n`n$($staleNote)Details: $pkDetail`n`nPlease check the network or VPN connection and try again. If this keeps happening, ask the workstation admin whether the disk of the workstation is full or the folder ~/.ssh is not writable."
                 Write-Log $msg 'Error'
                 [System.Windows.Forms.MessageBox]::Show($msg, 'SSH key copy failed', 'OK', 'Error') | Out-Null
                 return $false
