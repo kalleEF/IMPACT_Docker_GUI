@@ -4,19 +4,20 @@ A Windows tool for building, starting and stopping **IMPACT NCD Germany** RStudi
 
 ## What it does
 
-- Creates a personal SSH key for GitHub and for logging in to the workstation
+- Creates a personal SSH key for GitHub and for logging in to the workstation, and checks at every start that GitHub accepts it
 - Builds the Docker image from the model repository's `docker_setup` folder and starts an RStudio Server container
 - Works **locally** (Docker Desktop, RStudio reachable only from your PC) or **remotely** (Docker Engine on the workstation, account `php-workstation`)
 - Mounts the repository into the container, so you edit the real files in RStudio in your browser
 - Optional Docker volumes for outputs and synthpop, copied back to your folders when you stop (volumes are deleted only after a successful copy)
-- When you stop, offers to commit and push your changes with your own GitHub identity and key
+- When you stop, offers to commit and push your changes with your own GitHub identity and key, and tells you in the status line if your changes could not be checked or pushed
+- Leaves your PC's global Docker settings alone: it picks the Docker engine only for its own commands
 
 ## Quick start
 
 1. Install **PowerShell 7.3 or newer** once: `winget install --id Microsoft.PowerShell --source winget` (or the `.msi` from <https://aka.ms/powershell-release>).
 2. Double-click `current_version\IMPACT.bat` (or create a Desktop shortcut with `Create-Shortcut.bat`). **Updating from an older version?** Run `Create-Shortcut.bat` once, because older shortcuts start PowerShell directly and skip the checks in `IMPACT.bat`.
 3. Enter your **GitHub username** and choose a **new RStudio password** (at least 8 characters, **not** your GitHub password).
-4. If a new SSH key was created, add the public key to GitHub (Settings, SSH and GPG keys).
+4. If IMPACT shows your public key (a new key, or a key that GitHub does not accept yet), add it to GitHub (Settings, SSH and GPG keys, or click **Open GitHub** in that window).
 5. Choose **Local** or **Remote** and select your repository.
 6. Click **Start Container**, open the URL shown, log in as `rstudio`.
 7. Click **Stop Container** when you are done (it asks for confirmation).
