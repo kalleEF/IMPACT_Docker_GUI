@@ -1555,3 +1555,80 @@ Describe 'Get-SshFailureKind' -Tag Unit {
         Get-SshFailureKind -Output $null | Should -Be 'Unknown'
     }
 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ConvertTo-DockerSafeRepoName: folder name -> name Docker accepts
+#  (container name "<repo>_<user>", lower-cased image name, REPO_NAME build arg)
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'ConvertTo-DockerSafeRepoName' -Tag Unit {
+    BeforeAll {
+        # Docker's rule for one part of an image name (checked on the lower-cased name)
+        # and its rule for container names. Every non-empty result must pass both.
+        $script:ImageNameRule     = '^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*$'
+        $script:ContainerNameRule = '^[a-zA-Z0-9][a-zA-Z0-9_.-]+$'
+    }
+
+    It 'Leaves an already valid name unchanged: <Name>' -TestCases @(
+        @{ Name = 'IMPACTncd_Germany' }
+        @{ Name = 'IMPACTncd_Germany-main' }
+        @{ Name = 'model.v2' }
+        @{ Name = 'a__b' }
+        @{ Name = 'a--b' }
+    ) {
+        param($Name)
+        ConvertTo-DockerSafeRepoName -Name $Name | Should -BeExactly $Name
+    }
+
+    It 'Turns "<Name>" into "<Expected>"' -TestCases @(
+        @{ Name = 'IMPACTncd_Germany - Kopie';  Expected = 'IMPACTncd_Germany_Kopie' }
+        @{ Name = 'IMPACTncd_Germany-main (1)'; Expected = 'IMPACTncd_Germany-main_1' }
+        @{ Name = '[test] repo';                Expected = 'test_repo' }
+        @{ Name = 'v1.2 (copy)';                Expected = 'v1.2_copy' }
+        @{ Name = 'a___b';                      Expected = 'a_b' }
+        @{ Name = 'a._b';                       Expected = 'a_b' }
+        @{ Name = '.hidden';                    Expected = 'hidden' }
+    ) {
+        param($Name, $Expected)
+        ConvertTo-DockerSafeRepoName -Name $Name | Should -BeExactly $Expected
+    }
+
+    It 'Replaces accented letters by plain letters (German umlauts and sharp s)' {
+        # Written with char codes so the test does not depend on the file encoding:
+        # U+00DC = U-umlaut, U+00F6 = o-umlaut, U+00DF = sharp s
+        $name = "$([char]0x00DC)bung_Gr$([char]0x00F6)$([char]0x00DF)e"
+        ConvertTo-DockerSafeRepoName -Name $name | Should -BeExactly 'Ubung_Grosse'
+    }
+
+    It 'Does not keep non-ASCII letters that lower-case to ASCII (Kelvin sign)' {
+        $result = ConvertTo-DockerSafeRepoName -Name "x$([char]0x212A)y"
+        $result | Should -MatchExactly '^[A-Za-z0-9._-]+$'
+    }
+
+    It 'Returns an empty string when nothing usable is left: "<Name>"' -TestCases @(
+        @{ Name = '' }
+        @{ Name = '   ' }
+        @{ Name = '(((' }
+        @{ Name = '---' }
+    ) {
+        param($Name)
+        ConvertTo-DockerSafeRepoName -Name $Name | Should -BeExactly ''
+    }
+
+    It 'Returns an empty string for $null' {
+        ConvertTo-DockerSafeRepoName -Name $null | Should -BeExactly ''
+    }
+
+    It 'Always produces a valid Docker image and container name: "<Name>"' -TestCases @(
+        @{ Name = 'IMPACTncd_Germany - Kopie' }
+        @{ Name = 'My Model (v2) [final]' }
+        @{ Name = "Gr$([char]0x00F6)$([char]0x00DF)e Studie" }
+        @{ Name = '_leading_and_trailing_' }
+        @{ Name = 'x' }
+    ) {
+        param($Name)
+        $result = ConvertTo-DockerSafeRepoName -Name $Name
+        $result | Should -Not -BeNullOrEmpty
+        $result.ToLowerInvariant() | Should -MatchExactly $script:ImageNameRule
+        "$($result)_someuser" | Should -MatchExactly $script:ContainerNameRule
+    }
+}

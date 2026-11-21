@@ -574,17 +574,35 @@ echo SSH_KEY_COPIED
     Write-Log "Ensuring Docker context $contextName exists (ssh://$remoteHost)" 'Info'
     $ctxExists = (& docker context ls --format '{{.Name}}' 2>$null) -contains $contextName
     if (-not $ctxExists) {
-        try {
-            & docker context create $contextName --docker "host=ssh://$remoteHost" | Out-Null
+        # A failing native command such as docker does NOT throw in PowerShell, so a
+        # try/catch never noticed a failure here. Check the exit code instead.
+        & docker context create $contextName --docker "host=ssh://$remoteHost" 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
             Write-Log "Docker context $contextName created." 'Debug'
-        } catch {
+        } else {
             Write-Log "Failed to create docker context, will attempt direct DOCKER_HOST fallback." 'Warn'
         }
     }
 
-    $contextActive = $false
-    if ((& docker context ls --format '{{.Name}}' 2>$null) -contains $contextName) {
-        try { & docker context use $contextName | Out-Null; $contextActive = $true } catch { $contextActive = $false }
+    # We deliberately do NOT run 'docker context use' here. That command changes the
+    # user's GLOBAL Docker setting (saved in ~/.docker/config.json) and it stayed changed
+    # after the app closed: later "Local" checks, and the user's own docker commands,
+    # then silently talked to the shared workstation (or hung for minutes off the VPN).
+    # It is not needed: every remote docker call in this app passes
+    # '--context remote-<ip>' explicitly (see Get-DockerContextArgs).
+    $contextActive = ((& docker context ls --format '{{.Name}}' 2>$null) -contains $contextName)
+
+    # Older versions of this app DID switch the global context. If it still points at
+    # this workstation, switch it back to Docker's built-in 'default' context so the
+    # user's own docker commands talk to this computer again. ('docker context show'
+    # does not exist in very old Docker versions; then the exit code is non-zero and
+    # we simply skip this repair.)
+    $currentGlobalContext = & docker context show 2>$null
+    if ($LASTEXITCODE -eq 0 -and "$currentGlobalContext".Trim() -eq $contextName) {
+        & docker context use default *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log "Reset the global Docker context from '$contextName' back to 'default' (left over from an older version of this app)." 'Info'
+        }
     }
 
     if (-not $contextActive) {
@@ -593,7 +611,7 @@ echo SSH_KEY_COPIED
         Set-DockerSSHEnvironment -State $State
     } else {
         $State.Flags.UseDirectSsh = $false
-        Write-Log "Docker context set to $contextName" 'Info'
+        Write-Log "Using Docker context $contextName (passed with --context on each call)." 'Info'
     }
 
     # 4.1.5: Verify Docker Engine is installed and running on the remote host
@@ -738,7 +756,9 @@ function Ensure-LocalPreparation {
     }
 
     $documentsPath = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::MyDocuments)
-    if (Test-Path $documentsPath) {
+    # -LiteralPath: treat the path as plain text. Without it, PowerShell reads '[' and ']'
+    # in a folder name as wildcard characters and the test can wrongly fail.
+    if ($documentsPath -and (Test-Path -LiteralPath $documentsPath)) {
         $folderBrowser.SelectedPath = $documentsPath
     }
 
@@ -750,20 +770,95 @@ function Ensure-LocalPreparation {
     }
 
     $selectedPath = $folderBrowser.SelectedPath
-    if ([string]::IsNullOrWhiteSpace($selectedPath) -or -not (Test-Path $selectedPath)) {
+    if ([string]::IsNullOrWhiteSpace($selectedPath) -or -not (Test-Path -LiteralPath $selectedPath)) {
         Write-Log 'Invalid folder selection.' 'Error'
         [System.Windows.Forms.MessageBox]::Show('Please select a valid folder containing your repository.', 'Invalid Selection', 'OK', 'Error') | Out-Null
         return $false
     }
 
+    # Docker Desktop can only share folders that are on a disk of THIS computer with a
+    # container. A network share (\\server\share\...) or a mapped network drive (for
+    # example H:\ when "Documents" is redirected to a file server) is accepted by the
+    # folder picker, but 'docker run' then fails with a confusing mount error, and only
+    # after the long image build. So we stop here with a clear explanation instead.
+    $isNetworkFolder = $false
+    if ($selectedPath -match '^(\\\\|//)') {
+        # Starts with \\ or // : a UNC network path (also covers \\wsl.localhost\...).
+        $isNetworkFolder = $true
+    } else {
+        try {
+            $driveRoot = [System.IO.Path]::GetPathRoot($selectedPath)
+            if ($driveRoot -and ([System.IO.DriveInfo]::new($driveRoot)).DriveType -eq [System.IO.DriveType]::Network) {
+                $isNetworkFolder = $true
+            }
+        } catch {
+            # If Windows cannot tell us the drive type, do not block the user.
+            Write-Log "Could not determine the drive type of '$selectedPath': $($_.Exception.Message)" 'Debug'
+        }
+    }
+    if ($isNetworkFolder) {
+        Write-Log "Selected folder is on a network drive or share: $selectedPath" 'Error'
+        [System.Windows.Forms.MessageBox]::Show(
+            "The selected folder is on a network drive or network share:`n$selectedPath`n`nDocker Desktop cannot share network folders with containers, so the model could not start from here.`n`nPlease copy or clone the repository to a folder on this computer (for example C:\Users\<your name>\Repositories) and select that folder.",
+            'Network Folder Not Supported', 'OK', 'Error') | Out-Null
+        return $false
+    }
+
+    # The model repository must contain a 'docker_setup' folder (the image is built from
+    # it). Checking now catches a wrong folder choice (for example the parent folder
+    # 'Repositories') right away instead of only when the user clicks Start.
+    if (-not (Test-Path -LiteralPath (Join-Path $selectedPath 'docker_setup') -PathType Container)) {
+        Write-Log "No docker_setup folder found in selected folder: $selectedPath" 'Error'
+        [System.Windows.Forms.MessageBox]::Show(
+            "The selected folder does not contain a 'docker_setup' folder:`n$selectedPath`n`nPlease select the main folder of the model repository (the folder that contains 'docker_setup').",
+            'Not a Model Repository', 'OK', 'Error') | Out-Null
+        return $false
+    }
+
+    # The folder name is reused as the container name, the image name and the folder name
+    # inside the container. Docker rejects names with spaces, brackets or accents (for
+    # example 'IMPACTncd_Germany - Kopie'), which used to make Start fail with only
+    # "Docker build failed". ConvertTo-DockerSafeRepoName (module) leaves normal names
+    # unchanged and turns other names into a safe form ('IMPACTncd_Germany_Kopie').
+    $folderName = Split-Path $selectedPath -Leaf
+    $safeRepoName = ConvertTo-DockerSafeRepoName -Name $folderName
+    if (-not $safeRepoName) {
+        Write-Log "Folder name '$folderName' cannot be turned into a Docker name." 'Error'
+        [System.Windows.Forms.MessageBox]::Show(
+            "The folder name '$folderName' cannot be used by Docker.`n`nPlease rename the folder using only letters (A-Z), digits, '-' or '_' (for example IMPACTncd_Germany) and select it again.",
+            'Unsupported Folder Name', 'OK', 'Error') | Out-Null
+        return $false
+    }
+    if ($safeRepoName -cne $folderName) {
+        Write-Log "Folder name '$folderName' contains characters Docker does not accept; using '$safeRepoName' for the container and image name instead." 'Warn'
+    }
+
+    # OneDrive folders DO work with Docker, but OneDrive keeps uploading every change in
+    # the Git data and in the (large) simulation outputs. This can slow the computer down,
+    # fill the OneDrive quota and cause sync conflicts. Warn, but let the user continue.
+    $inOneDrive = ($selectedPath -match '\\OneDrive( - [^\\]+)?(\\|$)')
+    foreach ($oneDriveRoot in @($env:OneDrive, $env:OneDriveCommercial, $env:OneDriveConsumer)) {
+        if ($oneDriveRoot -and $selectedPath.StartsWith($oneDriveRoot, [System.StringComparison]::OrdinalIgnoreCase)) { $inOneDrive = $true }
+    }
+    if ($inOneDrive) {
+        Write-Log "Selected folder is inside OneDrive: $selectedPath" 'Warn'
+        $oneDriveChoice = [System.Windows.Forms.MessageBox]::Show(
+            "The selected folder is inside OneDrive:`n$selectedPath`n`nThis works, but OneDrive will keep syncing the model's Git data and its (possibly large) output files. That can slow down your computer, use up your OneDrive storage and cause sync conflicts.`n`nA folder outside OneDrive (for example C:\Users\<your name>\Repositories) is recommended.`n`nContinue with this folder anyway?",
+            'Folder Inside OneDrive', 'YesNo', 'Warning')
+        if ($oneDriveChoice -ne [System.Windows.Forms.DialogResult]::Yes) {
+            Write-Log 'User chose not to use the OneDrive folder.' 'Info'
+            return $false
+        }
+    }
+
     $State.Paths.LocalRepo = $selectedPath
-    $State.SelectedRepo = Split-Path $selectedPath -Leaf
+    $State.SelectedRepo = $safeRepoName
     $State.ContainerName = "$($State.SelectedRepo)_$($State.UserName)"
     Write-Log "Local repository path: $($State.Paths.LocalRepo)" 'Info'
     Write-Log "Repository name: $($State.SelectedRepo)" 'Info'
 
     $gitPath = Join-Path $selectedPath '.git'
-    if (-not (Test-Path $gitPath)) {
+    if (-not (Test-Path -LiteralPath $gitPath)) {
         Write-Log 'No .git directory found in selected folder.' 'Warn'
         $continueResult = [System.Windows.Forms.MessageBox]::Show(
             "The selected folder does not appear to be a Git repository.`n`nDo you want to continue anyway?",
@@ -787,110 +882,28 @@ function Ensure-LocalPreparation {
         $dockerVersion = & docker --version 2>&1
         if ($LASTEXITCODE -ne 0) {
             Write-Log "Docker CLI returned non-zero exit code (exit=$LASTEXITCODE). Output: $dockerVersion" 'Error'
-            [System.Windows.Forms.MessageBox]::Show('Docker is not available on this system.`n`nPlease ensure Docker Desktop is installed and running on your Windows machine.', 'Docker Not Available', 'OK', 'Error') | Out-Null
+            # Double quotes so that `n becomes a real line break (in single quotes it was shown as text).
+            [System.Windows.Forms.MessageBox]::Show("Docker is not available on this system.`n`nPlease ensure Docker Desktop is installed and running on your Windows machine.", 'Docker Not Available', 'OK', 'Error') | Out-Null
             return $false
         }
         Write-Log "Docker detected: $dockerVersion" 'Info'
     } catch {
         Write-Log "Could not check Docker availability: $($_.Exception.Message)" 'Error'
-        [System.Windows.Forms.MessageBox]::Show('Could not verify Docker availability.`n`nPlease ensure Docker Desktop is installed and running on your Windows machine.', 'Docker Check Failed', 'OK', 'Error') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("Could not verify Docker availability.`n`nPlease ensure Docker Desktop is installed and running on your Windows machine.", 'Docker Check Failed', 'OK', 'Error') | Out-Null
         return $false
     }
 
-    $dockerRunning = $false
-    try {
-        $quickCheck = & docker version --format "{{.Server.Version}}" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $quickCheck) {
-            $dockerRunning = $true
-            Write-Log "Docker engine is running (Server version: $quickCheck)" 'Info'
-        }
-    } catch {
-        Write-Log "Quick Docker version check failed: $($_.Exception.Message)" 'Debug'
-    }
+    # If the user chose Remote earlier in this session (then clicked Back and chose Local),
+    # DOCKER_HOST / DOCKER_SSH_OPTS may still point at the workstation. Clear them so the
+    # checks below really test the Docker engine on THIS computer.
+    $env:DOCKER_HOST = $null
+    $env:DOCKER_SSH_OPTS = $null
 
-    if (-not $dockerRunning) {
-        Write-Log 'Docker engine is not running; attempting to start Docker Desktop.' 'Warn'
-        try {
-            $dockerDesktopPath = "${env:ProgramFiles}\Docker\Docker\Docker Desktop.exe"
-            if (Test-Path $dockerDesktopPath) {
-                Write-Log "Attempting to start Docker Desktop via ProgramFiles path: $dockerDesktopPath" 'Debug'
-                Start-Process -FilePath $dockerDesktopPath -WindowStyle Hidden
-            } else {
-                $dockerDesktopAlt = "${env:LOCALAPPDATA}\Programs\Docker\Docker\Docker Desktop.exe"
-                if (Test-Path $dockerDesktopAlt) {
-                    Write-Log "Attempting to start Docker Desktop via LocalAppData path: $dockerDesktopAlt" 'Debug'
-                    Start-Process -FilePath $dockerDesktopAlt -WindowStyle Hidden
-                } else {
-                    Write-Log 'Docker Desktop executable not found; trying service startup.' 'Warn'
-                    Start-Service -Name 'com.docker.service' -ErrorAction SilentlyContinue
-                }
-            }
-
-            $maxAttempts = 30
-            $attempt = 0
-            do {
-                Start-Sleep -Seconds 1
-                $attempt++
-                $checkJob = Start-Job -ScriptBlock { & docker info 2>&1 | Out-Null; $LASTEXITCODE }
-                $checkResult = Wait-Job $checkJob -Timeout 5
-                if ($checkResult) {
-                    $checkExitCode = Receive-Job $checkJob
-                    Remove-Job $checkJob
-                    Write-Log "Docker start check attempt $attempt exit=$checkExitCode" 'Debug'
-                    if ($checkExitCode -eq 0) { $dockerRunning = $true; break }
-                } else {
-                    Stop-Job $checkJob -ErrorAction SilentlyContinue
-                    Remove-Job $checkJob -ErrorAction SilentlyContinue
-                }
-                if ($attempt -eq 10 -or $attempt -eq 20) {
-                    Write-Log 'Docker is still starting up...' 'Info'
-                }
-            } while ($attempt -lt $maxAttempts)
-
-            $finalJob = Start-Job -ScriptBlock { & docker info 2>&1 | Out-Null; $LASTEXITCODE }
-            $finalResult = Wait-Job $finalJob -Timeout 5
-            if ($finalResult) {
-                $finalExitCode = Receive-Job $finalJob
-                Remove-Job $finalJob
-                $dockerRunning = ($finalExitCode -eq 0)
-                Write-Log "Final docker start check exit=$finalExitCode" 'Debug'
-            } else {
-                Stop-Job $finalJob -ErrorAction SilentlyContinue
-                Remove-Job $finalJob -ErrorAction SilentlyContinue
-            }
-
-            if (-not $dockerRunning) {
-                Write-Log 'Docker engine did not start within the expected time.' 'Warn'
-                $choice = [System.Windows.Forms.MessageBox]::Show(
-                    "Docker engine could not be started automatically.`n`nWould you like to:`n- Click 'Yes' to wait and try again`n- Click 'No' to continue anyway (may cause errors)`n- Click 'Cancel' to exit",
-                    'Docker Startup Issue',
-                    'YesNoCancel',
-                    'Warning'
-                )
-
-                if ($choice -eq [System.Windows.Forms.DialogResult]::Yes) {
-                    [System.Windows.Forms.MessageBox]::Show(
-                        'Please start Docker Desktop manually and wait for it to be ready, then click OK to continue.`n`nOr click Cancel to skip Docker checks and continue anyway.',
-                        'Manual Start Required',
-                        'OKCancel',
-                        'Information'
-                    ) | Out-Null
-                } elseif ($choice -eq [System.Windows.Forms.DialogResult]::Cancel) {
-                    Write-Log 'User chose to exit after Docker startup failure.' 'Warn'
-                    return $false
-                }
-            }
-        } catch {
-            Write-Log "Failed to start Docker Desktop: $($_.Exception.Message)" 'Error'
-        }
-    }
-
-    if (-not $dockerRunning) {
-        Write-Log 'Docker engine may still be unavailable; continuing with caution.' 'Warn'
-    } else {
-        Write-Log "Docker engine is running (version: $quickCheck)." 'Info'
-    }
-
+    # Create the 'local' Docker context FIRST, so that every check below can name it
+    # explicitly with '--context local'. Before, the checks used whatever context was
+    # globally active. After a Remote session of an older version of this app that was the
+    # shared workstation, so the checks hung for minutes off the VPN (and then wrongly said
+    # Docker could not start) or tested the wrong machine.
     $LocalContextName = 'local'
     $onWindows = ($PSVersionTable.PSEdition -eq 'Desktop' -or $env:OS -like '*Windows*')
     if ($onWindows) {
@@ -912,6 +925,209 @@ function Ensure-LocalPreparation {
         Write-Log "Context '$LocalContextName' already exists." 'Debug'
     }
 
+    # Text Docker prints when this Windows account is not allowed to use Docker
+    # ("Access is denied"; German Windows may say "Zugriff verweigert"). Starting Docker
+    # Desktop or waiting cannot fix that, so we recognise it and explain the real fix.
+    $accessDeniedPattern = 'access is denied|zugriff verweigert|permission denied'
+
+    # Helper: explain how to fix "not allowed to use Docker" (the docker-users group).
+    $showDockerAccessHelp = {
+        Write-Log 'Docker refused access for this Windows account (probably not in the docker-users group).' 'Error'
+        [System.Windows.Forms.MessageBox]::Show(
+            "Docker Desktop is installed, but your Windows account is not allowed to use it.`n`nThis usually means your account is not a member of the local 'docker-users' group. This is common when IT installed Docker Desktop with an administrator account.`n`nHow to fix it:`n1. Ask IT or an administrator to add your account to the 'docker-users' group. An administrator can run:`n     net localgroup docker-users `"$($env:USERDOMAIN)\$($env:USERNAME)`" /add`n2. Sign out of Windows and sign back in (or restart the computer).`n3. Start IMPACT again.",
+            'Docker Access Denied', 'OK', 'Error') | Out-Null
+    }
+
+    # Helper: $true when the 'docker-users' group exists on this computer and the current
+    # Windows login is NOT in it. $null when we cannot tell (group missing, not Windows).
+    # This does not depend on the Windows display language. It is only used as an extra
+    # hint after Docker failed, never to block the user on its own.
+    $testNotInDockerUsers = {
+        try {
+            $groupSid = ([System.Security.Principal.NTAccount]::new('docker-users')).Translate([System.Security.Principal.SecurityIdentifier])
+            $principal = [System.Security.Principal.WindowsPrincipal]::new([System.Security.Principal.WindowsIdentity]::GetCurrent())
+            return (-not $principal.IsInRole($groupSid))
+        } catch {
+            return $null
+        }
+    }
+
+    # Helper: does this Docker error mean "this account may not use Docker"? Yes when the
+    # text says "access denied" AND we cannot confirm that the account IS in docker-users.
+    # If the account is confirmed to be in the group, the message is more likely a short
+    # hiccup while Docker Desktop (re)starts, so we keep waiting instead of sending the
+    # user to IT.
+    $isDockerAccessProblem = {
+        param([string]$ErrorText)
+        return (($ErrorText -match $accessDeniedPattern) -and ((& $testNotInDockerUsers) -ne $false))
+    }
+
+    # Helper: ask the local engine ('docker info') up to $MaxAttempts times, about once per
+    # second. Each try runs in a background job with a 5 second limit, because a
+    # half-started Docker Desktop can make 'docker info' hang. Returns an object with
+    # Running ($true/$false) and ErrorText (Docker's last error message, kept for the log
+    # and to recognise "access denied").
+    $waitForLocalDocker = {
+        param([int]$MaxAttempts)
+        $lastError = ''
+        for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+            Start-Sleep -Seconds 1
+            $checkJob = Start-Job -ScriptBlock {
+                param($ctx)
+                $text = (& docker --context $ctx info 2>&1 | ForEach-Object { "$_" }) -join "`n"
+                [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $text }
+            } -ArgumentList $LocalContextName
+            if (Wait-Job $checkJob -Timeout 5) {
+                $checkResult = Receive-Job $checkJob -ErrorAction SilentlyContinue
+                Remove-Job $checkJob -Force -ErrorAction SilentlyContinue
+                # Under StrictMode, reading a property of $null throws, so check first.
+                $checkExitCode = if ($checkResult) { $checkResult.ExitCode } else { -1 }
+                Write-Log "Docker start check attempt $attempt exit=$checkExitCode" 'Debug'
+                if ($checkExitCode -eq 0) { return [pscustomobject]@{ Running = $true; ErrorText = '' } }
+                if ($checkResult) { $lastError = ([string]$checkResult.Output).Trim() }
+                # A permission problem does not go away by waiting longer.
+                if (& $isDockerAccessProblem $lastError) { break }
+            } else {
+                Stop-Job $checkJob -ErrorAction SilentlyContinue
+                Remove-Job $checkJob -Force -ErrorAction SilentlyContinue
+                $lastError = 'docker info did not answer within 5 seconds.'
+            }
+            if ($attempt % 10 -eq 0) {
+                Write-Log 'Docker is still starting up...' 'Info'
+            }
+        }
+        if ($lastError) { Write-Log "Last Docker error: $lastError" 'Debug' }
+        return [pscustomobject]@{ Running = $false; ErrorText = $lastError }
+    }
+
+    $dockerRunning = $false
+    $quickCheck = $null
+    $dockerErrorText = ''
+    try {
+        # 2>&1 keeps Docker's error message (it used to be thrown away with 2>$null), so we
+        # can tell "Docker is not running" apart from "you are not allowed to use Docker".
+        $quickOutput = & docker --context $LocalContextName version --format "{{.Server.Version}}" 2>&1
+        if ($LASTEXITCODE -eq 0 -and $quickOutput) {
+            $quickCheck = (($quickOutput | ForEach-Object { "$_" }) -join ' ').Trim()
+            $dockerRunning = $true
+            Write-Log "Docker engine is running (Server version: $quickCheck)" 'Info'
+        } else {
+            $dockerErrorText = (($quickOutput | ForEach-Object { "$_" }) -join "`n").Trim()
+            Write-Log "Quick Docker check failed: $dockerErrorText" 'Debug'
+        }
+    } catch {
+        Write-Log "Quick Docker version check failed: $($_.Exception.Message)" 'Debug'
+    }
+
+    # Docker said "access denied": starting Docker Desktop and waiting will never help.
+    if (-not $dockerRunning -and (& $isDockerAccessProblem $dockerErrorText)) {
+        & $showDockerAccessHelp
+        return $false
+    }
+
+    # Becomes $true only when the user explicitly chooses "continue anyway" below.
+    $userSkippedDockerCheck = $false
+
+    if (-not $dockerRunning) {
+        Write-Log 'Docker engine is not running; attempting to start Docker Desktop.' 'Warn'
+        try {
+            $dockerDesktopPath = "${env:ProgramFiles}\Docker\Docker\Docker Desktop.exe"
+            if (Test-Path $dockerDesktopPath) {
+                Write-Log "Attempting to start Docker Desktop via ProgramFiles path: $dockerDesktopPath" 'Debug'
+                Start-Process -FilePath $dockerDesktopPath -WindowStyle Hidden
+            } else {
+                $dockerDesktopAlt = "${env:LOCALAPPDATA}\Programs\Docker\Docker\Docker Desktop.exe"
+                if (Test-Path $dockerDesktopAlt) {
+                    Write-Log "Attempting to start Docker Desktop via LocalAppData path: $dockerDesktopAlt" 'Debug'
+                    Start-Process -FilePath $dockerDesktopAlt -WindowStyle Hidden
+                } else {
+                    Write-Log 'Docker Desktop executable not found; trying service startup.' 'Warn'
+                    Start-Service -Name 'com.docker.service' -ErrorAction SilentlyContinue
+                }
+            }
+        } catch {
+            Write-Log "Failed to start Docker Desktop: $($_.Exception.Message)" 'Error'
+        }
+
+        # Give Docker Desktop time to boot (up to about 30 checks).
+        try {
+            $waitResult = & $waitForLocalDocker 30
+            $dockerRunning = $waitResult.Running
+            $dockerErrorText = $waitResult.ErrorText
+        } catch {
+            Write-Log "Docker start check failed: $($_.Exception.Message)" 'Debug'
+        }
+
+        # Keep asking until Docker runs, or the user chooses "continue anyway" or "go back".
+        # Before, "Yes - wait and try again" did not check again at all and the app went on
+        # as if Docker was fine; that later showed up as a confusing "Docker build failed".
+        while (-not $dockerRunning) {
+            if (& $isDockerAccessProblem $dockerErrorText) {
+                & $showDockerAccessHelp
+                return $false
+            }
+            Write-Log 'Docker engine did not start within the expected time.' 'Warn'
+
+            # Extra hint when this Windows account is not in the docker-users group.
+            $groupHint = ''
+            if ((& $testNotInDockerUsers) -eq $true) {
+                Write-Log "The current Windows account is not in the 'docker-users' group." 'Warn'
+                $groupHint = "`n`nNote: your Windows account is not in the 'docker-users' group. Docker Desktop usually refuses to work for such accounts. Ask IT or an administrator to add you to 'docker-users', then sign out of Windows and back in."
+            }
+
+            $choice = [System.Windows.Forms.MessageBox]::Show(
+                "Docker engine could not be started automatically.$groupHint`n`nWould you like to:`n- Click 'Yes' to start Docker Desktop yourself and check again`n- Click 'No' to continue anyway (starting a container will fail until Docker runs)`n- Click 'Cancel' to go back to the previous step",
+                'Docker Startup Issue',
+                'YesNoCancel',
+                'Warning'
+            )
+
+            if ($choice -eq [System.Windows.Forms.DialogResult]::Yes) {
+                $manualChoice = [System.Windows.Forms.MessageBox]::Show(
+                    "Please start Docker Desktop from the Windows Start menu and wait until it shows that the engine is running.`n`nThen click OK to check again, or Cancel to go back to the previous step.",
+                    'Manual Start Required',
+                    'OKCancel',
+                    'Information'
+                )
+                if ($manualChoice -ne [System.Windows.Forms.DialogResult]::OK) {
+                    Write-Log 'User chose to go back while waiting for Docker.' 'Warn'
+                    return $false
+                }
+                Write-Log 'Checking the Docker engine again...' 'Info'
+                try {
+                    $waitResult = & $waitForLocalDocker 10
+                    $dockerRunning = $waitResult.Running
+                    $dockerErrorText = $waitResult.ErrorText
+                } catch {
+                    Write-Log "Docker start check failed: $($_.Exception.Message)" 'Debug'
+                }
+            } elseif ($choice -eq [System.Windows.Forms.DialogResult]::No) {
+                Write-Log 'User chose to continue without a running Docker engine.' 'Warn'
+                $userSkippedDockerCheck = $true
+                break
+            } else {
+                # Cancel (or closing the box): the wizard treats $false as "go back to the
+                # location choice". The old text wrongly said Cancel would exit.
+                Write-Log 'User chose to go back after Docker startup failure.' 'Warn'
+                return $false
+            }
+        }
+    }
+
+    if (-not $dockerRunning) {
+        Write-Log 'Docker engine may still be unavailable; continuing with caution.' 'Warn'
+    } elseif ($quickCheck) {
+        Write-Log "Docker engine is running (version: $quickCheck)." 'Info'
+    } else {
+        Write-Log 'Docker engine is running.' 'Info'
+    }
+
+    # NOTE: 'docker context use' changes the user's GLOBAL Docker context. It is kept for
+    # now because the local image builds (Start button) still call 'docker build' without
+    # '--context', and switching to 'local' here makes them use this computer. It also
+    # repairs computers where an older version of this app left the global context
+    # pointing at the workstation. Once every local docker call passes '--context local',
+    # this line can be removed.
     & docker context use $LocalContextName *> $null
     if ($LASTEXITCODE -eq 0) {
         Write-Log "Switched to Docker context '$LocalContextName'." 'Info'
@@ -922,8 +1138,16 @@ function Ensure-LocalPreparation {
     & docker --context $LocalContextName version 2>&1 | Out-Null
     if ($LASTEXITCODE -eq 0) {
         Write-Log 'Docker connection test passed.' 'Info'
+    } elseif ($userSkippedDockerCheck) {
+        Write-Log 'Docker connection test failed (user chose to continue anyway).' 'Warn'
     } else {
-        Write-Log 'Docker connection test failed.' 'Warn'
+        # Docker answered a moment ago but not now (for example it was just closed or is
+        # restarting). Returning success here used to end in a misleading "build failed".
+        Write-Log 'Docker connection test failed.' 'Error'
+        [System.Windows.Forms.MessageBox]::Show(
+            "IMPACT could not connect to Docker Desktop on this computer.`n`nPlease check that Docker Desktop is running and shows that the engine is running, then try again.",
+            'Docker Not Reachable', 'OK', 'Error') | Out-Null
+        return $false
     }
 
     $State.Metadata.LocalDockerContext = $LocalContextName
@@ -939,32 +1163,71 @@ function Get-ContainerStatus {
     Set-DockerSSHEnvironment -State $State
     $ctxArgs = Get-DockerContextArgs -State $State
 
+    # Remember whether Docker answered at all. Before, any error (Docker Desktop not
+    # running yet, a network/SSH problem with the workstation) silently looked exactly like
+    # "container STOPPED", and Start then failed later with a misleading build error.
+    # The first 'docker ps' tells us; if it fails, the user can retry or continue knowingly.
+    $dockerReachable = $false
     $portUsers = @()
-    try {
-        $psCmd = $ctxArgs + @('ps','--format','{{.Names}}\t{{.Ports}}')
-        $all = & docker @psCmd 2>$null
-        if ($LASTEXITCODE -eq 0 -and $all) {
-            foreach ($line in ($all -split "`n")) {
-                if ($line -match '0\.0\.0\.0:(\d{4})->8787/tcp') {
-                    $port = $matches[1]
-                    if ($portUsers -notcontains $port) { $portUsers += $port }
+    do {
+        $retryStatusCheck = $false
+        $dockerStatusError = ''
+        try {
+            $psCmd = $ctxArgs + @('ps','--format','{{.Names}}\t{{.Ports}}')
+            # 2>&1 keeps Docker's error text; error lines arrive as ErrorRecord objects,
+            # so we separate them from the normal output lines.
+            $psOutput = & docker @psCmd 2>&1
+            $psExitCode = $LASTEXITCODE
+            $all = @($psOutput | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" })
+            if ($psExitCode -eq 0) {
+                $dockerReachable = $true
+                foreach ($line in ($all -split "`n")) {
+                    if ($line -match '0\.0\.0\.0:(\d{4})->8787/tcp') {
+                        $port = $matches[1]
+                        if ($portUsers -notcontains $port) { $portUsers += $port }
+                    }
                 }
+            } else {
+                $dockerStatusError = (($psOutput | ForEach-Object { "$_" }) -join "`n").Trim()
             }
+        } catch {
+            $dockerStatusError = $_.Exception.Message
+            Write-Log "Port scan failed: $($_.Exception.Message)" 'Warn'
         }
-    } catch {
-        Write-Log "Port scan failed: $($_.Exception.Message)" 'Warn'
-    }
+        if (-not $dockerReachable) {
+            if (-not $dockerStatusError) { $dockerStatusError = '(no error text)' }
+            Write-Log "Docker is not reachable for the status check: $dockerStatusError" 'Warn'
+            $statusWhere = if ($State.ContainerLocation -eq 'LOCAL') { 'Docker Desktop on this computer' } else { "Docker on the workstation ($($State.RemoteHostIp))" }
+            # Keep the message box readable if Docker printed a very long error.
+            $shortStatusError = if ($dockerStatusError.Length -gt 400) { $dockerStatusError.Substring(0, 400) + ' ...' } else { $dockerStatusError }
+            $statusChoice = [System.Windows.Forms.MessageBox]::Show(
+                "IMPACT could not get the container status from $statusWhere.`n`nDocker said:`n$shortStatusError`n`nClick 'Retry' to check again (for example once Docker Desktop has finished starting, or the network connection is back).`n`nClick 'Cancel' to open the container manager anyway. The status shown there may then be wrong: a running container can look STOPPED.",
+                'Docker Not Reachable', 'RetryCancel', 'Warning')
+            if ($statusChoice -eq [System.Windows.Forms.DialogResult]::Retry) { $retryStatusCheck = $true }
+        }
+    } while ($retryStatusCheck)
+    # Other code (for example the container manager) can use this to show "unknown"
+    # instead of "STOPPED" when Docker could not be asked.
+    $State.Metadata.DockerReachable = $dockerReachable
     Write-Log "Discovered in-use ports: $([string]::Join(',', $portUsers))" 'Debug'
     $State.Ports.Used = $portUsers
 
-    # Collect containers for this user
-    $pattern = "_$($State.UserName)"
+    # Collect containers for this user.
+    # Docker treats the name filter as a regular expression that matches ANYWHERE in the
+    # container name, so '_jo' also matched '..._john' (a colleague's container on the
+    # shared workstation) and caused a false "Other containers are running" warning.
+    # The trailing '$' anchors it to the END of the name ("<repo>_<user>"); Escape makes
+    # the user name match literally. GitHub user names cannot contain '_', so
+    # '_<user>' at the end can only be this user's own containers.
+    $pattern = "_$([regex]::Escape([string]$State.UserName))$"
     # Use raw format (no table header/padding) so parsing stays reliable
     $psAll = $ctxArgs + @('ps','-a','--filter',"name=$pattern",'--format','{{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}')
 
     $State.Metadata.ExistingContainers = @()
     try {
-        $out = & docker @psAll 2>$null
+        # Skip the call when Docker did not answer above (over SSH each failing call can
+        # take up to 30 seconds).
+        $out = if ($dockerReachable) { & docker @psAll 2>$null } else { $null }
         if ($LASTEXITCODE -eq 0 -and $out) {
             $lines = ($out -split "`n") | Where-Object { $_ }
             foreach ($l in $lines) {
@@ -988,7 +1251,7 @@ function Get-ContainerStatus {
     $isRunning = $false
     try {
         $psRunning = $ctxArgs + @('ps','--filter',"name=^$($State.ContainerName)$",'--format','{{.Names}}')
-        $name = & docker @psRunning 2>$null
+        $name = if ($dockerReachable) { & docker @psRunning 2>$null } else { $null }
         if ($LASTEXITCODE -eq 0 -and $name -and $name.Trim() -eq $State.ContainerName) { $isRunning = $true }
     } catch {
         Write-Log "Running check failed: $($_.Exception.Message)" 'Warn'
@@ -998,6 +1261,39 @@ function Get-ContainerStatus {
         Write-Log "Container '$($State.ContainerName)' is currently running." 'Debug'
     } else {
         Write-Log "Container '$($State.ContainerName)' is not running." 'Debug'
+    }
+
+    # The app always starts containers with '--rm', so Docker deletes them when they stop.
+    # A STOPPED container with our name can therefore only come from outside the app (for
+    # example one created by hand in Docker Desktop). It makes 'docker run --name ...' fail
+    # with "name already in use", and the Stop button cannot help because nothing is
+    # running. Offer to remove it so that Start works again.
+    if ($dockerReachable -and -not $isRunning) {
+        # Status 'Up ...' means running (or paused); never offer to remove such a container.
+        $leftoverContainer = @($State.Metadata.ExistingContainers | Where-Object { $_.Name -eq $State.ContainerName -and $_.Status -notmatch '^Up' })
+        if ($leftoverContainer.Count -gt 0) {
+            $leftoverStatus = $leftoverContainer[0].Status
+            Write-Log "Found a stopped container named '$($State.ContainerName)' (status: $leftoverStatus)." 'Warn'
+            $removeChoice = [System.Windows.Forms.MessageBox]::Show(
+                "A stopped container named '$($State.ContainerName)' already exists (status: $leftoverStatus).`n`nIt prevents IMPACT from starting a new container with the same name.`n`nRemove the old container now? Files in your repository folder are not affected.",
+                'Old Container Found', 'YesNo', 'Question')
+            if ($removeChoice -eq [System.Windows.Forms.DialogResult]::Yes) {
+                $rmCmd = $ctxArgs + @('rm', $State.ContainerName)
+                $rmOutput = & docker @rmCmd 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Log "Removed stopped container '$($State.ContainerName)'." 'Info'
+                    $State.Metadata.ExistingContainers = @($State.Metadata.ExistingContainers | Where-Object { $_.Name -ne $State.ContainerName })
+                } else {
+                    $rmError = (($rmOutput | ForEach-Object { "$_" }) -join "`n").Trim()
+                    Write-Log "Could not remove container '$($State.ContainerName)': $rmError" 'Warn'
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "The old container could not be removed.`n`nDocker said:`n$rmError`n`nYou can remove it in Docker Desktop (Containers list) and then click Start.",
+                        'Remove Failed', 'OK', 'Warning') | Out-Null
+                }
+            } else {
+                Write-Log 'User kept the stopped container; Start will fail until it is removed.' 'Warn'
+            }
+        }
     }
 
     # If running, attempt to recover connection details

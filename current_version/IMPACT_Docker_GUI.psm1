@@ -2217,6 +2217,57 @@ function Get-ContainerSshSetupCommand {
 }
 
 <#
+.SYNOPSIS Turn a repository folder name into a name Docker accepts (pure logic).
+.DESCRIPTION The repository folder name is reused in several Docker places: the
+             container name ("<repo>_<user>"), the image name (lower-cased), the
+             REPO_NAME build argument and the folder inside the container
+             (/home/rstudio/<repo>). Docker only accepts plain letters, digits and
+             single '.', '_' or '-' between them. A folder such as
+             'IMPACTncd_Germany - Kopie' or 'IMPACTncd_Germany-main (1)' therefore
+             made Start fail with a generic "Docker build failed" message.
+             Names that are already valid are returned UNCHANGED, so normal users
+             keep exactly the container and image names they had before.
+             Otherwise: accents are removed (a-umlaut becomes a), every run of other
+             characters becomes one '_', and separators at the start/end are dropped.
+.PARAMETER Name The folder name (leaf only, not a full path).
+.OUTPUTS   [string] The safe name, or '' when nothing usable is left (for example a
+           name made only of symbols). The caller must handle the empty case.
+#>
+function ConvertTo-DockerSafeRepoName {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return '' }
+
+    # Already valid? Docker's image-name rule (checked on the lower-cased name) is the
+    # stricter of the two rules; a name that passes it is also a valid container name.
+    # The first test makes sure the ORIGINAL name is plain ASCII: some non-ASCII letters
+    # (for example the Kelvin sign) turn into ASCII letters when lower-cased.
+    # -cmatch (case-sensitive) is used on purpose: with case-insensitive matching .NET
+    # lets some non-ASCII letters match [a-z].
+    if ($Name -cmatch '^[A-Za-z0-9._-]+$' -and
+        $Name.ToLowerInvariant() -cmatch '^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*$') { return $Name }
+
+    # Replace accented letters by their plain letter (e-acute -> e, o-umlaut -> o):
+    # FormD splits a letter from its accent, then we drop the accent marks.
+    # Sharp s has no plain form, so it is mapped by hand.
+    $decomposed = $Name.Replace([string][char]0x00DF, 'ss').Normalize([System.Text.NormalizationForm]::FormD)
+    $plain = -join ($decomposed.ToCharArray() | Where-Object {
+        [System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($_) -ne [System.Globalization.UnicodeCategory]::NonSpacingMark
+    })
+
+    # Every run of characters that are not plain ASCII letters/digits becomes ONE separator.
+    # A lone '.', '_' or '-' is kept as it is (so 'IMPACTncd_Germany-main' style names stay
+    # readable); anything else (spaces, brackets, several separators in a row) becomes '_'.
+    # -creplace/-cmatch: case-sensitive for the same reason as above.
+    $safe = $plain -creplace '[^A-Za-z0-9]+', {
+        if ($_.Value -cmatch '^[._-]$') { $_.Value } else { '_' }
+    }
+
+    # Docker names must start (and image names must end) with a letter or digit.
+    return $safe.Trim('.', '_', '-')
+}
+
+<#
 .SYNOPSIS Build the docker run command-line arguments (pure logic, no execution).
 .DESCRIPTION Given the session state and options, returns the string array to pass
              to 'docker run'. This makes the command testable without touching Docker.
@@ -2523,6 +2574,7 @@ Export-ModuleMember -Function @(
     # Location
     'Select-Location'
     # Container lifecycle (extracted)
+    'ConvertTo-DockerSafeRepoName'
     'Build-DockerRunCommand'
     'Get-ContainerGitSshCommand'
     'Get-ContainerSshSetupCommand'

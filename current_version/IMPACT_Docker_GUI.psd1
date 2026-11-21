@@ -58,6 +58,7 @@
         'Ensure-SshConfigEntry'
         'Ensure-GitKeySetup'
         'Select-Location'
+        'ConvertTo-DockerSafeRepoName'
         'Build-DockerRunCommand'
         'Get-ContainerGitSshCommand'
         'Get-ContainerSshSetupCommand'
