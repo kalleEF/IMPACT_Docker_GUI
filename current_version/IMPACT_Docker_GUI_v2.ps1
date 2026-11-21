@@ -2702,7 +2702,17 @@ function Show-ContainerManager {
         #    container use SSH for github.com instead. It is stored in the container's own
         #    /home/rstudio/.gitconfig only: the repository's .git/config and the settings on
         #    this PC or the workstation are not changed, so GitHub Desktop keeps working.
-        $gitCfgCmd = "git config --global user.name '$($State.UserName)' && git config --global user.email '$($State.UserName)@users.noreply.github.com' && git config --global pull.ff true && git config --global pull.rebase false && git config --global --add safe.directory '*' && git config --global url.git@github.com:.insteadOf https://github.com/ && echo GIT_CONFIGURED"
+        # 5. core.sshCommand: the same ssh command as GIT_SSH_COMMAND (IMPACT key, the
+        #    container's known_hosts, accept-new). RStudio starts its R sessions and the Git
+        #    pane through its own server process, and environment variables given to
+        #    'docker run -e' only reach them if the image copies them into Renviron.site.
+        #    git reads core.sshCommand from /home/rstudio/.gitconfig itself, so the Git
+        #    pane and git in the RStudio terminal use the IMPACT key either way. When
+        #    GIT_SSH_COMMAND is also set, git uses that one (same value, so no difference).
+        #    The command contains no single quotes (the user name is a validated GitHub
+        #    name), so wrapping it in '...' for sh is safe.
+        $containerSshCmd = Get-ContainerGitSshCommand -UserName $State.UserName
+        $gitCfgCmd = "git config --global user.name '$($State.UserName)' && git config --global user.email '$($State.UserName)@users.noreply.github.com' && git config --global pull.ff true && git config --global pull.rebase false && git config --global --add safe.directory '*' && git config --global url.git@github.com:.insteadOf https://github.com/ && git config --global core.sshCommand '$containerSshCmd' && echo GIT_CONFIGURED"
         $gitCfgCtx = (Get-DockerContextArgs -State $State) + @('exec', '--user', 'rstudio', $State.ContainerName, 'sh', '-c', $gitCfgCmd)
         $gitConfigured = $false
         for ($attempt = 1; $attempt -le 3 -and -not $gitConfigured; $attempt++) {
@@ -3083,7 +3093,10 @@ function Invoke-ImpactGui {
     while ($step -le 6) {
         switch ($step) {
             1 { # Prerequisites (automated — no back)
-                if (-not (Ensure-Prerequisites -State $state)) { return }
+                # A failed step sets exit code 1 (see the entry point at the end of this
+                # script), so IMPACT.bat keeps its window open and the user can read the
+                # console messages. Cancel in a dialog still ends normally with exit code 0.
+                if (-not (Ensure-Prerequisites -State $state)) { $script:ImpactExitCode = 1; return }
                 $step++
             }
             2 { # Credentials dialog
@@ -3092,7 +3105,7 @@ function Invoke-ImpactGui {
                 else { return } # cancel or failure — exit
             }
             3 { # SSH key setup (automated — no back)
-                if (-not (Ensure-GitKeySetup -State $state)) { return }
+                if (-not (Ensure-GitKeySetup -State $state)) { $script:ImpactExitCode = 1; return }
                 $step++
             }
             4 { # Location selection dialog
@@ -3109,6 +3122,7 @@ function Invoke-ImpactGui {
                     $prepOk = Ensure-LocalPreparation -State $state
                 } else {
                     Write-Log "No container location selected; exiting." 'Warn'
+                    $script:ImpactExitCode = 1
                     return
                 }
                 if ($prepOk) { $step++ }
@@ -3144,8 +3158,17 @@ try {
     Write-Log "Could not install the window error handler: $($_.Exception.Message)" 'Debug'
 }
 
+# Exit code of the whole script: 0 = normal end (also Cancel), 1 = a wizard step failed
+# or a fatal error. Invoke-ImpactGui sets it to 1 when a step fails. A script-level
+# variable is used instead of a return value, because functions in PowerShell also
+# "return" every uncaptured output line, which would make a return value unreliable.
+$script:ImpactExitCode = 0
 try {
     Invoke-ImpactGui
+    if ($script:ImpactExitCode -ne 0) {
+        Write-Host "IMPACT stopped because a setup step failed. The reason is in the messages above and in the log file: $(Get-ImpactLogPathText)" -ForegroundColor Red
+        exit $script:ImpactExitCode
+    }
 } catch {
     # Top-level catch to prevent the EXE from closing immediately and to surface diagnostics.
     $ex = $_.Exception
@@ -3157,9 +3180,10 @@ try {
     # has NOT seen the error in a message box: then the console text is the only place
     # where the error appears, and the window must stay open to read it. When a box was
     # shown, the user has already read the error there, so we do not make them press
-    # Enter as well. (Do not rely on IMPACT.bat to pause after an error: cmd reads every
-    # '%errorlevel%' inside a "( ... )" block before the block runs, so its check after
-    # pwsh always sees 0 and it never reaches its 'pause'.)
+    # Enter as well. IMPACT.bat sets IMPACT_LAUNCHED_BY_BAT=1 and itself waits for a key
+    # press after any non-zero exit code, so the wait is skipped then (otherwise the
+    # user would have to press a key twice). The wait stays for other ways of starting
+    # the script, for example from an older Desktop shortcut that runs pwsh directly.
     $alreadyTold = $false
     try { $alreadyTold = [bool]$ex.Data['ImpactUserNotified'] } catch { }
     $boxShown = $false
@@ -3170,7 +3194,7 @@ try {
             $boxShown = $true
         } catch { }
     }
-    if (-not $boxShown -and -not $alreadyTold) {
+    if (-not $boxShown -and -not $alreadyTold -and $env:IMPACT_LAUNCHED_BY_BAT -ne '1') {
         # No message box could be shown, so keep the console open long enough to read it.
         Write-Host "`nPress Enter to exit..." -ForegroundColor Yellow
         Read-Host | Out-Null

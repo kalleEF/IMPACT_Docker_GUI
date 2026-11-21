@@ -46,6 +46,9 @@ if "%PWSH_CHECK%"=="3" goto :pwsh_too_old
 REM Start the GUI. The exit code is saved on the next line. That line is read by
 REM cmd only when it runs, so it really sees the exit code of pwsh. Any value
 REM other than 0 (also negative crash codes) counts as an error.
+REM IMPACT_LAUNCHED_BY_BAT tells the GUI script that this launcher waits for a key
+REM press after an error, so the script does not ask for a second key press itself.
+set "IMPACT_LAUNCHED_BY_BAT=1"
 "%PWSH_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0IMPACT_Docker_GUI_v2.ps1" %*
 set "IMPACT_EXIT=%errorlevel%"
 if not "%IMPACT_EXIT%"=="0" goto :failed
