@@ -75,11 +75,36 @@ function Ensure-RemotePreparation {
 
     # Quick probe to see if key auth already works to avoid prompting for password unnecessarily
     $keyAuthorized = $false
+    $probeOut = $null   # set before the try, so StrictMode is happy even if ssh cannot start at all
     try {
         $probeOut = & ssh @sshArgs "echo KEY_AUTH_OK" 2>&1
         if ($LASTEXITCODE -eq 0 -and $probeOut -match 'KEY_AUTH_OK') { $keyAuthorized = $true }
         Write-Log "Key auth probe output: $probeOut (exit=$LASTEXITCODE)" 'Debug'
-    } catch { $keyAuthorized = $false }
+    } catch { $keyAuthorized = $false; $probeOut = $_.Exception.Message }
+
+    # If the key login failed, find out WHY before asking for a password.
+    # A password only helps when the workstation answered and refused the key
+    # (or when the reason is unclear). If the workstation cannot be reached at
+    # all (VPN off, wrong IP, machine off), or it presents a different host key
+    # than last time, a password cannot help: we stop with a clear message
+    # instead of a misleading password prompt. Not sending the password to a
+    # host whose identity changed also protects the shared workstation password.
+    if (-not $keyAuthorized) {
+        $probeFailure = Get-SshFailureKind -Output $probeOut
+        Write-Log "Key auth probe failed; reason category: $probeFailure" 'Debug'
+        if ($probeFailure -eq 'Unreachable') {
+            $msg = "IMPACT cannot reach the workstation at $remoteIp.`n`nPlease check that:`n  - you are connected to the institute network (or the VPN when working from home)`n  - the workstation is switched on`n  - the IP address $remoteIp is correct`n`nThen try again."
+            Write-Log "Workstation $remoteIp is not reachable over SSH: $probeOut" 'Error'
+            [System.Windows.Forms.MessageBox]::Show($msg, 'Workstation not reachable', 'OK', 'Error') | Out-Null
+            return $false
+        }
+        if ($probeFailure -eq 'HostKeyChanged') {
+            $msg = "The workstation at $remoteIp identified itself with a different SSH host key than the one this PC remembers.`n`nThis is expected after the workstation was reinstalled, but it can also mean that the connection is being intercepted. For your safety IMPACT will not send your password.`n`nAsk the workstation admin whether the workstation was reinstalled. If it was, run this command in PowerShell and then start IMPACT again:`n  ssh-keygen -R $remoteIp"
+            Write-Log "Host key of $remoteIp has changed; stopping before any password is sent: $probeOut" 'Error'
+            [System.Windows.Forms.MessageBox]::Show($msg, 'Workstation identity changed', 'OK', 'Warning') | Out-Null
+            return $false
+        }
+    }
 
     # 4.1.1: Ensure authorized_keys contains our public key and permissions are set
     Write-Log 'Authorizing SSH key on remote host...' 'Info'
@@ -95,7 +120,9 @@ USER_SSH_DIR="$HOME_DIR/.ssh"
 AUTH_KEYS="$USER_SSH_DIR/authorized_keys"
 KEY_TARGET_PUB="$USER_SSH_DIR/id_ed25519_{1}.pub"
 
-mkdir -p "$HOME_DIR" && chmod 755 "$HOME_DIR"
+# go-w (not 755): sshd only needs the home folder to be not writable by others.
+# 755 would make a private home folder readable by every account on the machine.
+mkdir -p "$HOME_DIR" && chmod go-w "$HOME_DIR"
 mkdir -p "$USER_SSH_DIR" && chmod 700 "$USER_SSH_DIR"
 touch "$AUTH_KEYS" && chmod 600 "$AUTH_KEYS"
 
@@ -107,10 +134,11 @@ chmod 644 "$KEY_TARGET_PUB"
 STALE_PUB="$USER_SSH_DIR/id_ed25519_{1}_.pub"
 [ -f "$STALE_PUB" ] && rm -f "$STALE_PUB"
 
-# Remove any previous keys for this IMPACT user (comment marker: IMPACT_{1})
-sed -i '/IMPACT_{1}/d' "$AUTH_KEYS" 2>/dev/null || true
-# Also remove stale markers with trailing underscore from old bug
-sed -i '/IMPACT_{1}_/d' "$AUTH_KEYS" 2>/dev/null || true
+# Remove any previous keys for this IMPACT user (comment marker: IMPACT_{1}).
+# The match is anchored to the END of the line (the key comment is the last
+# word), so IMPACT_jan does not also delete IMPACT_jane or IMPACT_jan-m of
+# other colleagues. The optional _ also removes markers from an old bug.
+sed -i -E '/[[:space:]]IMPACT_{1}_?[[:space:]]*$/d' "$AUTH_KEYS" 2>/dev/null || true
 
 if ! grep -qxF "{2}" "$AUTH_KEYS"; then
     echo "{2}" >> "$AUTH_KEYS"
@@ -119,14 +147,10 @@ chown {0}:{0} "$AUTH_KEYS"
 echo 'SSH_KEY_COPIED'
 '@ -f $remoteUser, $State.UserName, $publicKeyContent
 
-    if (-not $keyAuthorized) {
-        try {
-            # Escape single quotes for safe bash -lc wrapping (turn ' into '\'' )
-            $escaped = $remoteScript.Replace("'", "'\\''")
-            $cmdOut = & ssh @sshArgs "bash -lc '$escaped'" 2>&1
-            if ($LASTEXITCODE -eq 0 -and $cmdOut -match 'SSH_KEY_COPIED') { $keyAuthorized = $true }
-        } catch { $keyAuthorized = $false }
-    }
+    # (A second "install the key using the key" attempt used to run here. It was
+    # removed: it logged in with the same key that had just been refused, so it
+    # could never succeed, and it added up to 10 more seconds of waiting.
+    # $remoteScript above is still used by the plink fallback further down.)
 
     if (-not $keyAuthorized) {
         Write-Log 'Key-based auth failed; prompting for password bootstrap (one-time).' 'Warn'
@@ -156,6 +180,7 @@ echo 'SSH_KEY_COPIED'
 
         # Try Posh-SSH first (mirrors the legacy flow: create temp file remotely, then run install script)
         $poshSshUsed = $false
+        $poshSshErrorText = $null   # why Posh-SSH failed, so we can show the real reason to the user
         $sshSession = $null
         $remoteTemp = "/tmp/ssh_key_temp_$($State.UserName)_$(Get-Date -Format 'HHmmss').pub"
         try {
@@ -196,6 +221,8 @@ echo 'SSH_KEY_COPIED'
 
                 $secPw = ConvertTo-SecureString $plainPw -AsPlainText -Force
                 $cred = New-Object System.Management.Automation.PSCredential ($remoteUser, $secPw)
+                # Note: if the workstation's host key had changed, the OpenSSH probe at the top
+                # of this function has already stopped, so the password is not sent in that case.
                 $sshSession = New-SSHSession -ComputerName $remoteIp -Credential $cred -AcceptKey -ConnectionTimeout 15 -ErrorAction Stop
 
                 $keyEscaped = (Get-Content $tempKeyFile -Raw) -replace "'", "'\''"
@@ -214,7 +241,8 @@ AUTH_KEYS="$USER_SSH_DIR/authorized_keys"
 KEY_TARGET_PUB="$USER_SSH_DIR/id_ed25519_%%USERNAME%%.pub"
 REMOTE_TEMP="%%REMOTE_TEMP%%"
 
-mkdir -p "$HOME_DIR" && chmod 755 "$HOME_DIR"
+# go-w (not 755): sshd only needs the home folder to be not writable by others.
+mkdir -p "$HOME_DIR" && chmod go-w "$HOME_DIR"
 mkdir -p "$USER_SSH_DIR" && chmod 700 "$USER_SSH_DIR"
 touch "$AUTH_KEYS" && chmod 600 "$AUTH_KEYS"
 
@@ -229,8 +257,10 @@ chmod 644 "$KEY_TARGET_PUB"
 
 NEW_KEY=$(cat "$KEY_TARGET_PUB")
 
-# Remove any previous keys for this IMPACT user (comment marker: IMPACT_%%USERNAME%%)
-sed -i '/IMPACT_%%USERNAME%%/d' "$AUTH_KEYS" 2>/dev/null || true
+# Remove any previous keys for this IMPACT user (comment marker: IMPACT_%%USERNAME%%).
+# Anchored to the end of the line so other colleagues whose names merely start
+# the same way (IMPACT_jan vs IMPACT_jane) keep their keys.
+sed -i -E '/[[:space:]]IMPACT_%%USERNAME%%_?[[:space:]]*$/d' "$AUTH_KEYS" 2>/dev/null || true
 
 if ! grep -qxF "$NEW_KEY" "$AUTH_KEYS"; then
     echo "$NEW_KEY" >> "$AUTH_KEYS"
@@ -239,11 +269,12 @@ else
     echo KEY_ALREADY_EXISTS
 fi
 
-chmod 755 "$HOME_DIR"
+chmod go-w "$HOME_DIR"
 chmod 700 "$USER_SSH_DIR"
 chmod 600 "$AUTH_KEYS"
 chmod 644 "$KEY_TARGET_PUB"
-chown ${ACTUAL_USER}:${ACTUAL_USER} "$HOME_DIR"
+# (No chown of the home folder: it already belongs to this user, and a chown
+# could fail and abort the script if the group name differs from the user name.)
 chown -R ${ACTUAL_USER}:${ACTUAL_USER} "$USER_SSH_DIR"
 
 # Clean up stale pub files left by previous bug (extra underscore before .pub)
@@ -258,14 +289,47 @@ echo SSH_KEY_COPIED
                 $cmdResult = Invoke-SSHCommand -SessionId $sshSession.SessionId -Command $remoteInstallScript -TimeOut 60 -ErrorAction Stop
                 Write-Log "Posh-SSH install exit=$($cmdResult.ExitStatus); output length=$($cmdResult.Output.Length)" 'Debug'
                 if ($cmdResult.Output -match 'SSH_KEY_COPIED') { $keyAuthorized = $true }
+                else { $poshSshErrorText = "The key setup script on the workstation did not finish (exit status $($cmdResult.ExitStatus)): $($cmdResult.Output -join ' ')" }
             }
         } catch {
-            Write-Log "Posh-SSH bootstrap failed: $($_.Exception.Message)" 'Warn'
+            # Keep the exception type and message (also of an inner exception): they tell us
+            # whether the password was wrong or the workstation could not be reached.
+            $ex = $_.Exception
+            $poshSshErrorText = "$($ex.GetType().FullName): $($ex.Message)"
+            if ($ex.InnerException) { $poshSshErrorText += " | $($ex.InnerException.GetType().FullName): $($ex.InnerException.Message)" }
+            Write-Log "Posh-SSH bootstrap failed: $poshSshErrorText" 'Warn'
         } finally {
             if ($sshSession) { try { Remove-SSHSession -SessionId $sshSession.SessionId -ErrorAction SilentlyContinue | Out-Null } catch { } }
             if (Get-Variable tempKeyFile -Scope 0 -ErrorAction SilentlyContinue) { try { Remove-Item $tempKeyFile -Force -ErrorAction SilentlyContinue; Write-Log 'Removed temporary key file.' 'Debug' } catch { } }
         }
 
+        # Posh-SSH was available and really tried, but did not succeed: tell the user the
+        # real reason. (Before, this fell through to "install PuTTY", even when the only
+        # problem was a mistyped password.) We do NOT then also try plink with the same
+        # password: a wrong password would be sent twice, which can get this PC blocked
+        # by the workstation's brute-force protection.
+        if (-not $keyAuthorized -and $poshSshUsed) {
+            $poshFailure = Get-SshFailureKind -Output $poshSshErrorText
+            if ($poshFailure -eq 'AuthFailed' -and $poshSshErrorText -match 'Permission denied') {
+                Write-Log "Password for $remoteUser@$remoteIp was not accepted." 'Warn'
+                [System.Windows.Forms.MessageBox]::Show("The password for $remoteUser@$remoteIp was not accepted.`n`nPlease check it (is Caps Lock on?) and try again.", 'Wrong password', 'OK', 'Warning') | Out-Null
+                # Run the remote preparation again, so the password dialog appears again.
+                # This repeats only while the user keeps entering a password: pressing
+                # Cancel in the password dialog ends it.
+                return (Ensure-RemotePreparation -State $State)
+            }
+            $detail = if ($poshFailure -eq 'Unreachable') {
+                "The connection to the workstation failed or timed out. Please check that you are connected to the institute network (or the VPN) and that the workstation is switched on."
+            } else {
+                "Details: $poshSshErrorText"
+            }
+            $msg = "IMPACT could not copy your SSH key to the workstation ($remoteIp).`n`n$detail"
+            Write-Log $msg 'Error'
+            [System.Windows.Forms.MessageBox]::Show($msg, 'SSH key setup failed', 'OK', 'Error') | Out-Null
+            return $false
+        }
+
+        # Only reached when Posh-SSH is not available: fall back to PuTTY's plink.exe.
         if (-not $keyAuthorized) {
             $plink = Get-Command plink.exe -ErrorAction SilentlyContinue
             if (-not $plink) {
@@ -274,15 +338,55 @@ echo SSH_KEY_COPIED
             }
 
             if ($plink) {
-                $tmpScript = New-TemporaryFile
-                Set-Content -Path $tmpScript -Value $remoteScript -NoNewline
-                $plinkArgs = @('-batch','-ssh','-pw',$plainPw,$remoteHost,'bash -s')
-                $p = Start-Process -FilePath $plink.Source -ArgumentList $plinkArgs -RedirectStandardInput $tmpScript -NoNewWindow -PassThru -Wait
-                Remove-Item $tmpScript -Force -ErrorAction SilentlyContinue
-                Write-Log "plink bootstrap exit=$($p.ExitCode)" 'Debug'
-                if ($p.ExitCode -eq 0) { $keyAuthorized = $true }
+                # How plink is called, and why:
+                # - The password goes into a temporary file (-pwfile) instead of onto the
+                #   command line, where security logging and other programs could read it.
+                #   -pwfile needs PuTTY 0.77 or newer; an older plink stops with an
+                #   "unknown option" error, which is shown to the user below.
+                # - plink keeps its own list of trusted host keys, separate from OpenSSH,
+                #   and with -batch it refuses any host it has not seen before. So we pass
+                #   the host key that OpenSSH stored during the probe above (-hostkey).
+                # - The script gets Unix line endings: a Windows checkout of this file can
+                #   have CRLF, and bash cannot run lines that end in a carriage return.
+                # - plink is called directly (not via Start-Process) so that PowerShell
+                #   quotes every argument correctly, even when it contains spaces.
+                $pwFile = $null
+                $plinkOut = $null
+                $plinkExit = -1
+                try {
+                    $pwFile = New-TemporaryFile
+                    [System.IO.File]::WriteAllText($pwFile.FullName, $plainPw)
+                    $plinkArgs = @('-batch', '-ssh', '-pwfile', $pwFile.FullName)
+                    $hostKeyLines = @()
+                    try { $hostKeyLines = @(& ssh-keygen -l -F $remoteIp 2>$null) } catch { $hostKeyLines = @() }
+                    foreach ($fp in @($hostKeyLines | ForEach-Object { [regex]::Matches("$_", 'SHA256:[A-Za-z0-9+/=]+') } | ForEach-Object { $_.Value })) {
+                        $plinkArgs += @('-hostkey', $fp)
+                    }
+                    $plinkArgs += @($remoteHost, 'bash -s')
+                    $scriptLf = $remoteScript -replace "`r`n", "`n" -replace "`r", "`n"
+                    $plinkOut = $scriptLf | & $plink.Source @plinkArgs 2>&1
+                    $plinkExit = $LASTEXITCODE
+                } catch {
+                    $plinkOut = $_.Exception.Message
+                } finally {
+                    if ($pwFile) { Remove-Item $pwFile.FullName -Force -ErrorAction SilentlyContinue }
+                }
+                Write-Log "plink bootstrap exit=$plinkExit output=$plinkOut" 'Debug'
+                # Success needs both: exit code 0 AND the marker printed by the last line of
+                # the script (the exit code alone does not prove the script ran to the end).
+                if ($plinkExit -eq 0 -and ($plinkOut -match 'SSH_KEY_COPIED')) {
+                    $keyAuthorized = $true
+                } else {
+                    $plinkDetail = (@($plinkOut) | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -Last 3) -join ' '
+                    $msg = "IMPACT could not copy your SSH key to the workstation ($remoteIp) using PuTTY (plink).`n`nDetails: $plinkDetail`n`nThe easiest fix is the Posh-SSH PowerShell module: start IMPACT again and click 'Yes' when it offers to install Posh-SSH."
+                    Write-Log $msg 'Error'
+                    [System.Windows.Forms.MessageBox]::Show($msg, 'SSH key setup failed', 'OK', 'Error') | Out-Null
+                    return $false
+                }
             } else {
-                $msg = 'Password bootstrap failed because plink.exe is not available. Install PuTTY (plink) or ensure the Posh-SSH module is installed so password-based key setup can proceed.'
+                $msg = "IMPACT needs the Posh-SSH PowerShell module to copy your SSH key to the workstation with your password, but the module is not available on this PC."
+                if ($poshSshErrorText) { $msg += "`n`nDetails: $poshSshErrorText" }
+                $msg += "`n`nStart IMPACT again and click 'Yes' when it offers to install Posh-SSH. If the installation fails (for example because the PowerShell Gallery is blocked on this PC), ask your IT support to install the Posh-SSH module, or install PuTTY 0.77 or newer."
                 [System.Windows.Forms.MessageBox]::Show($msg,'Password bootstrap unavailable','OK','Error') | Out-Null
                 Write-Log $msg 'Error'
                 return $false
@@ -293,52 +397,102 @@ echo SSH_KEY_COPIED
             Write-Log 'Password-based bootstrap did not succeed.' 'Error'
             return $false
         }
+
+        # Whatever the setup step reported, the real test is whether the workstation now
+        # accepts our key. Check once more, so that a half-finished setup (for example
+        # wrong folder permissions on the workstation) is reported here clearly, instead
+        # of causing confusing errors in every later step.
+        $verifyOk = $false
+        $verifyOut = $null
+        try {
+            $verifyOut = & ssh @sshArgs "echo KEY_AUTH_OK" 2>&1
+            $verifyOk = ($LASTEXITCODE -eq 0 -and ($verifyOut -match 'KEY_AUTH_OK'))
+        } catch { $verifyOut = $_.Exception.Message }
+        if (-not $verifyOk) {
+            $msg = "Your SSH key was copied to the workstation ($remoteIp), but logging in with it still does not work.`n`nPlease contact the workstation admin. Details: $verifyOut"
+            Write-Log $msg 'Error'
+            [System.Windows.Forms.MessageBox]::Show($msg, 'SSH key setup failed', 'OK', 'Error') | Out-Null
+            return $false
+        }
     }
 
     Write-Log "SSH key authorized on remote host for user $($State.UserName)." 'Info'
 
     # SSH config was already validated/created at the top of this function.
 
-    # Sync SSH private key and known_hosts onto remote for Git inside container
-    Write-Log 'Syncing SSH private key and known_hosts to remote host.' 'Info'
+    # Copy the SSH private key onto the remote host for Git inside the container,
+    # and make sure the remote known_hosts file exists (see below).
+    Write-Log 'Copying SSH private key to remote host.' 'Info'
 
     if (Test-Path $sshKeyPath) {
-        $pkContent = Get-Content $sshKeyPath -Raw
-        $pkB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($pkContent))
-        $copyPrivateCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && rm -f ~/.ssh/id_ed25519_$($State.UserName) && echo '$pkB64' | base64 -d | tr -d '\r' > ~/.ssh/id_ed25519_$($State.UserName) && chmod 600 ~/.ssh/id_ed25519_$($State.UserName) && chown ${remoteUser}:${remoteUser} ~/.ssh/id_ed25519_$($State.UserName) && echo PRIVATE_KEY_COPIED"
-        $pkOut = & ssh @sshArgs $copyPrivateCmd 2>&1
-        if ($pkOut -notmatch 'PRIVATE_KEY_COPIED') { Write-Log "Remote private key copy may have failed: $pkOut" 'Warn' }
+        # The key is sent through ssh's standard input, NOT as part of the command line.
+        # Command lines are visible to other programs and are often recorded by security
+        # logging (for example Defender for Endpoint), which would keep a copy of the key.
+        # $sshArgs starts with '-n' (= "do not read input"), so this call uses a copy of
+        # the arguments without it; otherwise the key would never reach the workstation.
+        $sshArgsWithInput = @($sshArgs | Where-Object { $_ -ne '-n' })
+        # TrimEnd: PowerShell adds one line break itself when piping text to a program.
+        $pkContent = (Get-Content $sshKeyPath -Raw).TrimEnd()
+        $remoteKeyFile = "~/.ssh/id_ed25519_$($State.UserName)"
+        # umask 077 keeps the file private from the moment it exists; tr removes Windows
+        # line endings; writing to .tmp and renaming means a broken transfer can never
+        # leave a half-written key in place of a working one.
+        $copyPrivateCmd = "umask 077 && mkdir -p ~/.ssh && chmod 700 ~/.ssh && tr -d '\r' > $remoteKeyFile.tmp && chmod 600 $remoteKeyFile.tmp && mv -f $remoteKeyFile.tmp $remoteKeyFile && echo PRIVATE_KEY_COPIED"
+        $pkOut = $null
+        try { $pkOut = $pkContent | & ssh @sshArgsWithInput $copyPrivateCmd 2>&1 } catch { $pkOut = $_.Exception.Message }
+        if (-not ($pkOut -match 'PRIVATE_KEY_COPIED')) { Write-Log "Remote private key copy may have failed: $pkOut" 'Warn' }
     } else {
         Write-Log "Local private key not found at $sshKeyPath; skipping remote copy." 'Warn'
     }
 
-    $knownHostsPath = Join-Path $HOME '.ssh/known_hosts'
-    if (Test-Path $knownHostsPath) {
-        $khContent = Get-Content $knownHostsPath -Raw
-        $khB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($khContent))
-        $copyKhCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && rm -f ~/.ssh/known_hosts && echo '$khB64' | base64 -d | tr -d '\r' > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts && chown ${remoteUser}:${remoteUser} ~/.ssh/known_hosts && echo KNOWN_HOSTS_COPIED"
-        $khOut = & ssh @sshArgs $copyKhCmd 2>&1
-        if ($khOut -notmatch 'KNOWN_HOSTS_COPIED') { Write-Log "Remote known_hosts copy may have failed: $khOut" 'Warn' }
-    } else {
-        $createKhCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && rm -f ~/.ssh/known_hosts && touch ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts && chown ${remoteUser}:${remoteUser} ~/.ssh/known_hosts && echo KNOWN_HOSTS_EMPTY"
-        & ssh @sshArgs $createKhCmd 2>&1 | Out-Null
-        Write-Log 'Created empty known_hosts on remote host.' 'Debug'
-    }
+    # known_hosts on the workstation: this PC's known_hosts is no longer copied over the
+    # shared account's file. Doing that replaced every colleague's entries on each start,
+    # could bring in an outdated github.com key that then broke everyone's git push, and a
+    # large file could exceed the Windows command-line length limit. Now we only make sure
+    # the file exists (older container setups mount it) and add github.com's host keys if
+    # the file has none yet. Existing lines are never changed or removed.
+    $khCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/known_hosts && { ssh-keygen -F github.com -f ~/.ssh/known_hosts >/dev/null 2>&1 || ssh-keyscan -T 10 -t ed25519,ecdsa,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null || true; } && echo KNOWN_HOSTS_OK"
+    $khOut = $null
+    try { $khOut = & ssh @sshArgs $khCmd 2>&1 } catch { $khOut = $_.Exception.Message }
+    if (-not ($khOut -match 'KNOWN_HOSTS_OK')) { Write-Log "Remote known_hosts check may have failed: $khOut" 'Warn' }
 
     # 4.1.2: Scan remote repo list
     Write-Log "Scanning remote repositories at $remoteRepoBase" 'Info'
-    $listScript = "ls -1d $remoteRepoBase/*/ 2>/dev/null | xargs -n1 basename"
+    # 'find' prints one folder name per line and nothing at all for an empty folder.
+    # (The old 'ls | xargs basename' printed "basename: missing operand" for an empty
+    # folder, and split folder names that contain spaces.) Hidden folders are skipped,
+    # -xtype d also accepts links to folders, and the base path is single-quoted so
+    # spaces in it are safe.
+    $quotedRepoBase = "'" + $remoteRepoBase.Replace("'", "'\''") + "'"
+    $listScript = "find $quotedRepoBase -mindepth 1 -maxdepth 1 -xtype d ! -name '.*' -printf '%f\n'"
+    $repoScanOut = $null
     try {
-        $repoList = (& ssh @sshArgs $listScript 2>&1) -split "`n" | Where-Object { $_ -and ($_ -notmatch 'No such file') }
+        $repoScanOut = & ssh @sshArgs $listScript 2>&1
     } catch {
-        Write-Log "Repo scan failed: $($_.Exception.Message)" 'Error'
-        return $false
+        # Keep the error as an ErrorRecord (not a plain string), so it is reported
+        # below but can never be mistaken for a repository name.
+        $repoScanOut = $_
     }
+    $repoScanExit = $LASTEXITCODE
+    # @(...) so that $repoList is ALWAYS an array: with exactly one repository it would
+    # otherwise be a plain string, and .Count on it crashes the app under StrictMode.
+    # ConvertTo-RemoteRepoList also drops ssh/find error lines, so they never appear
+    # in the list as if they were repositories.
+    $repoList = @(ConvertTo-RemoteRepoList -Output $repoScanOut)
+    $repoScanErrors = (@($repoScanOut) | Where-Object { $_ -isnot [string] } | ForEach-Object { "$_" }) -join ' | '
+    if ($repoScanErrors) { Write-Log "Repo scan messages (exit=$repoScanExit): $repoScanErrors" 'Warn' }
 
     Write-Log "Remote repo count discovered: $($repoList.Count)" 'Debug'
 
-    if (-not $repoList -or $repoList.Count -eq 0) {
-        Write-Log "No repositories found under $remoteRepoBase" 'Error'
+    if ($repoList.Count -eq 0) {
+        # Tell the user what happened instead of silently going back to the location dialog.
+        if ((Get-SshFailureKind -Output $repoScanOut) -eq 'Unreachable' -or $repoScanExit -eq 255) {
+            $msg = "IMPACT lost the connection to the workstation ($remoteIp) while looking for repositories.`n`nPlease check the network or VPN connection and try again."
+        } else {
+            $msg = "No repositories were found in $remoteRepoBase on the workstation ($remoteIp).`n`nAsk the workstation admin to clone the IMPACT repository (for example IMPACTncd_Germany) into that folder, then try again."
+        }
+        Write-Log "No repositories found under $remoteRepoBase (exit=$repoScanExit): $repoScanErrors" 'Error'
+        [System.Windows.Forms.MessageBox]::Show($msg, 'No repositories found', 'OK', 'Error') | Out-Null
         return $false
     }
 
@@ -370,7 +524,7 @@ echo SSH_KEY_COPIED
     $listBox.BackColor = $palette.Panel
     $listBox.ForeColor = $palette.Text
     $listBox.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Regular)
-    $listBox.Items.AddRange($repoList)
+    $listBox.Items.AddRange([object[]]$repoList)
     $formRepo.Controls.Add($listBox)
 
     $buttonOk = New-Object System.Windows.Forms.Button -Property @{
@@ -446,6 +600,11 @@ echo SSH_KEY_COPIED
     Write-Log 'Checking remote Docker Engine availability...' 'Info'
     $remoteDockerOk = $false
     $remoteDockerCliExists = $false
+    # "permission denied" on the Docker socket means Docker IS running, but the workstation
+    # account is not allowed to use it (usually: not in the 'docker' group). That needs an
+    # admin, not a daemon restart, so it gets its own message instead of the sudo prompt.
+    $remoteDockerPermissionDenied = $false
+    $dockerPermissionMsg = "The workstation account '$remoteUser' is not allowed to use Docker on the workstation ($remoteIp): permission denied on the Docker socket.`n`nAsk the workstation admin to run:`n  sudo usermod -aG docker $remoteUser`n`nThen start IMPACT again."
     try {
         $sshCheckArgs = @('-n', '-i', $State.Paths.SshPrivate, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=15', $remoteHost)
         $dockerVer = & ssh @sshCheckArgs 'docker version --format "{{.Server.Version}}"' 2>&1
@@ -454,17 +613,31 @@ echo SSH_KEY_COPIED
             $remoteDockerCliExists = $true
             Write-Log "Remote Docker Engine running (Server version: $dockerVer)" 'Info'
         } else {
-            # Check if CLI exists but daemon is not running
-            $whichDocker = & ssh @sshCheckArgs 'which docker 2>/dev/null || echo NOT_FOUND' 2>&1
-            if ($whichDocker -and $whichDocker -notmatch 'NOT_FOUND') {
+            # Join the output into one text: with 2>&1 it is a list of lines and error records.
+            $dockerVerText = (@($dockerVer) | ForEach-Object { "$_" }) -join ' '
+            Write-Log "Remote 'docker version' failed (exit=$LASTEXITCODE): $dockerVerText" 'Warn'
+            if ($dockerVerText -match 'docker\.sock' -and $dockerVerText -match 'permission denied') {
                 $remoteDockerCliExists = $true
-                Write-Log 'Remote Docker CLI found but daemon is not running.' 'Warn'
+                $remoteDockerPermissionDenied = $true
+                Write-Log "Remote user '$remoteUser' may not access the Docker socket (not in the docker group?)." 'Error'
             } else {
-                Write-Log 'Remote Docker CLI not found.' 'Error'
+                # Check if CLI exists but daemon is not running
+                $whichDocker = & ssh @sshCheckArgs 'which docker 2>/dev/null || echo NOT_FOUND' 2>&1
+                if ($whichDocker -and $whichDocker -notmatch 'NOT_FOUND') {
+                    $remoteDockerCliExists = $true
+                    Write-Log 'Remote Docker CLI found but daemon is not running.' 'Warn'
+                } else {
+                    Write-Log 'Remote Docker CLI not found.' 'Error'
+                }
             }
         }
     } catch {
         Write-Log "Remote Docker check failed: $($_.Exception.Message)" 'Warn'
+    }
+
+    if ($remoteDockerPermissionDenied) {
+        [System.Windows.Forms.MessageBox]::Show($dockerPermissionMsg, 'Docker Permission Denied (Remote)', 'OK', 'Error') | Out-Null
+        return $false
     }
 
     if (-not $remoteDockerCliExists) {
@@ -485,7 +658,12 @@ echo SSH_KEY_COPIED
             Write-Host ''
             Write-Host '--- Enter the sudo password on the remote host when prompted ---' -ForegroundColor Yellow
             try {
-                $startArgs = @('-i', $State.Paths.SshPrivate, '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=30', '-t', $remoteHost, 'sudo systemctl start docker')
+                # Start-Process joins its arguments with plain spaces and quotes nothing, so a
+                # key path with a space (C:\Users\Max Mustermann\...) would be split in two and
+                # ssh would treat the second half as the host name. So we put double quotes
+                # around the path ourselves. Start-Process is kept on purpose: it gives ssh the
+                # real console, which the sudo password prompt (-t) needs.
+                $startArgs = @('-i', "`"$($State.Paths.SshPrivate)`"", '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=30', '-t', $remoteHost, 'sudo systemctl start docker')
                 $p = Start-Process -FilePath 'ssh' -ArgumentList $startArgs -Wait -PassThru -NoNewWindow
                 if ($p.ExitCode -eq 0) {
                     Write-Log 'sudo systemctl start docker completed.' 'Info'
@@ -497,6 +675,11 @@ echo SSH_KEY_COPIED
                     if ($LASTEXITCODE -eq 0 -and $dockerVer2 -and $dockerVer2 -notmatch 'Cannot connect') {
                         $remoteDockerOk = $true
                         Write-Log "Remote Docker Engine started successfully (Server version: $dockerVer2)" 'Info'
+                    } else {
+                        # The daemon may now be running while the account still may not use it.
+                        $dockerVer2Text = (@($dockerVer2) | ForEach-Object { "$_" }) -join ' '
+                        Write-Log "Remote 'docker version' after start failed: $dockerVer2Text" 'Warn'
+                        if ($dockerVer2Text -match 'docker\.sock' -and $dockerVer2Text -match 'permission denied') { $remoteDockerPermissionDenied = $true }
                     }
                 } else {
                     Write-Log "sudo systemctl start docker exited with code $($p.ExitCode)" 'Warn'
@@ -509,6 +692,10 @@ echo SSH_KEY_COPIED
         }
 
         if (-not $remoteDockerOk) {
+            if ($remoteDockerPermissionDenied) {
+                [System.Windows.Forms.MessageBox]::Show($dockerPermissionMsg, 'Docker Permission Denied (Remote)', 'OK', 'Error') | Out-Null
+                return $false
+            }
             [System.Windows.Forms.MessageBox]::Show(
                 "Docker daemon could not be started on the remote workstation ($remoteIp).`n`nStart it manually on the remote host:`n  sudo systemctl start docker`n  sudo systemctl enable docker",
                 'Docker Daemon Start Failed', 'OK', 'Error') | Out-Null
@@ -1079,7 +1266,7 @@ function Show-ContainerManager {
 
         if ($State.ContainerLocation -like 'REMOTE@*') {
             if (-not (Test-RemoteSSHKeyFiles -State $State)) {
-                [System.Windows.Forms.MessageBox]::Show('Remote SSH key or known_hosts missing. Re-run key setup.', 'SSH missing', 'OK', 'Error') | Out-Null
+                [System.Windows.Forms.MessageBox]::Show($(if ($State.Metadata['RemoteSshCheckMessage']) { $State.Metadata['RemoteSshCheckMessage'] } else { 'Your SSH key was not found on the workstation. Close IMPACT and start it again to set it up.' }), 'SSH problem', 'OK', 'Error') | Out-Null  # message explains the real cause (VPN, key missing, ...), set by Test-RemoteSSHKeyFiles
                 return
             }
         }

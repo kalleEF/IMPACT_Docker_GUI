@@ -761,34 +761,88 @@ Describe 'Remote container metadata lifecycle (mocked SSH)' -Tag Integration {
 #  Test-RemoteSSHKeyFiles (mocked SSH)
 # ═══════════════════════════════════════════════════════════════════════════════
 Describe 'Test-RemoteSSHKeyFiles (mocked SSH)' -Tag Integration {
+    BeforeAll {
+        # Pester can only mock a command that exists. On a machine without the
+        # OpenSSH client (for example a Linux CI box) we add an empty 'ssh'
+        # function for the duration of this block, so the Mocks below work.
+        $script:addedSshStub = $false
+        if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+            function global:ssh { }
+            $script:addedSshStub = $true
+        }
+    }
+    AfterAll {
+        if ($script:addedSshStub) { Remove-Item function:global:ssh -ErrorAction SilentlyContinue }
+    }
+
     It 'Returns true for LOCAL mode (no remote check needed)' {
         $state = New-TestSessionState -Location 'LOCAL'
         $result = Test-RemoteSSHKeyFiles -State $state
         $result | Should -BeTrue
     }
 
-    It 'Returns true when both key and known_hosts exist on remote' {
+    It 'Returns true when the private key exists on remote' {
         Mock ssh {
-            return 'OK'
+            return 'IMPACT_KEY_OK'
         } -ModuleName 'IMPACT_Docker_GUI'
 
         $state = New-TestSessionState -UserName 'sshuser' -Location 'REMOTE@10.0.0.5'
         $result = Test-RemoteSSHKeyFiles -State $state
         $result | Should -BeTrue
+        $state.Metadata['RemoteSshCheckStatus'] | Should -Be 'OK'
+        $state.Metadata['RemoteSshCheckMessage'] | Should -BeNullOrEmpty
     }
 
-    It 'Returns false when remote key check fails' {
-        $script:callCount = 0
+    It 'Only checks the private key (known_hosts is no longer required)' {
+        $script:sshCommands = @()
         Mock ssh {
-            $script:callCount++
-            if ($script:callCount -eq 1) { return '' }   # key missing
-            if ($script:callCount -eq 2) { return 'OK' }  # known_hosts present
-            return ''
+            $script:sshCommands += ($args -join ' ')
+            return 'IMPACT_KEY_OK'
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'sshuser' -Location 'REMOTE@10.0.0.5'
+        Test-RemoteSSHKeyFiles -State $state | Should -BeTrue
+        $script:sshCommands.Count | Should -Be 1
+        $script:sshCommands[0] | Should -Match 'id_ed25519_sshuser'
+        $script:sshCommands[0] | Should -Not -Match 'known_hosts'
+    }
+
+    It 'Returns false and reports KeyMissing when the key file is missing' {
+        Mock ssh {
+            return 'IMPACT_KEY_MISSING'
         } -ModuleName 'IMPACT_Docker_GUI'
 
         $state = New-TestSessionState -UserName 'sshuser' -Location 'REMOTE@10.0.0.5'
         $result = Test-RemoteSSHKeyFiles -State $state
         $result | Should -BeFalse
+        $state.Metadata['RemoteSshCheckStatus'] | Should -Be 'KeyMissing'
+        $state.Metadata['RemoteSshCheckMessage'] | Should -Match 'start it again'
+    }
+
+    It 'Reports Unreachable (not "key missing") when the workstation cannot be reached' {
+        Mock ssh {
+            # What ssh prints on stderr when the VPN is off; with 2>&1 it arrives as an ErrorRecord.
+            [System.Management.Automation.ErrorRecord]::new(
+                [System.Exception]::new('ssh: connect to host 10.0.0.5 port 22: Connection timed out'),
+                'NativeCommandError', [System.Management.Automation.ErrorCategory]::NotSpecified, $null)
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'sshuser' -Location 'REMOTE@10.0.0.5'
+        $result = Test-RemoteSSHKeyFiles -State $state
+        $result | Should -BeFalse
+        $state.Metadata['RemoteSshCheckStatus'] | Should -Be 'Unreachable'
+        $state.Metadata['RemoteSshCheckMessage'] | Should -Match 'VPN'
+        $state.Metadata['RemoteSshCheckMessage'] | Should -Match '10\.0\.0\.5'
+    }
+
+    It 'Reports LoginFailed when the workstation refuses the key' {
+        Mock ssh {
+            'php-workstation@10.0.0.5: Permission denied (publickey,password).'
+        } -ModuleName 'IMPACT_Docker_GUI'
+
+        $state = New-TestSessionState -UserName 'sshuser' -Location 'REMOTE@10.0.0.5'
+        Test-RemoteSSHKeyFiles -State $state | Should -BeFalse
+        $state.Metadata['RemoteSshCheckStatus'] | Should -Be 'LoginFailed'
     }
 
     It 'Returns false when SSH connection itself fails' {
@@ -799,6 +853,7 @@ Describe 'Test-RemoteSSHKeyFiles (mocked SSH)' -Tag Integration {
         $state = New-TestSessionState -UserName 'sshuser' -Location 'REMOTE@10.0.0.5'
         $result = Test-RemoteSSHKeyFiles -State $state
         $result | Should -BeFalse
+        $state.Metadata['RemoteSshCheckStatus'] | Should -Be 'Unreachable'
     }
 }
 

@@ -24,6 +24,8 @@
         'Get-DockerContextArgs'
         'Convert-PathToDockerFormat'
         'Test-RemoteSSHKeyFiles'
+        'Get-SshFailureKind'
+        'ConvertTo-RemoteRepoList'
         'Write-RemoteContainerMetadata'
         'Remove-RemoteContainerMetadata'
         'Read-RemoteContainerMetadata'
