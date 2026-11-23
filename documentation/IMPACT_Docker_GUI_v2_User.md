@@ -226,7 +226,7 @@ What happens next depends on which location you chose:
    - Enter the remote user's password once
    - The tool uses **Posh-SSH** (preferred) or **plink.exe** (fallback) to install your public key in the remote `~/.ssh/authorized_keys`
    - Subsequent connections use key-based auth (no password needed)
-2. **Key sync** — your private key and `known_hosts` are securely copied to the remote host for Git access inside containers
+2. **Key sync**: your private key is securely copied to the remote host for Git access inside containers (your `known_hosts` file is copied as well)
 3. **Repository selection** — the tool lists folders under `/home/php-workstation/Schreibtisch/Repositories/` on the remote machine; select one
 4. **Docker context** — a context named `remote-<ip>` is created. If that fails, the tool falls back to direct `DOCKER_HOST=ssh://...`
 
@@ -372,6 +372,7 @@ Click **Stop Container** in the Container Manager. The tool:
 |---|---|
 | **Git dialog on stop** | This appears when the repo has uncommitted changes. Enter a commit message and optionally push, or click **Skip** to ignore. |
 | **Push fails** | Ensure your SSH key is added to GitHub. The tool automatically converts HTTPS remotes to SSH for push. |
+| **"Host key verification failed" on `git pull` in RStudio** | Stop the container and start it again with the current version of the tool. A container that was started with an older version keeps its old settings until it is restarted. |
 
 ### UI Issues
 

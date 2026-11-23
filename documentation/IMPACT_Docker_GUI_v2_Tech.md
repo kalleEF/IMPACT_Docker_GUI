@@ -390,7 +390,9 @@ Within `Show-ContainerManager` Start button click handler:
    A second `docker exec` (as `rstudio`) writes the git settings to
    `/home/rstudio/.gitconfig`: user name and e-mail, the pull strategy,
    `safe.directory`, and `core.sshCommand` with the same value as
-   `GIT_SSH_COMMAND`, for shells that do not inherit that variable.
+   `GIT_SSH_COMMAND`. Git started from RStudio uses `GIT_SSH_COMMAND`.
+   The image's start-up script (`docker_setup/git-identity.sh`) also sets
+   `core.sshCommand` and can replace the value when it finishes later.
 8. **Metadata**: write remote metadata JSON, update UI state
 
 ### Phase 8 — Container Stop & Data Sync
@@ -453,7 +455,7 @@ Stop button click handler:
 | **SSH key on remote** | Private key base64-encoded via SSH pipe to `~/.ssh/id_ed25519_<user>` | `chmod 600`; owned by remote user |
 | **Docker socket** | Local: `npipe:////./pipe/docker_engine`; Remote: SSH tunnel | No TLS for local socket |
 | **Container privileges** | `--rm`, `USERID=1000`, `GROUPID=1000` | Not `--privileged`; no capabilities added |
-| **Git push** | SSH key mounted read-only; `IdentitiesOnly=yes`, `StrictHostKeyChecking=yes` | HTTPS→SSH remote conversion is automatic |
+| **Git push** | SSH key mounted read-only; `IdentitiesOnly=yes`. In the container: `StrictHostKeyChecking=accept-new`, github.com host keys are scanned inside the container at start | HTTPS→SSH remote conversion is automatic |
 | **Log file** | May contain sensitive info at Debug level | Recommend disabling Debug in production |
 
 ---
