@@ -367,18 +367,32 @@ Within `Show-ContainerManager` Start button click handler:
    docker run -d --rm --name <container>
      -e PASSWORD=<pass>
      -e DISABLE_AUTH=false
-     -e USERID=1000 -e GROUPID=1000
-     -e GIT_SSH_COMMAND="ssh -i /keys/id_ed25519_<user> ..."
-     --mount type=bind,source=<repo>,target=/host-repo
+     -e USERID=<uid> -e GROUPID=<gid>
+     -e GIT_SSH_COMMAND="ssh -i /home/rstudio/.ssh/id_ed25519_<user> -o IdentitiesOnly=yes
+                         -o UserKnownHostsFile=/home/rstudio/.ssh/known_hosts
+                         -o StrictHostKeyChecking=accept-new"
      --mount type=bind,source=<repo>,target=/home/rstudio/<repo>
      -p <port>:8787
      [volume or bind mounts for outputs/synthpop]
      [--cpus 32 -m 384g if high compute]
-     --mount type=bind,source=<key>,target=/keys/...,readonly
-     --mount type=bind,source=<known_hosts>,target=/etc/ssh/ssh_known_hosts,readonly
+     --mount type=bind,source=<key>,target=/keys/id_ed25519_<user>,readonly
      --workdir /home/rstudio/<repo>
      <image>
    ```
+   The `GIT_SSH_COMMAND` value comes from `Get-ContainerGitSshCommand`.
+   After start, `docker exec` (as root) runs the command from
+   `Get-ContainerSshSetupCommand`: it copies the key to
+   `/home/rstudio/.ssh/` (CR characters stripped, mode 600), writes
+   github.com's host keys to `/home/rstudio/.ssh/known_hosts` with
+   `ssh-keyscan` inside the container, and chowns `.ssh` to `<uid>:<gid>`.
+   The host's `known_hosts` is not mounted, so `git pull` in RStudio works
+   even when the host has never connected to github.com.
+   A second `docker exec` (as `rstudio`) writes the git settings to
+   `/home/rstudio/.gitconfig`: user name and e-mail, the pull strategy,
+   `safe.directory`, and `core.sshCommand` with the same value as
+   `GIT_SSH_COMMAND`. Git started from RStudio uses `GIT_SSH_COMMAND`.
+   The image's start-up script (`docker_setup/git-identity.sh`) also sets
+   `core.sshCommand` and can replace the value when it finishes later.
 8. **Metadata**: write remote metadata JSON, update UI state
 
 ### Phase 8 — Container Stop & Data Sync
@@ -441,7 +455,7 @@ Stop button click handler:
 | **SSH key on remote** | Private key base64-encoded via SSH pipe to `~/.ssh/id_ed25519_<user>` | `chmod 600`; owned by remote user |
 | **Docker socket** | Local: `npipe:////./pipe/docker_engine`; Remote: SSH tunnel | No TLS for local socket |
 | **Container privileges** | `--rm`, `USERID=1000`, `GROUPID=1000` | Not `--privileged`; no capabilities added |
-| **Git push** | SSH key mounted read-only; `IdentitiesOnly=yes`, `StrictHostKeyChecking=yes` | HTTPS→SSH remote conversion is automatic |
+| **Git push** | SSH key mounted read-only; `IdentitiesOnly=yes`. In the container: `StrictHostKeyChecking=accept-new`, github.com host keys are scanned inside the container at start | HTTPS→SSH remote conversion is automatic |
 | **Log file** | May contain sensitive info at Debug level | Recommend disabling Debug in production |
 
 ---

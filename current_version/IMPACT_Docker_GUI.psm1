@@ -1785,6 +1785,65 @@ function Select-Location {
 # ══════════════════════════════════════════════════════════════════════════════
 
 <#
+.SYNOPSIS Value for GIT_SSH_COMMAND inside the IMPACT container.
+.DESCRIPTION Git (also when started from the RStudio Git pane) uses this command
+             to reach GitHub. It points at the user's private key and at a
+             known_hosts file in the rstudio user's home directory, which
+             Get-ContainerSshSetupCommand fills with github.com's host key.
+             StrictHostKeyChecking=accept-new trusts github.com on first contact
+             if that pre-fill failed (e.g. no network at container start), and
+             still refuses a host key that differs from a stored one.
+#>
+function Get-ContainerGitSshCommand {
+    param([Parameter(Mandatory)][string]$UserName)
+    $keyPath   = "/home/rstudio/.ssh/id_ed25519_$UserName"
+    $knownHost = '/home/rstudio/.ssh/known_hosts'
+    return "ssh -i $keyPath -o IdentitiesOnly=yes -o UserKnownHostsFile=$knownHost -o StrictHostKeyChecking=accept-new"
+}
+
+<#
+.SYNOPSIS Shell command (run as root via 'docker exec') that prepares SSH for git.
+.DESCRIPTION 1. Copies the read-only mounted private key to ~rstudio/.ssh, strips
+                Windows CR characters, sets mode 600 and rstudio ownership.
+             2. Writes github.com's host keys to ~rstudio/.ssh/known_hosts with
+                ssh-keyscan, run inside the container. The host's own known_hosts
+                is not used: on many Windows machines it has no github.com entry
+                (or is missing entirely), which made 'git pull' fail with
+                "Host key verification failed".
+             Prints KEY_FIXED at the end so the caller can confirm it ran.
+#>
+function Get-ContainerSshSetupCommand {
+    param(
+        [Parameter(Mandatory)][string]$UserName,
+        [string]$ContainerUid = '1000',
+        [string]$ContainerGid = '1000'
+    )
+    $sshDir    = '/home/rstudio/.ssh'
+    $keySource = "/keys/id_ed25519_$UserName"
+    $keyTarget = "$sshDir/id_ed25519_$UserName"
+    $knownHost = "$sshDir/known_hosts"
+    $owner     = "${ContainerUid}:${ContainerGid}"
+
+    $steps = @(
+        "mkdir -p $sshDir",
+        "chmod 700 $sshDir",
+        "tr -d '\r' < $keySource > $keyTarget",
+        "chmod 600 $keyTarget",
+        "touch $knownHost",
+        # Keep existing lines except old github.com entries, then add fresh ones.
+        # '|| true' keeps a failed scan (e.g. no network yet) from aborting the
+        # chain, so the ownership fix below still runs; accept-new in
+        # GIT_SSH_COMMAND then records github.com on the first pull.
+        "{ grep -v '^github.com ' $knownHost 2>/dev/null; ssh-keyscan -T 10 -t ed25519,ecdsa,rsa github.com 2>/dev/null || true; } > $knownHost.tmp",
+        "mv $knownHost.tmp $knownHost",
+        "chmod 644 $knownHost",
+        "chown -R $owner $sshDir",
+        "echo KEY_FIXED"
+    )
+    return ($steps -join ' && ')
+}
+
+<#
 .SYNOPSIS Build the docker run command-line arguments (pure logic, no execution).
 .DESCRIPTION Given the session state and options, returns the string array to pass
              to 'docker run'. This makes the command testable without touching Docker.
@@ -1801,7 +1860,6 @@ function Build-DockerRunCommand {
         [string]$OutputDir,
         [string]$SynthpopDir,
         [string]$SshKeyPath,
-        [string]$KnownHostsPath,
         [string]$ContainerUid  = '1000',
         [string]$ContainerGid  = '1000'
     )
@@ -1815,7 +1873,7 @@ function Build-DockerRunCommand {
         '-e',"USERID=$ContainerUid",'-e',"GROUPID=$ContainerGid",
         '-e',"CONTAINER_REPO_NAME=$($State.SelectedRepo)",
         '-e','SYNC_ENABLED=false',
-        '-e',"GIT_SSH_COMMAND=ssh -i $containerKeyPath -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/ssh/ssh_known_hosts -o StrictHostKeyChecking=yes",
+        '-e',"GIT_SSH_COMMAND=$(Get-ContainerGitSshCommand -UserName $State.UserName)",
         '--mount',"type=bind,source=$repoMountSource,target=/home/rstudio/$($State.SelectedRepo)",
         '-p',"${Port}:8787"
     )
@@ -1838,8 +1896,10 @@ function Build-DockerRunCommand {
         $dockerArgs += @('--cpus','32','-m','384g')
     }
 
+    # Only the private key is mounted from the host. The github.com host key is
+    # written inside the container by Get-ContainerSshSetupCommand, so the
+    # container does not depend on the host's known_hosts file.
     $dockerArgs += @('--mount',"type=bind,source=$SshKeyPath,target=/keys/id_ed25519_$($State.UserName),readonly",
-                     '--mount',"type=bind,source=$KnownHostsPath,target=/etc/ssh/ssh_known_hosts,readonly",
                      '--workdir',"/home/rstudio/$($State.SelectedRepo)",
                      $ImageName)
 
@@ -2031,6 +2091,8 @@ Export-ModuleMember -Function @(
     'Select-Location'
     # Container lifecycle (extracted)
     'Build-DockerRunCommand'
+    'Get-ContainerGitSshCommand'
+    'Get-ContainerSshSetupCommand'
     'Test-DockerDaemonReady'
     'Start-DockerDesktopIfNeeded'
     # GitHub SSH key API

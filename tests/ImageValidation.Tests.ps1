@@ -165,7 +165,6 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
         docker stop $script:CONTAINER_NAME 2>$null | Out-Null
         docker rm   $script:CONTAINER_NAME 2>$null | Out-Null
 
-        $containerKeyPath = "/home/rstudio/.ssh/id_ed25519_$($script:TEST_USER)"
 
         $dockerArgs = @(
             'run', '-d',
@@ -175,7 +174,8 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
             '-e', 'USERID=1000', '-e', 'GROUPID=1000',
             '-e', "CONTAINER_REPO_NAME=$($script:REPO_NAME)",
             '-e', 'SYNC_ENABLED=false',
-            '-e', "GIT_SSH_COMMAND=ssh -i $containerKeyPath -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/ssh/ssh_known_hosts -o StrictHostKeyChecking=yes",
+            # Same value the GUI uses in production
+            '-e', "GIT_SSH_COMMAND=$(Get-ContainerGitSshCommand -UserName $script:TEST_USER)",
             '-v', "$($script:repoDir):/home/rstudio/$($script:REPO_NAME)",
             '-p', "$($script:CONTAINER_PORT):8787",
             '-v', "$($script:outputDir):/home/rstudio/$($script:REPO_NAME)/outputs",
@@ -201,7 +201,9 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
         #   Also generate known_hosts INSIDE the container to avoid Windows
         #   encoding issues (CRLF, BOM) from host-side ssh-keyscan.
         Start-Sleep -Seconds 2
-        $fixCmd = "chown -R 1000:1000 /home/rstudio/$($script:REPO_NAME) && mkdir -p /home/rstudio/.ssh && cp /keys/id_ed25519_$($script:TEST_USER) $containerKeyPath && chmod 600 $containerKeyPath && chown 1000:1000 $containerKeyPath && ssh-keyscan -t ed25519 github.com > /etc/ssh/ssh_known_hosts 2>/dev/null && cp /etc/ssh/ssh_known_hosts /home/rstudio/.ssh/known_hosts 2>/dev/null; chmod 644 /home/rstudio/.ssh/known_hosts 2>/dev/null; chown 1000:1000 /home/rstudio/.ssh/known_hosts 2>/dev/null; echo KEY_FIXED"
+        # The SSH part is the exact command the GUI runs in production, so this
+        # suite exercises the real key / known_hosts setup.
+        $fixCmd = "chown -R 1000:1000 /home/rstudio/$($script:REPO_NAME) && " + (Get-ContainerSshSetupCommand -UserName $script:TEST_USER)
         $fixArgs = @('exec', $script:CONTAINER_NAME, 'sh', '-c', $fixCmd)
         $fixOut = docker @fixArgs 2>&1
         if (($fixOut -join '') -notmatch 'KEY_FIXED') {

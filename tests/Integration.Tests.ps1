@@ -249,8 +249,7 @@ synthpop_dir: /mnt/Storage_1/IMPACT_Storage/Base/inputs/synthpop
             -ProjectRoot  $remoteRepoBase `
             -OutputDir    '/mnt/Storage_1/IMPACT_Storage/Base/outputs' `
             -SynthpopDir  '/mnt/Storage_1/IMPACT_Storage/Base/inputs/synthpop' `
-            -SshKeyPath   "/home/php-workstation/.ssh/id_ed25519_remuser" `
-            -KnownHostsPath "/home/php-workstation/.ssh/known_hosts"
+            -SshKeyPath   "/home/php-workstation/.ssh/id_ed25519_remuser"
 
         $joined = $args -join ' '
 
@@ -334,8 +333,7 @@ synthpop_dir: ./inputs/synthpop
             -ProjectRoot  $script:localRepo `
             -OutputDir    $script:outputDir `
             -SynthpopDir  $script:synthpopDir `
-            -SshKeyPath   "C:\Users\localuser\.ssh\id_ed25519_localuser" `
-            -KnownHostsPath "C:\Users\localuser\.ssh\known_hosts"
+            -SshKeyPath   "C:\Users\localuser\.ssh\id_ed25519_localuser"
 
         $joined = $args -join ' '
 
@@ -367,8 +365,7 @@ Describe 'Build-DockerRunCommand end-to-end' -Tag Integration {
             -ProjectRoot 'C:\repos\IMPACTncd_Germany' `
             -OutputDir 'C:\repos\IMPACTncd_Germany\outputs' `
             -SynthpopDir 'C:\repos\IMPACTncd_Germany\inputs\synthpop' `
-            -SshKeyPath 'C:\Users\inttest\.ssh\id_ed25519_inttest' `
-            -KnownHostsPath 'C:\Users\inttest\.ssh\known_hosts'
+            -SshKeyPath 'C:\Users\inttest\.ssh\id_ed25519_inttest'
 
         $joined = $args -join ' '
 
@@ -395,8 +392,7 @@ Describe 'Build-DockerRunCommand end-to-end' -Tag Integration {
             -ProjectRoot '/home/php-workstation/Schreibtisch/Repositories/IMPACTncd_Germany' `
             -OutputDir '/mnt/Storage_1/IMPACT_Storage/Base/outputs' `
             -SynthpopDir '/mnt/Storage_1/IMPACT_Storage/Base/inputs/synthpop' `
-            -SshKeyPath '/home/php-workstation/.ssh/id_ed25519_remuser' `
-            -KnownHostsPath '/home/php-workstation/.ssh/known_hosts'
+            -SshKeyPath '/home/php-workstation/.ssh/id_ed25519_remuser'
 
         $joined = $args -join ' '
 

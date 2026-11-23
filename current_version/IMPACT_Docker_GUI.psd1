@@ -47,6 +47,8 @@
         'Ensure-GitKeySetup'
         'Select-Location'
         'Build-DockerRunCommand'
+        'Get-ContainerGitSshCommand'
+        'Get-ContainerSshSetupCommand'
         'Test-DockerDaemonReady'
         'Start-DockerDesktopIfNeeded'
         'Add-GitHubSshKey'

@@ -385,8 +385,7 @@ Describe 'Build-DockerRunCommand' -Tag Unit {
             -ProjectRoot 'C:\repos\IMPACTncd_Germany' `
             -OutputDir 'C:\repos\IMPACTncd_Germany\outputs' `
             -SynthpopDir 'C:\repos\IMPACTncd_Germany\inputs\synthpop' `
-            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice' `
-            -KnownHostsPath 'C:\Users\alice\.ssh\known_hosts'
+            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice'
 
         $args[0] | Should -Be 'run'
     }
@@ -396,8 +395,7 @@ Describe 'Build-DockerRunCommand' -Tag Unit {
             -ProjectRoot 'C:\repos\IMPACTncd_Germany' `
             -OutputDir 'C:\repos\IMPACTncd_Germany\outputs' `
             -SynthpopDir 'C:\repos\IMPACTncd_Germany\inputs\synthpop' `
-            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice' `
-            -KnownHostsPath 'C:\Users\alice\.ssh\known_hosts'
+            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice'
 
         $args | Should -Contain $baseState.ContainerName
     }
@@ -407,8 +405,7 @@ Describe 'Build-DockerRunCommand' -Tag Unit {
             -ProjectRoot 'C:\repos\IMPACTncd_Germany' `
             -OutputDir 'C:\repos\IMPACTncd_Germany\outputs' `
             -SynthpopDir 'C:\repos\IMPACTncd_Germany\inputs\synthpop' `
-            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice' `
-            -KnownHostsPath 'C:\Users\alice\.ssh\known_hosts'
+            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice'
 
         $args | Should -Contain 'PASSWORD=secret'
     }
@@ -418,8 +415,7 @@ Describe 'Build-DockerRunCommand' -Tag Unit {
             -ProjectRoot 'C:\repos\IMPACTncd_Germany' `
             -OutputDir 'C:\repos\IMPACTncd_Germany\outputs' `
             -SynthpopDir 'C:\repos\IMPACTncd_Germany\inputs\synthpop' `
-            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice' `
-            -KnownHostsPath 'C:\Users\alice\.ssh\known_hosts'
+            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice'
 
         $args | Should -Contain '9090:8787'
     }
@@ -430,8 +426,7 @@ Describe 'Build-DockerRunCommand' -Tag Unit {
             -ProjectRoot '/home/php-workstation/Schreibtisch/Repositories/IMPACTncd_Germany' `
             -OutputDir '/mnt/Storage_1/IMPACT_Storage/Base/outputs' `
             -SynthpopDir '/mnt/Storage_1/IMPACT_Storage/Base/inputs/synthpop' `
-            -SshKeyPath '/home/php-workstation/.ssh/id_ed25519_alice' `
-            -KnownHostsPath '/home/php-workstation/.ssh/known_hosts'
+            -SshKeyPath '/home/php-workstation/.ssh/id_ed25519_alice'
 
         $args | Should -Contain '--cpus'
         $args | Should -Contain '32'
@@ -444,8 +439,7 @@ Describe 'Build-DockerRunCommand' -Tag Unit {
             -ProjectRoot 'C:\repos\IMPACTncd_Germany' `
             -OutputDir 'C:\repos\IMPACTncd_Germany\outputs' `
             -SynthpopDir 'C:\repos\IMPACTncd_Germany\inputs\synthpop' `
-            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice' `
-            -KnownHostsPath 'C:\Users\alice\.ssh\known_hosts'
+            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice'
 
         $args | Should -Not -Contain '--cpus'
     }
@@ -455,8 +449,7 @@ Describe 'Build-DockerRunCommand' -Tag Unit {
             -ProjectRoot 'C:\repos\IMPACTncd_Germany' `
             -OutputDir 'C:\repos\IMPACTncd_Germany\outputs' `
             -SynthpopDir 'C:\repos\IMPACTncd_Germany\inputs\synthpop' `
-            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice' `
-            -KnownHostsPath 'C:\Users\alice\.ssh\known_hosts'
+            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice'
 
         $joined = $args -join ' '
         $joined | Should -Match '-v.*impactncd_germany_output_alice'
@@ -468,8 +461,7 @@ Describe 'Build-DockerRunCommand' -Tag Unit {
             -ProjectRoot 'C:\repos\IMPACTncd_Germany' `
             -OutputDir 'C:\repos\IMPACTncd_Germany\outputs' `
             -SynthpopDir 'C:\repos\IMPACTncd_Germany\inputs\synthpop' `
-            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice' `
-            -KnownHostsPath 'C:\Users\alice\.ssh\known_hosts'
+            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice'
 
         $joined = $args -join ' '
         $joined | Should -Match 'type=bind.*outputs'
@@ -481,8 +473,7 @@ Describe 'Build-DockerRunCommand' -Tag Unit {
             -ProjectRoot 'C:\repos\IMPACTncd_Germany' `
             -OutputDir 'C:\repos\IMPACTncd_Germany\outputs' `
             -SynthpopDir 'C:\repos\IMPACTncd_Germany\inputs\synthpop' `
-            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice' `
-            -KnownHostsPath 'C:\Users\alice\.ssh\known_hosts'
+            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice'
 
         $args[-1] | Should -Be 'my-image'
     }
@@ -492,13 +483,68 @@ Describe 'Build-DockerRunCommand' -Tag Unit {
             -ProjectRoot 'C:\repos\IMPACTncd_Germany' `
             -OutputDir 'C:\repos\IMPACTncd_Germany\outputs' `
             -SynthpopDir 'C:\repos\IMPACTncd_Germany\inputs\synthpop' `
-            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice' `
-            -KnownHostsPath 'C:\Users\alice\.ssh\known_hosts'
+            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice'
 
         $args | Should -Contain '--gpus'
         $args | Should -Contain 'all'
         $args | Should -Contain '--shm-size'
         $args | Should -Contain '4g'
+    }
+
+    It 'Does not bind-mount the host known_hosts file' {
+        # Regression: the host known_hosts often lacks github.com, which made
+        # git pull fail inside the container with "Host key verification failed".
+        $args = Build-DockerRunCommand -State $baseState -ImageName 'test-image' `
+            -ProjectRoot 'C:\repos\IMPACTncd_Germany' `
+            -OutputDir 'C:\repos\IMPACTncd_Germany\outputs' `
+            -SynthpopDir 'C:\repos\IMPACTncd_Germany\inputs\synthpop' `
+            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice'
+
+        ($args -join ' ') | Should -Not -Match 'known_hosts,readonly'
+    }
+
+    It 'Sets GIT_SSH_COMMAND to the writable known_hosts in the rstudio home' {
+        $args = Build-DockerRunCommand -State $baseState -ImageName 'test-image' `
+            -ProjectRoot 'C:\repos\IMPACTncd_Germany' `
+            -OutputDir 'C:\repos\IMPACTncd_Germany\outputs' `
+            -SynthpopDir 'C:\repos\IMPACTncd_Germany\inputs\synthpop' `
+            -SshKeyPath 'C:\Users\alice\.ssh\id_ed25519_alice'
+
+        $args | Should -Contain "GIT_SSH_COMMAND=$(Get-ContainerGitSshCommand -UserName 'alice')"
+    }
+}
+
+Describe 'Container SSH setup for git' -Tag Unit {
+    It 'GIT_SSH_COMMAND uses the user key, rstudio known_hosts and accept-new' {
+        $cmd = Get-ContainerGitSshCommand -UserName 'alice'
+        $cmd | Should -Match '-i /home/rstudio/\.ssh/id_ed25519_alice'
+        $cmd | Should -Match 'IdentitiesOnly=yes'
+        $cmd | Should -Match 'UserKnownHostsFile=/home/rstudio/\.ssh/known_hosts'
+        $cmd | Should -Match 'StrictHostKeyChecking=accept-new'
+        $cmd | Should -Not -Match '/etc/ssh/ssh_known_hosts'
+    }
+
+    It 'Setup command scans github.com host keys inside the container' {
+        $cmd = Get-ContainerSshSetupCommand -UserName 'alice'
+        $cmd | Should -Match 'ssh-keyscan .*github\.com'
+        $cmd | Should -Match '> /home/rstudio/\.ssh/known_hosts\.tmp'
+    }
+
+    It 'A failed keyscan does not abort the ownership fix' {
+        $cmd = Get-ContainerSshSetupCommand -UserName 'alice'
+        $cmd | Should -Match 'github\.com 2>/dev/null \|\| true'
+    }
+
+    It 'Copies the key with CR characters stripped and mode 600' {
+        $cmd = Get-ContainerSshSetupCommand -UserName 'alice'
+        $cmd | Should -Match "tr -d '\\r' < /keys/id_ed25519_alice > /home/rstudio/\.ssh/id_ed25519_alice"
+        $cmd | Should -Match 'chmod 600 /home/rstudio/\.ssh/id_ed25519_alice'
+    }
+
+    It 'Chowns the .ssh directory to the given uid:gid and ends with KEY_FIXED' {
+        $cmd = Get-ContainerSshSetupCommand -UserName 'alice' -ContainerUid '1001' -ContainerGid '1002'
+        $cmd | Should -Match 'chown -R 1001:1002 /home/rstudio/\.ssh'
+        $cmd | Should -Match 'echo KEY_FIXED$'
     }
 }
 
