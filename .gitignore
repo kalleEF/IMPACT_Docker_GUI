@@ -17,3 +17,6 @@ tests/TestResults-*.xml
 
 # Claude files
 .claude/
+
+# zip files
+*.zip
