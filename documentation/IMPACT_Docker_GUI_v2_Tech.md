@@ -387,6 +387,10 @@ Within `Show-ContainerManager` Start button click handler:
    `ssh-keyscan` inside the container, and chowns `.ssh` to `<uid>:<gid>`.
    The host's `known_hosts` is not mounted, so `git pull` in RStudio works
    even when the host has never connected to github.com.
+   A second `docker exec` (as `rstudio`) writes the git settings to
+   `/home/rstudio/.gitconfig`: user name and e-mail, the pull strategy,
+   `safe.directory`, and `core.sshCommand` with the same value as
+   `GIT_SSH_COMMAND`, for shells that do not inherit that variable.
 8. **Metadata**: write remote metadata JSON, update UI state
 
 ### Phase 8 — Container Stop & Data Sync

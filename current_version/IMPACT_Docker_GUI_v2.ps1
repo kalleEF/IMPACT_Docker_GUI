@@ -1417,7 +1417,15 @@ function Show-ContainerManager {
         #    fast-forward isn't possible. We override at global level so git pull
         #    works like GitKraken / vanilla-git (merge when not fast-forwardable).
         # 3. safe.directory='*' is a safety net for any remaining ownership edge cases.
-        $gitCfgCmd = "git config --global user.name '$($State.UserName)' && git config --global user.email '$($State.UserName)@users.noreply.github.com' && git config --global pull.ff true && git config --global pull.rebase false && git config --global --add safe.directory '*' && echo GIT_CONFIGURED"
+        # 4. core.sshCommand gets the same ssh command as GIT_SSH_COMMAND (IMPACT key, the
+        #    known_hosts file in the rstudio home, accept-new). The image's start-up script
+        #    (docker_setup/git-identity.sh) sets core.sshCommand to strict host key checking
+        #    against /etc/ssh/ssh_known_hosts. A shell that does not inherit GIT_SSH_COMMAND
+        #    would use that setting and could fail with 'Host key verification failed'.
+        #    When GIT_SSH_COMMAND is set, git uses it (same value, so no difference).
+        #    The command contains no single quotes, so wrapping it in '...' for sh is safe.
+        $containerSshCmd = Get-ContainerGitSshCommand -UserName $State.UserName
+        $gitCfgCmd = "git config --global user.name '$($State.UserName)' && git config --global user.email '$($State.UserName)@users.noreply.github.com' && git config --global pull.ff true && git config --global pull.rebase false && git config --global --add safe.directory '*' && git config --global core.sshCommand '$containerSshCmd' && echo GIT_CONFIGURED"
         $gitCfgCtx = (Get-DockerContextArgs -State $State) + @('exec', '--user', 'rstudio', $State.ContainerName, 'sh', '-c', $gitCfgCmd)
         try {
             $gitCfgOut = & docker $gitCfgCtx 2>&1
