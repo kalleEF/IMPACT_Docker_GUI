@@ -1,0 +1,42 @@
+# =============================================================================
+# Dockerfile.test-prerequisite: stand-in for the model's prerequisite image
+# =============================================================================
+#
+# The real images are built in two steps:
+#   1. the prerequisite image (docker_setup/Dockerfile.prerequisite.IMPACTncdGER):
+#      the Rocker image plus system packages and many R packages. It is large and
+#      takes long to build.
+#   2. the model image (docker_setup/Dockerfile.IMPACTncdGER): the prerequisite image
+#      plus the repository, the model's R package and the start-up scripts.
+#
+# The tests build step 2 from the real Dockerfile. For step 1 they use this small
+# stand-in: the same Rocker image, and only what the start-up scripts and the tests
+# need from the prerequisite. run-tests.sh builds it once and reuses it.
+#
+# ROCKER_IMAGE is passed by run-tests.sh. It is the image named in the FROM line of
+# docker_setup/Dockerfile.prerequisite.IMPACTncdGER, so the tests always use the Rocker
+# version the model uses. The value here is only a default for a build by hand.
+ARG ROCKER_IMAGE=rocker/rstudio:4.5.1
+FROM ${ROCKER_IMAGE}
+
+# Keeps apt-get from asking questions during the build.
+ARG DEBIAN_FRONTEND=noninteractive
+
+# openssh-client   the prerequisite image installs it (docker_setup/apt-packages.txt);
+#                  git-identity.sh and git need "ssh".
+# openssh-server   test tool: one container of this image plays the SSH server that
+#                  stands in for GitHub in the git tests.
+# python3          test tool: the small RStudio client of the tests is written in Python.
+#                  The Rocker image already contains it; naming it here keeps the tests
+#                  independent of that.
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends openssh-client openssh-server python3 \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+# The model's Dockerfile calls roxygen2 (an R package that writes help pages) before it
+# builds the model's R package. The real prerequisite image has roxygen2. The stand-in
+# package below has the same name and does nothing, which is enough for the tiny test
+# package: its help pages and its NAMESPACE file are written by hand.
+COPY standin/roxygen2 /tmp/roxygen2-standin
+RUN R CMD INSTALL /tmp/roxygen2-standin && rm -rf /tmp/roxygen2-standin

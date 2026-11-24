@@ -1,0 +1,10 @@
+Package: roxygen2
+Type: Package
+Title: Stand-In for 'roxygen2' in the 'docker_setup' Tests
+Version: 0.0.1
+Authors@R: person("IMPACT Docker GUI", "tests", role = c("aut", "cre"), email = "tests@example.org")
+Description: Has the name of the real 'roxygen2' package and does nothing. The test
+    image of the 'docker_setup' tests needs a package of this name, because the model's
+    Dockerfile calls it. This stand-in must never be installed outside that test image.
+License: GPL-3
+Encoding: UTF-8

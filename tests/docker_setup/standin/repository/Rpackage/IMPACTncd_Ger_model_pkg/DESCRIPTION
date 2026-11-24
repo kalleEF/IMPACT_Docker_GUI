@@ -1,0 +1,11 @@
+Package: impactstandin
+Type: Package
+Title: Stand-In for the Model Package in the 'docker_setup' Tests
+Version: 0.0.1
+Authors@R: person("IMPACT Docker GUI", "tests", role = c("aut", "cre"), email = "tests@example.org")
+Description: A tiny package with one compiled function. The tests build and install it
+    the way the model's Dockerfile builds the real model package, and install it again
+    from an RStudio session to prove that the R library stays writable.
+License: GPL-3
+Encoding: UTF-8
+NeedsCompilation: yes

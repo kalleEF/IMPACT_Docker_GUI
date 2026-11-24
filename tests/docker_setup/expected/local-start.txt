@@ -1,0 +1,39 @@
+# Expected state of /home/rstudio after a LOCAL start (USERID=1000, GROUPID=1000, no
+# IMPACT_UID, no IMPACT_GID), before anyone signs in to RStudio.
+#
+# One line per entry:  path|type|owner:group|mode     (type: d folder, f file)
+# The mounted repository folder is left out.
+#
+# Where the values come from: the lines marked "as before" are what the start-up
+# scripts of setup version 1 (the scripts in the model repositories before version 2.1)
+# produce for the same start. They were worked out by reading those scripts line by
+# line; the old scripts were never executed for this file. A LOCAL start with the
+# version 2 scripts must give the same owners and modes for these entries.
+# The line marked "new" exists from setup version 2 on.
+
+# From the Rocker image (created together with the user rstudio): as before.
+/home/rstudio|d|1000:1000|750
+/home/rstudio/.bash_logout|f|1000:1000|644
+/home/rstudio/.bashrc|f|1000:1000|644
+/home/rstudio/.profile|f|1000:1000|644
+
+# Written by entrypoint.sh, then handed to rstudio: as before.
+/home/rstudio/.config|d|1000:1000|755
+/home/rstudio/.config/rstudio|d|1000:1000|755
+/home/rstudio/.config/rstudio/rstudio-prefs.json|f|1000:1000|644
+/home/rstudio/.rstudio|d|1000:1000|755
+/home/rstudio/.rstudio/monitored|d|1000:1000|755
+/home/rstudio/.rstudio/monitored/user-settings|d|1000:1000|755
+/home/rstudio/.rstudio/monitored/user-settings/user-settings|f|1000:1000|644
+/home/rstudio/.rstudio/projects_settings|d|1000:1000|755
+/home/rstudio/.rstudio/projects_settings/last-project-path|f|1000:1000|644
+/home/rstudio/.rstudio/projects_settings/project-settings|f|1000:1000|644
+
+# Written by git-identity.sh: the key copy and the git settings, as before.
+/home/rstudio/.ssh|d|1000:1000|700
+/home/rstudio/.ssh/id_ed25519_testuser|f|1000:1000|600
+/home/rstudio/.gitconfig|f|1000:1000|644
+
+# New in setup version 2: GitHub's host keys also in the user's own file, the one the
+# GUI names in its git settings. (Version 1 wrote them to /etc/ssh/ssh_known_hosts only.)
+/home/rstudio/.ssh/known_hosts|f|1000:1000|644

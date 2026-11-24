@@ -1,0 +1,155 @@
+# Base image with R and prerequisites
+FROM kalleef/prerequisite.impactncdger:latest
+# Maintainer information
+LABEL maintainer="(as in the model repository)"
+
+# Version of this docker_setup folder. The IMPACT Docker GUI reads this label to see
+# whether an image was built from the set-up it needs (IMPACT_UID, IMPACT_GID and the
+# ready marker exist from version 2 on). The same number stands in impact_model.json.
+LABEL impact.setup_version="2"
+
+# Build argument to control source method: "copy" or "git"
+ARG SOURCE_METHOD=copy
+ARG REPO_NAME=IMPACT-NCD-Germany_Base
+
+# Method 1: Copy from build context (only when using copy method)
+# Build context should be the parent directory that contains docker_setup: docker build -f Dockerfile.IMPACTncdGER -t impactncd_germany ..
+# Note: For git method, you can use an empty build context or the docker_setup directory to minimize copying
+RUN if [ "$SOURCE_METHOD" = "copy" ]; then \
+        echo "Copy method selected - will copy build context"; \
+    else \
+        echo "Git method selected - will clone from GitHub"; \
+    fi
+
+# Copy build context (unavoidable in Docker, but minimize impact for git method)
+# Build context should be the parent directory containing the entire project
+# The docker_build_push.sh script needs to be updated to use ".." as build context for copy method
+COPY . /tmp/build_context/
+
+# Set the repository name as an environment variable for subsequent steps
+RUN if [ "$SOURCE_METHOD" = "copy" ]; then \
+      DETECTED_REPO_NAME=$(basename "$(dirname "$(pwd)")") && \
+      FINAL_REPO_NAME="${REPO_NAME:-$DETECTED_REPO_NAME}"; \
+    else \
+      FINAL_REPO_NAME="${REPO_NAME:-IMPACT-NCD-Germany_Base}"; \
+    fi && \
+    echo "CONTAINER_REPO_NAME=$FINAL_REPO_NAME" >> /etc/environment && \
+    echo "Repository name set to: $FINAL_REPO_NAME"
+
+# Process the copied content only if using copy method
+RUN if [ "$SOURCE_METHOD" = "copy" ]; then \
+      echo "Using copy method - setting up from build context" && \
+      . /etc/environment && \
+      echo "Repository name: $CONTAINER_REPO_NAME" && \
+      mkdir -p /home/rstudio/$CONTAINER_REPO_NAME && \
+      cp -a /tmp/build_context/. /home/rstudio/$CONTAINER_REPO_NAME/ && \
+      echo "Local files moved successfully to /home/rstudio/$CONTAINER_REPO_NAME"; \
+    fi && \
+    rm -rf /tmp/build_context
+
+# Method 2: Clone from GitHub (when using git method)
+# This will be dynamically updated by GitHub Actions to clone the correct branch
+RUN if [ "$SOURCE_METHOD" = "git" ]; then \
+        echo "Using git method - cloning from GitHub" && \
+        . /etc/environment && \
+        echo "Repository name: $CONTAINER_REPO_NAME" && \
+        git clone https://github.com/IMPACT-NCD-Modeling-Germany/IMPACT-NCD-Germany_Base.git /home/rstudio/$CONTAINER_REPO_NAME && \
+        echo "Repository cloned successfully to /home/rstudio/$CONTAINER_REPO_NAME"; \
+    fi
+
+# Reconstruct large files from their chunks that are stored on GitHub
+RUN . /etc/environment && \
+    cd /home/rstudio/$CONTAINER_REPO_NAME && \
+    if [ -f "./simulation/large_files_indx.csv" ]; then \
+        tail -n +2 "./simulation/large_files_indx.csv" | while IFS=, read -r pths rest; do \
+            file=$(echo "$pths" | tr -d '"'); \
+            if [ ! -f "$file" ]; then \
+                if ls "${file}".chunk* 1> /dev/null 2>&1; then \
+                    cat "${file}".chunk* > "$file" && \
+                    rm "${file}".chunk*; \
+                fi; \
+            fi; \
+        done; \
+    fi
+
+# Make sure the directory and all files are owned by the rstudio user
+RUN . /etc/environment && chown -R rstudio:rstudio /home/rstudio/$CONTAINER_REPO_NAME
+RUN . /etc/environment && chmod -R 777 /home/rstudio/$CONTAINER_REPO_NAME
+
+# git-identity.sh will auto-run at container start (s6 cont-init.d hook)
+COPY /docker_setup/git-identity.sh /etc/cont-init.d/git-identity
+# normalize line endings + make executable
+RUN sed -i 's/\r$//' /etc/cont-init.d/git-identity \
+ && chmod +x /etc/cont-init.d/git-identity
+
+# impact-ready.sh writes the marker /run/impact-ready when all start-up scripts have ended.
+# The scripts in /etc/cont-init.d run in name order, and "zz-impact-ready" sorts last.
+COPY /docker_setup/impact-ready.sh /etc/cont-init.d/zz-impact-ready
+# normalize line endings + make executable
+RUN sed -i 's/\r$//' /etc/cont-init.d/zz-impact-ready \
+ && chmod +x /etc/cont-init.d/zz-impact-ready
+
+# Configure git to use SSH and behave like usual client
+RUN git config --system url."git@github.com:".insteadOf "https://github.com/" \
+    && git config --system pull.rebase true \
+    && git config --system rebase.autoStash true \
+    && git config --system pull.ff only
+
+# Add littler tools to PATH
+ENV PATH="/usr/local/lib/R/site-library/littler/bin:${PATH}"
+
+# Add littler examples to PATH
+ENV PATH="/usr/local/lib/R/site-library/littler/examples:${PATH}"
+
+# Create directories for outputs and synthpop/Not needed because we use the native folders from the repo
+#RUN mkdir -p /outputs
+#RUN mkdir -p /synthpop
+
+# Build R package - using original structure with dynamic repo name
+RUN . /etc/environment && \
+    cd /home/rstudio/$CONTAINER_REPO_NAME/Rpackage/IMPACTncd_Ger_model_pkg
+
+# Generate documentation using Roxygen 
+RUN . /etc/environment && \
+    cd /home/rstudio/$CONTAINER_REPO_NAME/Rpackage/IMPACTncd_Ger_model_pkg && \
+    (roxy.r || R -e "library(roxygen2); roxygenise()") 
+
+# Build the package
+RUN . /etc/environment && \
+    cd /home/rstudio/$CONTAINER_REPO_NAME/Rpackage/IMPACTncd_Ger_model_pkg && \
+    (build.r || R CMD build .) 
+
+# Dynamically construct the .tar.gz filename for the local R package from its DESCRIPTION file and install it 
+RUN . /etc/environment && \
+    cd /home/rstudio/$CONTAINER_REPO_NAME/Rpackage/IMPACTncd_Ger_model_pkg && \
+    PACKAGE=$(grep "^Package:" DESCRIPTION | awk '{print $2}') && \
+    VERSION=$(grep "^Version:" DESCRIPTION | awk '{print $2}') && \
+    TARBALL="${PACKAGE}_${VERSION}.tar.gz" && \
+    (install2.r "$TARBALL" || R CMD INSTALL "$TARBALL")
+
+# Note: Final working directory is set by entrypoint.sh using CONTAINER_REPO_NAME
+
+# entrypoint.sh is the first program of the container: it sets the user and group numbers
+# of rstudio (IMPACT_UID, IMPACT_GID), prepares the RStudio settings and starts /init
+COPY docker_setup/entrypoint.sh /usr/local/bin/entrypoint.sh
+# normalize line endings + make executable
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh \
+ && chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+#CMD ["/init"]
+
+# Build commands:
+# 
+# Using docker_build_push.sh script (recommended):
+# ./docker_build_push.sh Dockerfile.IMPACTncdJPN  # Uses copy method by default
+# ./docker_build_push.sh Dockerfile.IMPACTncdJPN --source-method git  # Uses git method
+# 
+# Manual build commands (run from docker_setup directory):
+# Copy method: docker build --no-cache -f Dockerfile.IMPACTncdJPN -t impactncd_japan ..
+# Git method: docker build --no-cache --build-arg SOURCE_METHOD=git -f Dockerfile.IMPACTncdJPN -t impactncd_japan ..
+#
+# Run commands:
+# docker run -it --name test impactncd_japan /bin/bash
+# docker run -it --name test chriskypri/impactncd_japan /bin/bash

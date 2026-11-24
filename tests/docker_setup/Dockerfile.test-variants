@@ -1,0 +1,25 @@
+# =============================================================================
+# Dockerfile.test-variants: two small additions to the test image
+# =============================================================================
+#
+# The test image itself is built from docker_setup/Dockerfile.IMPACTncdGER and holds
+# nothing that a model image does not hold. Two tests need a little more. Each addition
+# is a "stage" of this file (a part that starts with FROM ... AS name); run-tests.sh
+# builds one stage at a time with "docker build --target <name>".
+#
+#   clash   a second group and a second account with numbers a person could have, for
+#           the tests "group number already in use" and "user number already in use".
+#   probe   a start-up script that runs just before the ready marker script and notes
+#           whether the marker already exists, for the test of the start-up order.
+#
+# TEST_IMAGE is the test image; run-tests.sh passes its name.
+ARG TEST_IMAGE=impact-setup-test:local
+
+FROM ${TEST_IMAGE} AS clash
+RUN groupadd --gid 1234 imagegroup \
+ && useradd --uid 1777 --no-create-home --shell /usr/sbin/nologin otheraccount
+
+FROM ${TEST_IMAGE} AS probe
+# The name "zy-test-probe" sorts directly before "zz-impact-ready".
+COPY lib/probe-before-ready.sh /etc/cont-init.d/zy-test-probe
+RUN chmod +x /etc/cont-init.d/zy-test-probe
