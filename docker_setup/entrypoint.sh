@@ -423,7 +423,10 @@ write_settings_file() {
         return 0
     fi
     # "${file%/*}" is the path without its last part, which is the folder of the file.
-    mkdir -p "${file%/*}" && cat > "$file" || log "WARNING: $file could not be written."
+    # "{ a && b; }" groups two commands; "if !" runs the warning when either one fails.
+    if ! { mkdir -p "${file%/*}" && cat > "$file"; }; then
+        log "WARNING: $file could not be written."
+    fi
 }
 
 configure_rstudio() {
@@ -478,7 +481,7 @@ EOF
 EOF
         log "RStudio configured to open project: $rproj_name in $repo_path"
     else
-        log "No .Rproj file found in $repo_path - RStudio will start in repository directory"
+        log "No .Rproj file found in $repo_path. RStudio will start in the repository folder."
         # At least the working directory.
         write_settings_file "$RSTUDIO_HOME/.rstudio/monitored/user-settings/user-settings" << EOF
 {

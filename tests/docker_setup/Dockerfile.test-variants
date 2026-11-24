@@ -1,9 +1,9 @@
 # =============================================================================
-# Dockerfile.test-variants: two small additions to the test image
+# Dockerfile.test-variants: three small additions to the test image
 # =============================================================================
 #
 # The test image itself is built from docker_setup/Dockerfile.IMPACTncdGER and holds
-# nothing that a model image does not hold. Two tests need a little more. Each addition
+# nothing that a model image does not hold. Three tests need a little more. Each addition
 # is a "stage" of this file (a part that starts with FROM ... AS name); run-tests.sh
 # builds one stage at a time with "docker build --target <name>".
 #
@@ -11,6 +11,9 @@
 #           the tests "group number already in use" and "user number already in use".
 #   probe   a start-up script that runs just before the ready marker script and notes
 #           whether the marker already exists, for the test of the start-up order.
+#   failing a start-up script that fails on purpose, for the test "the marker appears
+#           although an earlier script failed" (the marker says that the scripts ended,
+#           and nothing about their success).
 #
 # TEST_IMAGE is the test image; run-tests.sh passes its name.
 ARG TEST_IMAGE=impact-setup-test:local
@@ -23,3 +26,9 @@ FROM ${TEST_IMAGE} AS probe
 # The name "zy-test-probe" sorts directly before "zz-impact-ready".
 COPY lib/probe-before-ready.sh /etc/cont-init.d/zy-test-probe
 RUN chmod +x /etc/cont-init.d/zy-test-probe
+
+FROM ${TEST_IMAGE} AS failing
+# "printf" writes the three lines of a tiny script; "\n" is a line break. The name
+# "zx-test-fails" sorts after git-identity and before zz-impact-ready.
+RUN printf '#!/bin/sh\necho "[test] this start-up script fails on purpose"\nexit 3\n' > /etc/cont-init.d/zx-test-fails \
+ && chmod +x /etc/cont-init.d/zx-test-fails

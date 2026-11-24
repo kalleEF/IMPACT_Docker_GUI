@@ -1,0 +1,65 @@
+# =============================================================================
+# .dockerignore: what stays out of the model image
+# =============================================================================
+#
+# WHERE THIS FILE BELONGS
+#   At the top of the model repository, next to the folder docker_setup, under the
+#   name ".dockerignore" (with the dot, without any extension).
+#
+# WHAT IT DOES
+#   "docker build" first sends a set of files to Docker: the "build context". The IMPACT
+#   Docker GUI and docker_build_push.* use the whole repository folder as build context,
+#   and Dockerfile.IMPACTncdGER copies all of it into the image. Every line below names
+#   files that Docker leaves out of that set, so they never reach the image.
+#   Without this file, model results, synthetic populations and the git history end up
+#   in the image, and each of them is stored there several times.
+#
+# WHY THIS IS SAFE
+#   The GUI mounts the repository folder into the container at every start, so inside
+#   a running container the files on disk are used and the copy in the image is hidden.
+#   The image needs the copy only while it is built: for the R package in Rpackage/,
+#   for the large files listed in simulation/large_files_indx.csv, and for the three
+#   start-up scripts in docker_setup/. This file excludes none of them.
+#
+# ASSUMPTIONS ABOUT THE REPOSITORY (check them when a model repository differs)
+#   1. The results folder is "outputs" and the synthetic populations are in
+#      "inputs/synthpop", both directly below the repository folder. These are the two
+#      places where the GUI mounts the folders named in sim_design.yaml.
+#   2. No file the image build needs lies inside these two folders: no part of the R
+#      package, and no file or chunk listed in simulation/large_files_indx.csv.
+#   3. The image build needs no file called .env, .Rhistory or .RData, and nothing in a
+#      folder called .Rproj.user.
+#
+# RULES OF THIS FILE FORMAT
+#   - A line that starts with "#" is a comment. A "#" later in a line is part of the
+#     pattern, so comments always stand on lines of their own.
+#   - A pattern is a path from the top of the repository, with "/" between folders,
+#     also on Windows. A pattern without a folder part matches only at the top.
+#   - "*" stands for any part of one name. "**/" at the start stands for "in any
+#     folder, at any depth, including the top".
+# =============================================================================
+
+# git's own folder: the full history of the repository. It can be larger than the
+# files themselves, and nothing in the image uses it (git works on the mounted folder).
+.git
+
+# Model results. "/*" leaves out everything inside the folder and keeps the empty
+# folder itself, so the image has an "outputs" folder as before, only without content.
+outputs/*
+
+# Synthetic populations (large files the model creates). Same rule as for outputs.
+inputs/synthpop/*
+
+# RStudio's state of the open project: open files, the history of the console and
+# similar. RStudio writes it while a person works in the repository.
+**/.Rproj.user
+
+# R's command history and saved workspace (R writes them when a session ends with
+# "save workspace"). A saved workspace can be several gigabytes.
+**/.Rhistory
+**/.RData
+
+# Files named .env hold private settings, for example the Docker Hub token in
+# docker_setup/.env that docker_build_push.* and the GUI read. Everyone who can use
+# an image can read every file in it, so such files must never be copied into one.
+**/.env

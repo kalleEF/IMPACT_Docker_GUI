@@ -1,24 +1,38 @@
 <#
-    Updated Features:
-    - Automatically sources environment variables from a `.env` file if it exists.
-    - Uses DOCKERHUB_USERNAME and DOCKERHUB_TOKEN from the environment or `.env`.
-    - If DOCKERHUB_USERNAME is missing, it prompts for it at runtime.
-    - Constructs the image name as: <image-name>:<image-tag>.
-    - If the image is pushed to dockerhub, it will be tagged as `<dockerhub-username>/<image-name>:<image-tag>`.
-    - Image name and tag can be specified via parameters `-ImageName` and `-ImageTag` with defaults `impactncd-japan-r-prerequisite` and `local`.
-    - Uses token-based login if available; otherwise prompts for manual login.
-    - Logs each step with timestamps and exits on failure.
+    docker_build_push.ps1: build one of the two images by hand, and push it if wanted
 
-    Updated Usage:
-    1. (Optional) Create a `.env` file in the same directory with the following variables:
-           export DOCKERHUB_USERNAME=yourusername
-           export DOCKERHUB_TOKEN=youraccesstoken
+    PURPOSE
+      Builds an image from one of the Dockerfiles in docker_setup and, with -Push,
+      uploads it to Docker Hub (the public image registry of Docker). The IMPACT Docker
+      GUI builds the model image by itself; this script is for the maintainer, mainly for
+      the prerequisite image (see docker_setup/README.md).
 
-    2. Run the script as follows:
-           .\docker_build_push.ps1 <dockerfile> [-ImageName <name>] [-ImageTag <tag>] [-Push]
+    WHEN IT RUNS
+      Only when a person starts it, in PowerShell, from the docker_setup folder (the
+      build context below is taken relative to the current folder):
+          cd docker_setup
+          .\docker_build_push.ps1 <dockerfile> [-ImageName <name>] [-ImageTag <tag>] [-Push]
+      Example:
+          .\docker_build_push.ps1 Dockerfile.prerequisite.IMPACTncdGER -ImageName prerequisite.impactncdger -ImageTag latest
 
-       Use the -Push switch to push the Docker image to Docker Hub. Without the switch, the script will only build the image.
-       Use -ImageName and -ImageTag to specify the Docker image name and tag.
+    WHAT IT CHANGES
+      - Builds the image <ImageName>:<ImageTag> on this computer, always from scratch
+        ("--no-cache"). The defaults are "impactncd-germany-r-prerequisite" and "local";
+        both are turned into small letters.
+      - Build context ("the files Docker may copy into the image"): the repository
+        folder ("..") for Dockerfile.IMPACTncdGER, the docker_setup folder (".") for any
+        other Dockerfile.
+      - With -Push only: signs in to Docker Hub and uploads the image as
+        <DOCKERHUB_USERNAME>/<ImageName>:<ImageTag>. DOCKERHUB_USERNAME and
+        DOCKERHUB_TOKEN come from the environment or from the file .env in the current
+        folder, for example:
+              export DOCKERHUB_USERNAME=yourusername
+              export DOCKERHUB_TOKEN=youraccesstoken
+        Without a token the script asks for the Docker Hub sign-in.
+
+    WHAT IT NEVER TOUCHES
+      Files of the repository, containers, and other images. Without -Push nothing
+      leaves this computer.
 #>
 param (
     [string]$Dockerfile,

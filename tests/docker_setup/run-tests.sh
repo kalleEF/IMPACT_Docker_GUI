@@ -78,6 +78,7 @@ IMG_PREREQ="${IMPACT_TEST_PREREQ_IMAGE:-impact-setup-test-prereq:local}"
 IMG="$PREFIX:local"
 IMG_CLASH="$PREFIX-clash:local"
 IMG_PROBE="$PREFIX-probe:local"
+IMG_FAILING="$PREFIX-failing:local"
 NETWORK="$PREFIX-net"
 
 # The stand-in repository and where things appear inside the container.
@@ -484,7 +485,7 @@ group_build() {
 
     # The two variants (see Dockerfile.test-variants).
     local target
-    for target in clash probe; do
+    for target in clash probe failing; do
         if docker build "${BUILD_OPTS[@]}" -f "$HERE/Dockerfile.test-variants" --target "$target" \
                 --build-arg "TEST_IMAGE=$IMG" -t "$PREFIX-$target:local" "$HERE" > "$WORK/build-$target.log" 2>&1; then
             ok "the image variant '$target' builds"
@@ -902,6 +903,41 @@ group_restart() {
 }
 
 # ---------------------------------------------------------------------------
+# Group "failing-script": what the marker means when a start-up script fails
+# ---------------------------------------------------------------------------
+# The variant image "failing" has one more start-up script, zx-test-fails, which ends
+# with the exit code 3. The init system of the base image goes on after a failed script
+# (its setting S6_BEHAVIOUR_IF_STAGE2_FAILS is 0), so the marker still appears. These
+# tests document that the marker means "all start-up scripts have ended" and says
+# nothing about their success: a program that waits for the marker must read the log
+# when it needs to know more.
+group_failing_script() {
+    make_fixture failing "$PERSON_UID" "$SHARED_GID"
+    set_mounts failing
+    remote_env "$PERSON_UID" "$SHARED_GID"
+    record failing before
+    start failing "$IMG_FAILING" "${ENV_OPTS[@]}" "${COMMON_OPTS[@]}" "${GUI_MOUNTS[@]}" "${STORAGE_MOUNT[@]}"
+    if wait_ready failing 90; then
+        ok "a failed start-up script: the marker appears all the same"
+        local log status
+        log="$(logs failing)"
+        expect_contains "a failed start-up script: the log shows its exit code" "$log" "[cont-init.d] zx-test-fails: exited 3."
+        expect_contains "a failed start-up script: the marker script still ran last" \
+            "$(grep -o '^\[cont-init.d\] [^:]*: executing' <<< "$log" | tail -n 1)" "zz-impact-ready: executing"
+        if status="$(wait_rstudio failing 60)"; then
+            ok "a failed start-up script: the container keeps running and RStudio answers ($status)"
+        else
+            bad "a failed start-up script: the container keeps running and RStudio answers" "last answer: $status"
+        fi
+    else
+        bad "a failed start-up script: the marker appears all the same" "$(logs failing | tail -n 20)"
+    fi
+    record failing after
+    expect_untouched "a failed start-up script: mounted trees unchanged" failing before after
+    finish_case failing failing
+}
+
+# ---------------------------------------------------------------------------
 # Group "readonly": every folder mounted read-only
 # ---------------------------------------------------------------------------
 group_readonly() {
@@ -1039,10 +1075,29 @@ group_symlink() {
 # Group "session": password, RStudio sign-in, R session, R library
 # ---------------------------------------------------------------------------
 
+# RStudio Server refuses every sign-in of a user that comes less than 5 seconds after
+# the previous sign-in of the same user, with the same answer as for a wrong password
+# (its setting "auth-sign-in-throttle-seconds", 5 by default; "rserver --help" lists it).
+# A refusal is therefore only a proof of a wrong password when the previous sign-in lies
+# at least that long back. signin_pause waits until 7 seconds have passed since the
+# previous sign-in of these tests ("date +%s" counts whole seconds, so 7 leaves a margin).
+# The time is kept in a file: the tests call signin inside "$(...)", which runs in a copy
+# of the shell ("subshell"), and a variable set there is lost when the copy ends.
+signin_pause() {
+    local last now
+    last="$(cat "$WORK/last-signin" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+    if (( now < last + 7 )); then
+        sleep $((last + 7 - now))
+    fi
+    date +%s > "$WORK/last-signin"
+}
+
 # signin SHORT PASSWORD: tries RStudio's real sign-in inside the container and prints
 # ACCEPTED, REFUSED or the client's error text. The password travels through standard
 # input ("docker exec -i"), never through a command line.
 signin() {
+    signin_pause
     printf '%s\n' "$2" | docker exec -i "$(cname "$1")" python3 /tmp/impact-test/rstudio_client.py signin http://127.0.0.1:8787 rstudio 2>&1 | tail -n 1
 }
 
@@ -1052,6 +1107,7 @@ run_in_session() {
     local name
     name="$(cname "$1")"
     printf '%s\n' "$3" | docker exec -i "$name" /bin/bash -c 'cat > /tmp/impact-test/code.R && chmod 644 /tmp/impact-test/code.R'
+    signin_pause
     printf '%s\n' "$2" | docker exec -i "$name" python3 /tmp/impact-test/rstudio_client.py run http://127.0.0.1:8787 rstudio /tmp/impact-test/code.R 2>&1
 }
 
@@ -1095,6 +1151,9 @@ group_session() {
     expect_equal "RStudio's sign-in refuses a wrong password" "REFUSED" "$(signin session "wrong-$new_password")"
     expect_equal "RStudio's sign-in refuses the start password after the change" "REFUSED" "$(signin session "$start_password")"
     expect_equal "RStudio's sign-in refuses an empty password" "REFUSED" "$(signin session "")"
+    # The control: the right password still gets through after the refusals, so the
+    # refusals above came from the password and from nothing else.
+    expect_equal "RStudio's sign-in accepts the new password again after the refused attempts" "ACCEPTED" "$(signin session "$new_password")"
     expect_lacks "the new password is not in 'docker inspect'" "$(docker inspect "$name")" "$new_password"
     expect_lacks "the new password is not in the container log" "$(docker logs "$name" 2>&1)" "$new_password"
     expect_lacks "the new password is not in the environment the R sessions get (Renviron.site)" \
@@ -1407,6 +1466,7 @@ group_local() {
     docker cp "$HERE/lib/rstudio_client.py" "$(cname localref):/tmp/impact-test/rstudio_client.py" > /dev/null
     expect_equal "LOCAL: RStudio's sign-in accepts the password given as PASSWORD" "ACCEPTED" "$(signin localref "$LOCAL_PASSWORD")"
     expect_equal "LOCAL: RStudio's sign-in refuses a wrong password" "REFUSED" "$(signin localref "not-$LOCAL_PASSWORD")"
+    expect_equal "LOCAL: RStudio's sign-in accepts the password again after the refused attempt" "ACCEPTED" "$(signin localref "$LOCAL_PASSWORD")"
     expect_equal "LOCAL: the working folder of the container is the repository" "$REPO_IN_CONTAINER" "$(in_container localref pwd)"
     finish_case localref localref
 }
@@ -1420,6 +1480,7 @@ GROUPS_LIST=(
     "rocker-env|group_rocker_env|what the Rocker start-up sees of USERID and GROUPID"
     "invalid|group_invalid|invalid values must end the container"
     "restart|group_restart|stop and start of the same container; order of the ready marker"
+    "failing-script|group_failing_script|the marker appears also when a start-up script failed"
     "readonly|group_readonly|all folders mounted read-only"
     "settings-mount|group_settings_mount|RStudio's settings folders are mounts themselves"
     "symlink|group_symlink|symbolic links in the home folder that point into a mount"

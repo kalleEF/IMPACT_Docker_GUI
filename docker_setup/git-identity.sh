@@ -310,10 +310,13 @@ if [[ -n "$KEY_SOURCE" && "$SSH_DIR_USABLE" == 1 ]]; then
         # created readable for their owner only, so the key is never readable for others.
         KEY_PATH="$key_target"
         # The public key, if it lies next to the private one. 644: everyone may read it.
+        # Git works without it, so a failure here is only noted in the log.
         if [[ -f "$KEY_SOURCE.pub" ]]; then
-            tr -d '\r' < "$KEY_SOURCE.pub" > "$key_target.pub" \
-                && chown "$RSTUDIO_UID:$RSTUDIO_GID" "$key_target.pub" \
-                && chmod 644 "$key_target.pub" || true
+            if ! { tr -d '\r' < "$KEY_SOURCE.pub" > "$key_target.pub" \
+                   && chown "$RSTUDIO_UID:$RSTUDIO_GID" "$key_target.pub" \
+                   && chmod 644 "$key_target.pub"; }; then
+                log "WARNING: could not copy the public key to $key_target.pub"
+            fi
         fi
     fi
     if [[ -n "$KEY_PATH" ]]; then

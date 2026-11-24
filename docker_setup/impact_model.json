@@ -1,0 +1,6 @@
+{
+  "setup_version": 2,
+  "short_name": "base",
+  "storage_name": "Base",
+  "rpackage_dir": "Rpackage"
+}

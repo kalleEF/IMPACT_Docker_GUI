@@ -1,27 +1,42 @@
 #!/bin/bash
-
-# This script automates building and pushing a Docker image to Docker Hub.
+# =============================================================================
+# docker_build_push.sh: build one of the two images by hand, and push it if wanted
+# =============================================================================
 #
-# Features:
-# - Automatically sources environment variables from a `.env` file if it exists.
-# - Uses DOCKERHUB_USERNAME and DOCKERHUB_TOKEN from the environment or `.env`.
-# - If DOCKERHUB_USERNAME is missing, it prompts for it at runtime.
-# - Constructs the image name as: <image-name>:<image-tag>.
-# - If the image then pushed to dockerhub, it will be tagged as <DOCKERHUB_USERNAME>/<image-name>:<image-tag>.
-# - Image name and tag can be specified via arguments `--image-name` and `--image-tag` with defaults `impactncd-japan-r-prerequisite` and `local`.
-# - Uses token-based login if available; otherwise prompts for manual login.
-# - Logs each step with timestamps and exits on failure.
+# PURPOSE
+#   Builds an image from one of the Dockerfiles in docker_setup and, with --push,
+#   uploads it to Docker Hub (the public image registry of Docker). The IMPACT Docker
+#   GUI builds the model image by itself; this script is for the maintainer, mainly for
+#   the prerequisite image (see docker_setup/README.md).
 #
-# Usage:
-# 1. (Optional) Create a `.env` file in the same directory:
-#       export DOCKERHUB_USERNAME=yourusername
-#       export DOCKERHUB_TOKEN=youraccesstoken
+# WHEN IT RUNS
+#   Only when a person starts it, from the docker_setup folder (the build context below
+#   is taken relative to the current folder):
+#       cd docker_setup
+#       bash bash/docker_build_push.sh [--image-name <name>] [--image-tag <tag>] <dockerfile> [--push]
+#   Examples:
+#       bash bash/docker_build_push.sh Dockerfile.prerequisite.IMPACTncdGER
+#       bash bash/docker_build_push.sh --image-name prerequisite.impactncdger --image-tag latest Dockerfile.prerequisite.IMPACTncdGER --push
 #
-# 2. Run the script:
-#       ./docker_build_push.sh [--image-name <name>] [--image-tag <tag>] <dockerfile> [--push]
+# WHAT IT CHANGES
+#   - Builds the image <image-name>:<image-tag> on this computer, always from scratch
+#     ("--no-cache"). Without --image-name the name is the Dockerfile name without the
+#     word "Dockerfile.", in small letters. The tag is "local" unless --image-tag is given.
+#   - Build context ("the files Docker may copy into the image"): the repository folder
+#     ("..") for Dockerfile.IMPACTncdGER, the docker_setup folder (".") for any other
+#     Dockerfile.
+#   - With --push only: signs in to Docker Hub and uploads the image as
+#     <DOCKERHUB_USERNAME>/<image-name>:<image-tag>. DOCKERHUB_USERNAME and
+#     DOCKERHUB_TOKEN come from the environment or from the file .env in the current
+#     folder, for example:
+#         export DOCKERHUB_USERNAME=yourusername
+#         export DOCKERHUB_TOKEN=youraccesstoken
+#     Without a token the script asks for the Docker Hub sign-in.
 #
-#    Use the '--push' flag to push the Docker image to Docker Hub. Without the flag, the script will only build the image.
-#    Use '--image-name' and '--image-tag' to specify the Docker image name and tag.
+# WHAT IT NEVER TOUCHES
+#   Files of the repository, containers, and other images. Without --push nothing leaves
+#   this computer.
+# =============================================================================
 
 set -euo pipefail
 
@@ -69,7 +84,7 @@ if ! docker info > /dev/null 2>&1; then
   echo "     sudo usermod -aG docker $USER"
   echo "     (You'll need to log out and back in for this change to take effect)"
   echo "  3. Or run this script using 'sudo':"
-  echo "     sudo ./setup_dev_docker_env.sh [options]"
+  echo "     sudo $0 [options] <dockerfile>"
   echo "---------------------------------------------------------------------"
   exit 1
 fi
@@ -131,11 +146,11 @@ fi
 
 # Build the Docker image
 log "Building Docker image..."
-# Use parent directory as build context for Dockerfile.IMPACTncdJPN to include entire project
+# Use parent directory as build context for Dockerfile.IMPACTncdGER to include entire project
 # Use current directory for other dockerfiles
-if [[ "$(basename "$DOCKERFILE")" == "Dockerfile.IMPACTncdJPN" ]]; then
+if [[ "$(basename "$DOCKERFILE")" == "Dockerfile.IMPACTncdGER" ]]; then
   BUILD_CONTEXT=".."
-  log "Using parent directory (..) as build context for Dockerfile.IMPACTncdJPN"
+  log "Using parent directory (..) as build context for Dockerfile.IMPACTncdGER"
 else
   BUILD_CONTEXT="."
   log "Using current directory (.) as build context for $(basename "$DOCKERFILE")"
