@@ -1,0 +1,62 @@
+# IMPACT Docker GUI: site settings of this workstation
+#
+# Read by the IMPACT workstation commands and by the GUI on each PC.
+#
+# Format: one KEY=value per line. The value is everything after the first
+# "=". Write it without quotes. A comment needs its own line and starts
+# with "#". The file is read as text and is never executed.
+#
+# Change a value with the setup command, for example:
+#   sudo impact-workstation-setup --min-free-gb 300
+# The command checks every value and updates the SSH rules when the port
+# range changes. After a change by hand, run "sudo impact-check".
+
+# Format version of this file. Always 1.
+IMPACT_CONF_VERSION=1
+
+# Oldest version of the GUI that may start containers on this workstation.
+# Three numbers with dots.
+MIN_GUI_VERSION=2.1.0
+
+# How new containers are published.
+#   tunnel: reachable only from the workstation itself; the GUI opens an
+#           SSH tunnel (an encrypted connection) from the PC.
+#   direct: reachable from the network, as in version 2.0.
+ACCESS_MODE=tunnel
+
+# Folder that holds the working copies of each person.
+# %h stands for the home folder of the person, %u for the account name.
+REPO_BASE=%h/Repositories
+
+# Folder with one subfolder per model (model.conf and extras),
+# written by the administrator, readable for the shared group.
+MODEL_DIR=/srv/impact/models
+
+# Linux group of all enrolled people. It owns the shared storage, and the
+# SSH rules apply to its members.
+SHARED_GROUP=impact
+
+# The storage roots: folders on the large disks that hold one folder per
+# model. Several roots are separated by commas, without spaces.
+SHARED_ROOTS=/mnt/disk_a/shared,/mnt/disk_b/shared
+
+# The GUI warns before a start when the chosen disk has less free space
+# than this many gigabytes.
+MIN_FREE_GB=200
+
+# First port of the range for containers on the workstation.
+PORT_MIN=8787
+
+# Last port of the range (at most 200 ports in the range).
+PORT_MAX=8830
+
+# Name patterns of containers outside the GUI that may publish ports to the
+# network, separated by commas. * stands for any text, ? for one character.
+# Example: data_preparation_*   Empty means: none.
+KNOWN_DIRECT_CONTAINERS=
+
+# Shown in messages that tell a colleague whom to contact.
+ADMIN_CONTACT=Alice Example (alice@example.org)
+
+# Optional second contact for the same messages. Empty means: none.
+DEPUTY_CONTACT=

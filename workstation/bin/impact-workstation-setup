@@ -1,0 +1,773 @@
+#!/bin/bash
+# =============================================================================
+# impact-workstation-setup: prepare the workstation for IMPACT Docker GUI 2.1
+#
+# Purpose
+#   Creates the shared group, the folders, the site settings file
+#   /etc/impact/impact.conf and the SSH rules for the group. Before it changes
+#   anything it checks the machine: Ubuntu version, tools, Docker, and the
+#   file system of the storage roots.
+#
+# Who runs it
+#   The administrator, with sudo, from the administration account. That
+#   account must be no member of the shared group.
+#
+# Usage
+#   sudo impact-workstation-setup [options]
+#
+# Examples
+#   First run, shown without changing anything:
+#     sudo impact-workstation-setup --dry-run \
+#          --shared-roots /mnt/disk_a/shared,/mnt/disk_b/shared \
+#          --admin-contact "Alice Example (alice@example.org)"
+#   The same for real: leave out --dry-run.
+#   Later: change one value; all other values stay as they are:
+#     sudo impact-workstation-setup --port-max 8850
+#   Remove the SSH rules again:
+#     sudo impact-workstation-setup --remove-ssh-rules
+#
+# Options for the settings file (first run: the two marked ones are required)
+#   --shared-roots <paths>      required at the first run. Storage roots,
+#                               separated by commas: /mnt/disk_a/shared
+#   --admin-contact <text>      required at the first run. Shown to colleagues
+#                               in messages that say whom to contact
+#   --deputy-contact <text>     second contact; "" removes it
+#   --access-mode <mode>        tunnel (default) or direct
+#   --repo-base <path>          default %h/Repositories (%h home folder,
+#                               %u account name)
+#   --model-dir <path>          default /srv/impact/models
+#   --shared-group <name>       default impact
+#   --min-free-gb <number>      default 200
+#   --port-min <port>           default 8787
+#   --port-max <port>           default 8830 (at most 200 ports)
+#   --known-direct-containers <patterns>   containers outside the GUI that may
+#                               publish ports to the network, for example
+#                               data_preparation_*
+#   --min-gui-version <x.y.z>   default 2.1.0
+# Other options
+#   --gid <number>              group number for a new shared group (1000 to
+#                               60000). Use it when a workstation is rebuilt,
+#                               so files on the storage keep their group.
+#   --dry-run                   print every step, change nothing
+#   --remove-ssh-rules          remove the SSH rules file and do nothing else
+#   --help                      show this text
+#
+# What it changes on the system
+#   the shared group (created when missing)
+#   /etc/impact (settings file, GitHub's host keys)
+#   /opt/impact/admin and its subfolders (root only)
+#   the model folder MODEL_DIR (owner root, group = shared group, mode 2750)
+#   a storage root that does not exist yet (created; an existing one is left
+#   as it is; one temporary folder is created and removed in each root to
+#   test access control lists)
+#   /etc/ssh/sshd_config.d/60-impact.conf and a reload of the SSH service.
+#   The SSH change is checked step by step; if a check fails, the previous
+#   rules file and the previous settings file are put back.
+#
+# How to undo
+#   SSH rules:      sudo impact-workstation-setup --remove-ssh-rules
+#   Settings file:  set the old value again with the same option, or remove
+#                   /etc/impact/impact.conf
+#   Group:          sudo groupdel <group>   (after its members were removed)
+#   The command prints the matching lines at its end.
+#
+# Exit codes
+#   0 done or nothing to do; 1 a check or a step failed; 2 wrong usage;
+#   3 the existing settings file is invalid; 4 the request conflicts with the
+#   current state.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Reading help: bash constructs that appear in this file
+#   NAME=text            store a text in the variable NAME; "$NAME" reads it
+#   local NAME           a variable that exists only inside one function
+#   "$1" "$2" "$@" "$#"  first parameter, second parameter, all parameters,
+#                        number of parameters
+#   "${NAME:-text}"      the value of NAME, or "text" when NAME is unset or empty
+#   $( command )         the text that the command prints
+#   [[ ... ]]            a test: -f plain file, -d folder, -L symbolic link,
+#                        -e exists, -r readable, -x executable, -z empty text,
+#                        -n text with content, == equal, != different,
+#                        =~ matches a pattern
+#   (( ... ))            arithmetic: true when the result is not zero
+#   A && B               run B only when A succeeded
+#   A || B               run B only when A failed
+#   ! command            true when the command fails
+#   if / case / for / while   branches and loops; "case" compares one value
+#                        with several patterns
+#   >file >>file <file   write to a file (replace it / add to its end), read
+#                        from a file
+#   2>/dev/null  >&2     throw error messages away / write to the error channel
+#   command1 | command2  hand the output of command1 to command2
+#   return N / exit N    end the function / the script with status N; 0 means
+#                        success
+#   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+# Constructs beyond these are explained where they are first used.
+# -----------------------------------------------------------------------------
+
+# "set -e" stops the script at the first command that fails, "-u" stops it
+# when a variable is read that was never set, and "-o pipefail" makes a chain
+# of commands joined with "|" fail when any part of it fails.
+set -euo pipefail
+
+# Find this file's real place (the name in /usr/local/bin is a link) and load
+# the shared functions that lie next to it in ../lib.
+IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# The two comment lines below tell the checking tool "shellcheck" where the
+# loaded file is.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-common.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-common.sh"
+impact_init "$IMPACT_SELF"
+
+impact_parse_args 'dry-run remove-ssh-rules' \
+    'shared-roots admin-contact deputy-contact access-mode repo-base model-dir shared-group min-free-gb port-min port-max known-direct-containers min-gui-version gid' \
+    '' "$@"
+impact_require_arg_count 0 0
+impact_require_root
+impact_log_enable "$@"
+# Two runs of this command at the same time would get in each other's way.
+impact_lock setup
+
+# Which option sets which key of the settings file. "declare -A" creates a
+# list whose entries are found by a name.
+declare -A OPTION_KEY=(
+    [shared-roots]=SHARED_ROOTS [admin-contact]=ADMIN_CONTACT [deputy-contact]=DEPUTY_CONTACT
+    [access-mode]=ACCESS_MODE [repo-base]=REPO_BASE [model-dir]=MODEL_DIR
+    [shared-group]=SHARED_GROUP [min-free-gb]=MIN_FREE_GB [port-min]=PORT_MIN
+    [port-max]=PORT_MAX [known-direct-containers]=KNOWN_DIRECT_CONTAINERS
+    [min-gui-version]=MIN_GUI_VERSION
+)
+
+SETTINGS_PENDING=0     # 1 while a new settings file waits for the SSH step
+SETTINGS_BACKUP=''     # copy of the previous settings file ('' = there was none)
+SETTINGS_TEXT=''       # the step text of the settings file, for the summary
+declare -A OLD=()      # the values of the existing settings file
+declare -A NEW=()      # the values this run will write
+FIRST_RUN=0            # 1 when no settings file exists yet
+GROUP=''               # NEW[SHARED_GROUP], for short
+ROOTS=()               # the storage roots of NEW[SHARED_ROOTS]
+GROUP_EXISTS=0         # 1 when the shared group already exists
+
+# -----------------------------------------------------------------------------
+# Functions
+# -----------------------------------------------------------------------------
+
+# read_settings_and_options
+#   Fills OLD from the existing settings file and NEW from OLD (or from the
+#   defaults at the first run) plus the options of this run. Stops on any
+#   invalid value, before anything is changed.
+read_settings_and_options() {
+    local option key text
+    if [[ -e "$IMPACT_CONF_FILE" || -L "$IMPACT_CONF_FILE" ]]; then
+        if ! impact_conf_load; then
+            for text in "${IMPACT_CONF_ERRORS[@]}"; do
+                impact_error "$text"
+            done
+            impact_die "$IMPACT_EXIT_NOT_PREPARED" "The existing settings file $IMPACT_CONF_FILE is invalid, so its values cannot be kept." \
+                "Correct the lines named above with an editor (sudo nano $IMPACT_CONF_FILE), then run the command again."
+        fi
+        for text in "${IMPACT_CONF_WARNINGS[@]}"; do
+            impact_warn "$IMPACT_CONF_FILE: $text"
+        done
+        for key in "${IMPACT_CONF_KEYS[@]}"; do
+            OLD[$key]="${IMPACT_CONF[$key]}"
+            NEW[$key]="${IMPACT_CONF[$key]}"
+        done
+        impact_ok "The settings file $IMPACT_CONF_FILE exists and is valid. Values without an option stay as they are."
+    else
+        FIRST_RUN=1
+        for key in "${IMPACT_CONF_KEYS[@]}"; do
+            NEW[$key]="$(impact_conf_default "$key")"
+        done
+        impact_info "There is no settings file yet: this is the first run."
+        if ! impact_opt_given shared-roots || ! impact_opt_given admin-contact; then
+            impact_die_usage "The first run needs --shared-roots <paths> and --admin-contact <text>."
+        fi
+    fi
+
+    # "${!OPTION_KEY[@]}" lists the names (the keys) of the associative array.
+    for option in "${!OPTION_KEY[@]}"; do
+        key="${OPTION_KEY[$option]}"
+        if impact_opt_given "$option"; then
+            NEW[$key]="$(impact_opt "$option")"
+            if ! impact_conf_check_value "$key" "${NEW[$key]}"; then
+                impact_die_usage "The value '$(impact_display "${NEW[$key]}")' of --$option is not accepted: $IMPACT_CHECK_REASON."
+            fi
+        fi
+    done
+    if ! impact_conf_validate NEW; then
+        for text in "${IMPACT_CONF_ERRORS[@]}"; do
+            impact_error "$text"
+        done
+        impact_die_usage "The settings would be invalid. Nothing was changed."
+    fi
+    if impact_opt_given gid && ! impact_valid_user_number "$(impact_opt gid)"; then
+        impact_die_usage "The value '$(impact_display "$(impact_opt gid)")' of --gid is not accepted: expected a whole number from 1000 to 60000."
+    fi
+    GROUP="${NEW[SHARED_GROUP]}"
+    impact_split_list "${NEW[SHARED_ROOTS]}" ROOTS
+}
+
+# check_input_rules
+#   Rules for what this command writes that go beyond the format of the
+#   settings file. Stops with exit code 2 on a violation.
+check_input_rules() {
+    local root other folder
+    if [[ "${NEW[REPO_BASE]}" != *%h* && "${NEW[REPO_BASE]}" != *%u* ]]; then
+        impact_die_usage "REPO_BASE '${NEW[REPO_BASE]}' contains neither %h nor %u, so all people would share one folder. Example: %h/Repositories"
+    fi
+    for root in "${ROOTS[@]}"; do
+        for other in "${ROOTS[@]}"; do
+            if [[ "$root" != "$other" ]] && impact_path_is_below "$root" "$other"; then
+                impact_die_usage "The storage root $root lies inside the storage root $other. Give separate folders."
+            fi
+        done
+        # Count how often this root appears in the list.
+        local count=0
+        for other in "${ROOTS[@]}"; do
+            if [[ "$root" == "$other" ]]; then
+                count=$((count + 1))
+            fi
+        done
+        if ((count > 1)); then
+            impact_die_usage "The storage root $root is listed twice."
+        fi
+        if impact_is_system_path "$root" || impact_is_home_path "$root"; then
+            impact_die_usage "The storage root $root is a system folder or a home folder. Give a folder on a storage disk, for example /mnt/disk_a/shared."
+        fi
+        if impact_path_is_below "${NEW[MODEL_DIR]}" "$root" || [[ "${NEW[MODEL_DIR]}" == "$root" ]]; then
+            impact_die_usage "MODEL_DIR ${NEW[MODEL_DIR]} lies inside the storage root $root. The model folder is written by the administrator only and belongs outside the shared storage."
+        fi
+    done
+    if impact_is_home_path "${NEW[MODEL_DIR]}"; then
+        impact_die_usage "MODEL_DIR ${NEW[MODEL_DIR]} lies inside a home folder. Give a folder such as /srv/impact/models."
+    fi
+    for folder in /bin /boot /dev /etc /lib /lib32 /lib64 /libx32 /proc /root /run /sbin /sys /tmp /usr "$IMPACT_INSTALL_DIR"; do
+        if [[ "${NEW[MODEL_DIR]}" == "$folder" ]] || impact_path_is_below "${NEW[MODEL_DIR]}" "$folder"; then
+            impact_die_usage "MODEL_DIR ${NEW[MODEL_DIR]} lies inside the system folder $folder. Give a folder such as /srv/impact/models."
+        fi
+    done
+    # A path with one part only, such as /srv, is a top folder of the system.
+    if [[ "${NEW[MODEL_DIR]#/}" != */* ]]; then
+        impact_die_usage "MODEL_DIR ${NEW[MODEL_DIR]} is a top folder of the system. Give a folder such as /srv/impact/models."
+    fi
+}
+
+# check_conflicts_with_current_state
+#   On a later run: refuses changes that would cut existing people or models
+#   off. Stops with exit code 4.
+check_conflicts_with_current_state() {
+    local members model_file root key
+    local -A parsed=()
+    # shellcheck disable=SC2034
+    # Reason for SC2034 (variable appears unused): impact_kv_parse fills
+    # "order" and "errors" through their names.
+    local -a order=() errors=() model_roots=()
+    ((FIRST_RUN == 0)) || return 0
+    if [[ "${OLD[SHARED_GROUP]}" != "${NEW[SHARED_GROUP]}" ]] && impact_group_exists "${OLD[SHARED_GROUP]}"; then
+        members="$(impact_group_members "${OLD[SHARED_GROUP]}" | tr '\n' ' ')"
+        if [[ -n "${members// /}" ]]; then
+            impact_die "$IMPACT_EXIT_CONFLICT" "The shared group cannot change from '${OLD[SHARED_GROUP]}' to '${NEW[SHARED_GROUP]}' while the old group has members: $members" \
+                "The SSH rules and the storage rights are tied to the group. Keep the group name, or remove the members first."
+        fi
+    fi
+    if [[ "${OLD[MODEL_DIR]}" != "${NEW[MODEL_DIR]}" && -d "${OLD[MODEL_DIR]}" ]] &&
+        [[ -n "$(find "${OLD[MODEL_DIR]}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+        impact_die "$IMPACT_EXIT_CONFLICT" "MODEL_DIR cannot change from ${OLD[MODEL_DIR]} to ${NEW[MODEL_DIR]} while the old folder holds models." \
+            "Move the model folders first (sudo mv ${OLD[MODEL_DIR]}/<model> ${NEW[MODEL_DIR]}/), or keep MODEL_DIR."
+    fi
+    # A storage root that a model uses must stay in the list.
+    if [[ -d "${OLD[MODEL_DIR]}" ]]; then
+        # "nullglob": a pattern without any match expands to nothing.
+        shopt -s nullglob
+        for model_file in "${OLD[MODEL_DIR]}"/*/model.conf; do
+            if impact_kv_parse "$model_file" parsed order errors && [[ -v parsed[STORAGE_ROOTS] ]]; then
+                impact_split_list "${parsed[STORAGE_ROOTS]}" model_roots
+                for root in "${model_roots[@]}"; do
+                    if ! impact_in_list "$root" "${ROOTS[@]}"; then
+                        shopt -u nullglob
+                        impact_die "$IMPACT_EXIT_CONFLICT" "The storage root $root is used by $model_file and would no longer be listed in SHARED_ROOTS." \
+                            "Keep the root in --shared-roots, or change the model first."
+                    fi
+                done
+            fi
+        done
+        shopt -u nullglob
+    fi
+    if [[ "${OLD[REPO_BASE]}" != "${NEW[REPO_BASE]}" ]] && impact_group_exists "${OLD[SHARED_GROUP]}" &&
+        [[ -n "$(impact_group_members "${OLD[SHARED_GROUP]}")" ]]; then
+        impact_warn "REPO_BASE changes from ${OLD[REPO_BASE]} to ${NEW[REPO_BASE]}. Existing working copies stay where they are; the GUI will look in the new place. Move them or hand them out again."
+    fi
+    for key in "${IMPACT_CONF_KEYS[@]}"; do
+        if [[ "${OLD[$key]}" != "${NEW[$key]}" ]]; then
+            impact_info "$key changes from '${OLD[$key]}' to '${NEW[$key]}'."
+        fi
+    done
+}
+
+# check_ubuntu
+#   Reads /etc/os-release as text. Stops on a system that is no Ubuntu or is
+#   older than 22.04; warns for versions that were not tested.
+check_ubuntu() {
+    local line id='' version=''
+    if [[ -r /etc/os-release ]]; then
+        while IFS= read -r line; do
+            case "$line" in
+                ID=*) id="${line#ID=}" ;;
+                VERSION_ID=*) version="${line#VERSION_ID=}" ;;
+                *) ;;
+            esac
+        done </etc/os-release
+    fi
+    id="${id//\"/}"            # remove the quotes around the values
+    version="${version//\"/}"
+    if [[ "$id" != 'ubuntu' ]]; then
+        impact_die "$IMPACT_EXIT_FAILED" "This system is '$(impact_display "${id:-unknown}")'. The commands are written for Ubuntu 22.04 and 24.04." \
+            "Run them on the Ubuntu workstation."
+    fi
+    if [[ "$version" == '22.04' || "$version" == '24.04' ]]; then
+        impact_ok "Ubuntu $version."
+    elif impact_version_ge "$version" 22.04; then
+        impact_warn "Ubuntu $version: the commands were written for 22.04 and 24.04. Read the output of each step with care."
+    else
+        impact_die "$IMPACT_EXIT_FAILED" "Ubuntu $(impact_display "$version") is older than 22.04." "Upgrade the system first."
+    fi
+}
+
+# check_docker
+#   Docker must be installed (the snap package is refused), and for
+#   ACCESS_MODE=tunnel its version must be at least 28.3.3. Warnings for a
+#   daemon that does not answer or does not start with the machine.
+check_docker() {
+    local origin engine='' server='' boot mode="${NEW[ACCESS_MODE]}"
+    origin="$(impact_docker_install_source)"
+    case "$origin" in
+        none)
+            impact_install_hint docker
+            impact_die "$IMPACT_EXIT_FAILED" "Docker Engine is not installed." \
+                "Install the package docker-ce from Docker's own apt source, then run the command again."
+            ;;
+        snap)
+            impact_die "$IMPACT_EXIT_FAILED" "FAIL: Docker is installed as a snap package. That variant runs in a closed environment and cannot use all folders of the machine, for example the storage disks." \
+                "Remove it (sudo snap remove docker) and install the package docker-ce from Docker's own apt source: https://docs.docker.com/engine/install/ubuntu/"
+            ;;
+        docker-ce)
+            impact_ok "Docker comes from Docker's own apt source (package docker-ce)."
+            ;;
+        *)
+            impact_warn "Docker does not come from the package docker-ce (found: $origin). The commands were written for docker-ce from Docker's own apt source."
+            ;;
+    esac
+    if [[ "$origin" != 'snap' ]] && impact_docker_snap_present; then
+        impact_warn "The snap package of Docker is installed in addition. Remove it to avoid confusion: sudo snap remove docker"
+    fi
+
+    engine="$(impact_docker_engine_version)" || engine=''
+    server="$(impact_docker_server_version)" || server=''
+    if [[ -z "$engine" && -z "$server" ]]; then
+        if [[ "$mode" == 'tunnel' ]]; then
+            impact_die "$IMPACT_EXIT_FAILED" "The version of Docker Engine cannot be read (neither 'dockerd --version' nor the running daemon answered). ACCESS_MODE=tunnel needs version $IMPACT_DOCKER_MIN_VERSION or newer." \
+                "Check the Docker installation: sudo systemctl status docker"
+        fi
+        impact_warn "The version of Docker Engine cannot be read."
+    fi
+    local version
+    for version in "$engine" "$server"; do
+        [[ -n "$version" ]] || continue
+        if impact_version_ge "$version" "$IMPACT_DOCKER_MIN_VERSION"; then
+            continue
+        fi
+        if [[ "$mode" == 'tunnel' ]]; then
+            impact_die "$IMPACT_EXIT_FAILED" "Docker Engine $version is older than $IMPACT_DOCKER_MIN_VERSION. Older versions can let neighbouring computers reach ports that are published on 127.0.0.1, so ACCESS_MODE=tunnel is refused." \
+                "Update Docker (sudo apt-get update && sudo apt-get install docker-ce docker-ce-cli containerd.io). If the packages are new already, restart the daemon at a quiet moment: sudo systemctl restart docker"
+        fi
+        impact_warn "Docker Engine $version is older than $IMPACT_DOCKER_MIN_VERSION. This matters as soon as ACCESS_MODE is set to tunnel."
+    done
+    if [[ -n "$engine" ]]; then
+        impact_ok "Docker Engine $engine is installed (needed for tunnel: $IMPACT_DOCKER_MIN_VERSION or newer)."
+    fi
+    if [[ -n "$server" ]]; then
+        impact_ok "The Docker daemon answers (version $server)."
+    else
+        impact_warn "The Docker daemon does not answer. Start it with: sudo systemctl start docker"
+    fi
+    boot="$(impact_docker_boot_state)"
+    case "$boot" in
+        enabled) impact_ok "Docker starts with the machine." ;;
+        socket) impact_warn "Docker starts at its first use only (docker.socket). Enable the service so it starts with the machine: sudo systemctl enable docker" ;;
+        disabled) impact_warn "Docker does not start with the machine. Enable it: sudo systemctl enable docker" ;;
+        *) impact_warn "Whether Docker starts with the machine cannot be told here, because systemd does not run." ;;
+    esac
+    if ! impact_group_exists docker; then
+        impact_warn "The group 'docker' does not exist. impact-add-user needs it; the package docker-ce creates it."
+    fi
+}
+
+# check_storage_roots
+#   Every storage root must lie on ext4, xfs or btrfs, mounted without the
+#   option "noacl". A root that does not exist yet needs an existing parent
+#   folder.
+check_storage_roots() {
+    local root type options parent real
+    for root in "${ROOTS[@]}"; do
+        if [[ -L "$root" || -e "$root" ]]; then
+            real="$(realpath -e -- "$root" 2>/dev/null)" || real=''
+            if [[ -z "$real" || ! -d "$real" ]]; then
+                impact_die "$IMPACT_EXIT_FAILED" "The storage root $root exists and is no folder." "Give the path of a folder."
+            fi
+            if [[ "$real" != "$root" ]]; then
+                impact_warn "The storage root $root is a symbolic link or contains one; its real place is $real. The commands work with the real place."
+                if impact_is_system_path "$real" || impact_is_home_path "$real"; then
+                    impact_die "$IMPACT_EXIT_FAILED" "The real place $real of the storage root $root is a system folder or a home folder." "Give a folder on a storage disk."
+                fi
+            fi
+        else
+            parent="$(dirname -- "$root")"
+            if [[ ! -d "$parent" ]]; then
+                impact_die "$IMPACT_EXIT_FAILED" "The storage root $root does not exist, and its parent folder $parent does not exist either." \
+                    "If a storage disk belongs there, mount it first. Otherwise create the parent folder: sudo mkdir -p $parent"
+            fi
+            impact_info "The storage root $root does not exist yet; it will be created."
+            if [[ "$(findmnt -n -o TARGET -T "$parent" 2>/dev/null | head -n 1)" == '/' ]]; then
+                impact_warn "$root lies on the system disk. If a storage disk belongs there, stop now (Ctrl+C) and mount it first."
+            fi
+        fi
+        type="$(impact_fs_type "$root")"
+        if ! impact_fs_type_supported "$type"; then
+            impact_die "$IMPACT_EXIT_FAILED" "The storage root $root lies on a file system of the type '${type:-unknown}'. The shared storage needs ext4, xfs or btrfs, because only a Linux file system keeps owners, groups and access control lists." \
+                "Use a disk with one of these file systems."
+        fi
+        options="$(impact_fs_mount_options "$root")"
+        # Commas around both texts make "noacl" match as a whole word.
+        if [[ ",$options," == *,noacl,* ]]; then
+            impact_die "$IMPACT_EXIT_FAILED" "The file system of $root is mounted with the option noacl, so it refuses access control lists." \
+                "Remove noacl from its line in /etc/fstab and mount it again."
+        fi
+        impact_ok "Storage root $root: file system $type."
+    done
+}
+
+# check_group
+#   The shared group may exist already. It must then have a number of 1000
+#   or more, must not be the personal group of an account, and must match
+#   --gid when that option is given. Stops with exit code 4 otherwise.
+check_group() {
+    local gid wanted=''
+    if impact_opt_given gid; then
+        wanted="$(impact_opt gid)"
+    fi
+    if impact_group_exists "$GROUP"; then
+        GROUP_EXISTS=1
+        gid="$(impact_group_gid "$GROUP")"
+        if ((gid < 1000)); then
+            impact_die "$IMPACT_EXIT_CONFLICT" "The group '$GROUP' exists with the number $gid. Numbers below 1000 belong to the system; a system group is never used as the shared group." \
+                "Choose another name with --shared-group."
+        fi
+        if impact_account_exists "$GROUP"; then
+            impact_die "$IMPACT_EXIT_CONFLICT" "'$GROUP' is also the name of an account, so the group is that account's personal group." \
+                "Choose another name with --shared-group."
+        fi
+        if [[ -n "$wanted" && "$wanted" != "$gid" ]]; then
+            impact_die "$IMPACT_EXIT_CONFLICT" "The group '$GROUP' exists with the number $gid; --gid asks for $wanted." \
+                "Leave out --gid to keep the existing group."
+        fi
+        impact_ok "The group '$GROUP' exists (number $gid)."
+    else
+        GROUP_EXISTS=0
+        if impact_account_exists "$GROUP"; then
+            impact_die "$IMPACT_EXIT_CONFLICT" "'$GROUP' is the name of an existing account." "Choose another name with --shared-group."
+        fi
+        if [[ -n "$wanted" ]] && ! impact_gid_is_free "$wanted"; then
+            impact_die "$IMPACT_EXIT_CONFLICT" "The group number $wanted is in use by the group '$(impact_group_by_gid "$wanted")'." \
+                "Choose another number with --gid, or leave the option out."
+        fi
+        impact_info "The group '$GROUP' does not exist yet; it will be created."
+    fi
+}
+
+# check_ssh_before
+#   Read-only checks for the SSH step, done before anything is changed: the
+#   rules folder is read by sshd, the current SSH configuration is free of
+#   errors, and the account that runs this command is no member of the
+#   shared group (the rules would restrict its own login).
+check_ssh_before() {
+    local invoker
+    if ! impact_ssh_include_ok; then
+        impact_die "$IMPACT_EXIT_FAILED" "$IMPACT_SSHD_CONFIG does not read the folder $IMPACT_SSH_RULES_DIR, so the SSH rules would have no effect." \
+            "Add this line near the top of $IMPACT_SSHD_CONFIG, above any line that starts with Match, then run the command again:  Include $IMPACT_SSH_RULES_DIR/*.conf"
+    fi
+    impact_ok "$IMPACT_SSHD_CONFIG reads the files in $IMPACT_SSH_RULES_DIR."
+    if ! impact_ssh_rules_path_usable; then
+        impact_die "$IMPACT_EXIT_CONFLICT" "$IMPACT_SSH_RULES_FILE exists and is no plain file (a symbolic link or a folder)." \
+            "Look at it (ls -l $IMPACT_SSH_RULES_FILE) and move it away, then run the command again."
+    fi
+    # sshd -t needs the folder /run/sshd. Where it is missing, the SSH step
+    # creates it and runs this test itself.
+    if impact_ssh_runtime_dir_ready; then
+        if ! impact_ssh_config_test; then
+            impact_error "sshd reports an error in the current SSH configuration:"
+            printf '%s\n' "$IMPACT_SSH_OUTPUT" >&2
+            impact_die "$IMPACT_EXIT_FAILED" "The SSH configuration has an error before this command changed anything. Nothing was changed." \
+                "Correct the file that sshd names above. If it is $IMPACT_SSH_RULES_FILE, remove it with: sudo impact-workstation-setup --remove-ssh-rules"
+        fi
+        impact_ok "sshd -t: the current SSH configuration is free of errors."
+    fi
+    invoker="$(impact_invoking_account)"
+    if ((GROUP_EXISTS == 1)) && impact_account_in_group "$invoker" "$GROUP"; then
+        impact_die "$IMPACT_EXIT_FAILED" "The account '$invoker' that runs this command is a member of the group '$GROUP'. The SSH rules would restrict its own login (key only, no password)." \
+            "Run the command from the administration account, which is no member of '$GROUP'."
+    fi
+    impact_ok "The account '$invoker' that runs this command is no member of '$GROUP'."
+}
+
+# create_group
+#   Creates the shared group, with the number of --gid when given.
+create_group() {
+    if impact_opt_given gid; then
+        groupadd --gid "$(impact_opt gid)" -- "$GROUP"
+    else
+        # Without a number, groupadd takes the next free one from 1000 on.
+        groupadd -- "$GROUP"
+    fi
+}
+
+# ensure_dir PATH MODE OWNER GROUP TEXT
+#   Creates one folder, corrects owner, group and mode of an existing one, or
+#   says that it is in order. The folder's content is never touched.
+ensure_dir() {
+    if impact_dir_is "$1" "$2" "$3" "$4"; then
+        impact_ok "$1 is in order."
+    elif [[ -d "$1" && ! -L "$1" ]]; then
+        impact_do "Correct the folder $1 ($5) to owner $3, group $4, mode $2" impact_make_dir "$1" "$2" "$3" "$4"
+    else
+        impact_do "Create the folder $1 ($5; owner $3, group $4, mode $2)" impact_make_dir "$1" "$2" "$3" "$4"
+    fi
+}
+
+# member_can_enter FOLDER
+#   Result: success when a member of the shared group can enter and list
+#   FOLDER: through the group rights when the folder belongs to the group,
+#   or through the rights of all others.
+member_can_enter() {
+    local facts mode group_name
+    facts="$(stat -c '%a %G' -- "$1" 2>/dev/null)" || return 1
+    mode="${facts%% *}"
+    group_name="${facts##* }"
+    # 8#005 is "read and enter for others", 8#050 the same for the group.
+    if (((8#$mode & 8#005) == 8#005)); then
+        return 0
+    fi
+    [[ "$group_name" == "$GROUP" ]] && (((8#$mode & 8#050) == 8#050))
+}
+
+# setup_storage_roots
+#   Creates a missing storage root. Leaves an existing one as it is and warns
+#   when members cannot enter it. A root that is new in the settings is
+#   tested by a real write: does it accept access control lists?
+setup_storage_roots() {
+    local root
+    local -a known_roots=()
+    impact_split_list "${OLD[SHARED_ROOTS]:-}" known_roots
+    for root in "${ROOTS[@]}"; do
+        if [[ -d "$root" ]]; then
+            if ((GROUP_EXISTS == 1 || IMPACT_DRY_RUN == 0)) && ! member_can_enter "$root"; then
+                impact_warn "Members of '$GROUP' cannot enter $root (see: ls -ld $root). To allow it: sudo chgrp $GROUP $root && sudo chmod g+rx $root"
+            else
+                impact_ok "The storage root $root exists. It is left as it is."
+            fi
+        else
+            impact_do "Create the storage root $root (owner root, group $GROUP, mode 2750: members may enter and list)" \
+                impact_make_dir "$root" 2750 root "$GROUP"
+            impact_undo "Remove the storage root while it is empty: sudo rmdir $root"
+        fi
+        if impact_in_list "$root" "${known_roots[@]}" && [[ -d "$root" ]]; then
+            # The write test ran when this root was added to the settings.
+            continue
+        fi
+        impact_do --transient "Test that $root accepts access control lists (one temporary folder is created and removed)" \
+            impact_acl_probe "$root" ||
+            impact_die "$IMPACT_EXIT_FAILED" "The storage root $root does not accept access control lists." \
+                "Check the mount options of its file system (findmnt -T $root)."
+    done
+}
+
+# write_settings
+#   Writes the settings file. The settings file and the SSH rules must agree
+#   (the rules are built from the port range), so the previous file is kept
+#   aside until the SSH step has succeeded; see restore_settings_if_unconfirmed.
+write_settings() {
+    SETTINGS_BACKUP=''
+    if [[ -f "$IMPACT_CONF_FILE" ]]; then
+        impact_mktemp_file || return 1
+        SETTINGS_BACKUP="$IMPACT_TMP"
+        cp -p -- "$IMPACT_CONF_FILE" "$SETTINGS_BACKUP" || return 1
+    fi
+    SETTINGS_PENDING=1
+    impact_conf_write "$IMPACT_CONF_FILE" NEW
+}
+
+# restore_settings_if_unconfirmed EXIT_CODE
+#   Runs when the command ends. When the settings file was written and the
+#   command then stopped before the SSH rules were in place, the previous
+#   settings file is put back (or the new one removed at a first run), so the
+#   settings and the SSH rules never disagree.
+restore_settings_if_unconfirmed() {
+    local text
+    local -a kept=()
+    ((SETTINGS_PENDING == 1)) || return 0
+    SETTINGS_PENDING=0
+    {
+        printf '\nPutting the previous settings back, because the run did not finish:\n'
+        if [[ -n "$SETTINGS_BACKUP" ]]; then
+            if impact_write_file_atomic "$IMPACT_CONF_FILE" 644 root root <"$SETTINGS_BACKUP"; then
+                printf '  The previous file %s is back in place.\n' "$IMPACT_CONF_FILE"
+            else
+                printf '  FAILED to put the previous settings file back. Look at %s now.\n' "$IMPACT_CONF_FILE"
+            fi
+        elif rm -f -- "$IMPACT_CONF_FILE"; then
+            printf '  The new file %s was removed (there was none before).\n' "$IMPACT_CONF_FILE"
+        else
+            printf '  FAILED to remove %s. Remove it by hand now.\n' "$IMPACT_CONF_FILE"
+        fi
+    } >&2
+    # Take the settings step and its undo hints out of the lists for the
+    # final report: they are no longer true.
+    for text in "${IMPACT_CHANGES[@]}"; do
+        if [[ "$text" != "$SETTINGS_TEXT" ]]; then
+            kept+=("$text")
+        fi
+    done
+    IMPACT_CHANGES=("${kept[@]}")
+    kept=()
+    for text in "${IMPACT_UNDO[@]}"; do
+        if [[ "$text" != *"$IMPACT_CONF_FILE"* && "$text" != 'Set '*' back to its previous value '* ]]; then
+            kept+=("$text")
+        fi
+    done
+    IMPACT_UNDO=("${kept[@]}")
+}
+
+# install_known_hosts
+#   Copies GitHub's host keys from the delivered file to /etc/impact.
+install_known_hosts() {
+    impact_write_file_atomic "$IMPACT_KNOWN_HOSTS_FILE" 644 root root <"$IMPACT_BASE_DIR/etc/github_known_hosts"
+}
+
+# -----------------------------------------------------------------------------
+# --remove-ssh-rules: its own short run
+# -----------------------------------------------------------------------------
+if impact_opt_given remove-ssh-rules; then
+    for option in "${!OPTION_KEY[@]}" gid; do
+        if impact_opt_given "$option"; then
+            impact_die_usage "--remove-ssh-rules stands alone (with --dry-run if wanted); --$option cannot be combined with it."
+        fi
+    done
+    impact_step "Checks"
+    impact_require_tools sshd
+    impact_ok "The SSH server program is present."
+    GROUP='impact'
+    if impact_conf_load; then
+        GROUP="${IMPACT_CONF[SHARED_GROUP]}"
+    fi
+    impact_step "Remove the SSH rules of the group '$GROUP'"
+    impact_ssh_rules_remove "$GROUP"
+    impact_summary
+    exit "$IMPACT_EXIT_OK"
+fi
+
+# -----------------------------------------------------------------------------
+# The steps of a normal run
+# -----------------------------------------------------------------------------
+
+impact_step "Read the current settings and the options"
+read_settings_and_options
+check_input_rules
+check_conflicts_with_current_state
+
+impact_step "Check the machine (nothing is changed in this step)"
+check_ubuntu
+impact_require_tools sshd ssh-keygen getfacl setfacl git curl runuser findmnt mountpoint getent \
+    groupadd useradd usermod realpath stat install mktemp diff cmp awk sed
+impact_ok "All needed tools are present."
+check_docker
+check_storage_roots
+check_group
+check_ssh_before
+if [[ ! -r "$IMPACT_BASE_DIR/etc/github_known_hosts" ]]; then
+    impact_die "$IMPACT_EXIT_FAILED" "The delivered file $IMPACT_BASE_DIR/etc/github_known_hosts is missing." \
+        "Install the commands again with install.sh."
+fi
+
+impact_step "Shared group"
+if ((GROUP_EXISTS == 1)); then
+    impact_ok "Nothing to do: the group '$GROUP' exists."
+else
+    if impact_opt_given gid; then
+        impact_do "Create the group '$GROUP' with the number $(impact_opt gid)" create_group
+    else
+        impact_do "Create the group '$GROUP' (the system chooses a free number from 1000 on)" create_group
+    fi
+    impact_undo "Remove the group while it has no members: sudo groupdel $GROUP"
+    if ((IMPACT_DRY_RUN == 0)); then
+        impact_info "The group '$GROUP' has the number $(impact_group_gid "$GROUP"). Note it in the site record; a rebuilt workstation needs it (--gid)."
+    fi
+fi
+
+impact_step "Folders"
+ensure_dir "$IMPACT_CONF_DIR" 755 root root 'settings'
+ensure_dir "$IMPACT_ADMIN_DIR" 700 root root 'administrator files, readable by root only'
+ensure_dir "$IMPACT_LOG_DIR" 700 root root 'the log of the commands'
+ensure_dir "$IMPACT_KEYS_DIR" 700 root root 'received and removed public keys'
+ensure_dir "$IMPACT_ACCOUNTS_DIR" 700 root root 'records of the enrolled accounts'
+ensure_dir "$IMPACT_ACL_BACKUP_DIR" 700 root root 'saved access rights of the shared storage'
+ensure_dir "$IMPACT_STATE_DIR" 700 root root 'exported states for a rebuild'
+ensure_dir "${NEW[MODEL_DIR]}" 2750 root "$GROUP" 'one subfolder per model; members may read'
+setup_storage_roots
+
+impact_step "Settings file $IMPACT_CONF_FILE"
+if impact_conf_needs_write "$IMPACT_CONF_FILE" NEW; then
+    SETTINGS_TEXT="Write the settings file $IMPACT_CONF_FILE (owner root, mode 644)"
+    impact_on_exit restore_settings_if_unconfirmed
+    impact_do "$SETTINGS_TEXT" write_settings
+    if ((FIRST_RUN == 1)); then
+        impact_undo "Remove the settings file: sudo rm $IMPACT_CONF_FILE"
+    else
+        for key in "${IMPACT_CONF_KEYS[@]}"; do
+            if [[ "${OLD[$key]}" != "${NEW[$key]}" ]]; then
+                impact_undo "Set $key back to its previous value '${OLD[$key]}' with the matching option of this command."
+            fi
+        done
+    fi
+else
+    impact_ok "The settings file already holds these values."
+fi
+for key in "${IMPACT_CONF_KEYS[@]}"; do
+    impact_info "$key=${NEW[$key]}"
+done
+
+impact_step "GitHub's host keys for impact-get-repo"
+if impact_file_has_content "$IMPACT_KNOWN_HOSTS_FILE" "$IMPACT_BASE_DIR/etc/github_known_hosts" &&
+    impact_file_is "$IMPACT_KNOWN_HOSTS_FILE" 644 root root; then
+    impact_ok "$IMPACT_KNOWN_HOSTS_FILE is up to date."
+else
+    impact_do "Write $IMPACT_KNOWN_HOSTS_FILE (GitHub's three published host keys; owner root, mode 644)" install_known_hosts
+    impact_undo "Remove GitHub's host keys: sudo rm $IMPACT_KNOWN_HOSTS_FILE"
+fi
+
+impact_step "SSH rules for the members of '$GROUP'"
+impact_mktemp_file
+RULES_FILE="$IMPACT_TMP"
+impact_ssh_rules_content "$GROUP" "${NEW[PORT_MIN]}" "${NEW[PORT_MAX]}" >"$RULES_FILE"
+impact_ssh_rules_install "$RULES_FILE" "$GROUP" "${NEW[PORT_MIN]}" "${NEW[PORT_MAX]}"
+# The SSH step succeeded: the new settings file is confirmed.
+SETTINGS_PENDING=0
+
+impact_summary
+if ((IMPACT_DRY_RUN == 0)); then
+    impact_say ''
+    impact_say 'Next steps:'
+    impact_say '  sudo impact-check                  confirm the state of the workstation'
+    impact_say '  sudo impact-add-model --help       register the first model'
+    impact_say '  sudo impact-add-user --help        enrol the first person'
+fi
