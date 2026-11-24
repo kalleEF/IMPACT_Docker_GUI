@@ -1,0 +1,7 @@
+# Line endings for the files in this folder.
+#
+# probe-workstation.sh runs with bash on a Linux runner. bash cannot run a
+# script that has Windows (CRLF) line endings: it stops with errors such as
+# "$'\r': command not found". "eol=lf" makes git write the file with Unix (LF)
+# line endings into every checkout, also on a Windows PC.
+*.sh text eol=lf

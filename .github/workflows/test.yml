@@ -2,17 +2,35 @@ name: IMPACT Docker GUI - Tests
 
 on:
   push:
-    branches: [main, develop]
+    # main      = the main branch.
+    # dev-v2.1  = the development branch for version 2.1; the remote-mode
+    #             redesign is built there.
+    # (The branch 'develop' used to be listed here. It no longer exists on
+    #  GitHub, and nothing else in this file referred to it, so it was removed.)
+    branches: [main, dev-v2.1]
+    # A push starts this workflow only when it changes a file below one of
+    # these paths. A push that changes only the documentation starts nothing.
     paths:
       - 'current_version/**'
       - 'tests/**'
+      # Folder for the workstation commands of the redesign. It does not exist
+      # yet; it is listed already so that CI starts as soon as files appear.
+      - 'workstation/**'
+      # Already covered by 'tests/**'. Listed on its own line because the
+      # temporary probe jobs at the end of this file react to this folder.
+      - 'tests/Probes/**'
       - '.github/workflows/test.yml'
   pull_request:
-    branches: [main]
+    # Pull requests INTO one of these branches (any changed file).
+    branches: [main, dev-v2.1]
   workflow_dispatch:
     inputs:
       run_e2e:
         description: 'Run E2E tests (ImageValidation + RemoteE2E)'
+        type: boolean
+        default: false
+      run_probes:
+        description: 'Run the TEMPORARY feasibility probes (Windows tunnel + Ubuntu workstation)'
         type: boolean
         default: false
   schedule:
@@ -35,6 +53,21 @@ permissions:
 #    3. DockerSsh (Ubuntu)       - SSH to SSHD container, tests remote funcs
 #    4. ImageValidation (Ubuntu) - builds real IMPACT image, validates container
 #    5. RemoteE2E (Ubuntu)       - full SSH -> Docker build -> container lifecycle
+#
+#  When does which job run:
+#    Tiers 1 to 3   every push to main or dev-v2.1 that changes one of the
+#                   paths listed above, every pull request into main or
+#                   dev-v2.1, every manual start, and the weekly schedule.
+#    Tiers 4 and 5  manual start with run_e2e ticked, and the weekly schedule.
+#
+#  TEMPORARY feasibility probes (the last three jobs in this file):
+#    They are not tests of the GUI. They find out whether GitHub's runners can
+#    host two test tiers planned for the remote-mode redesign (an SSH tunnel on
+#    Windows, account and sshd set-up on the workstation). They run only on a
+#    manual start with run_probes ticked, and on a push to dev-v2.1 that
+#    changes a file under tests/Probes/. They never run for main, for pull
+#    requests or on the weekly schedule. Delete the three jobs, the input
+#    run_probes and the folder tests/Probes once the questions are answered.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 jobs:
@@ -422,3 +455,154 @@ jobs:
         with:
           name: test-results-remote-e2e
           path: tests/TestResults-RemoteE2E.xml
+
+  # ═════════════════════════════════════════════════════════════════════════
+  #  TEMPORARY FEASIBILITY PROBES (work package 0 of the remote-mode redesign)
+  #
+  #  The three jobs below are NOT tests of the IMPACT Docker GUI, and what
+  #  they find does not make a push "red": each probe script prints PASS /
+  #  FAIL lines and a summary table, and ends with exit code 0. (A red probe
+  #  job means that the probe script itself could not run, or ran out of
+  #  time.) Read the summary on the page of the workflow run, or download
+  #  the artifact of the job.
+  #
+  #  They run only
+  #    - on a manual start with the box "run_probes" ticked, or
+  #    - on a push to dev-v2.1 that changes a file under tests/Probes/.
+  #  They do not run on pushes to main, on pull requests or on the weekly
+  #  schedule.
+  #
+  #  Delete all three jobs (and the input run_probes, and tests/Probes/) when
+  #  the two questions are answered.
+  # ═════════════════════════════════════════════════════════════════════════
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  PROBE gate - decides whether the two probe jobs run.
+  #  A job condition ("if:") cannot see which files a push changed. So this
+  #  small job looks it up with git and hands the answer ("true" or "false")
+  #  to the two probe jobs as its output "run_probes".
+  # ─────────────────────────────────────────────────────────────────────────
+  probe-gate:
+    name: 'PROBE gate (temporary): should the probes run?'
+    runs-on: ubuntu-latest
+    # Start this job only for the two cases named above. In every other case
+    # (main, pull request, schedule, manual start without run_probes) it is
+    # skipped, and jobs that "need" a skipped job are skipped as well.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_probes == 'true')
+      || (github.event_name == 'push' && github.ref == 'refs/heads/dev-v2.1')
+    outputs:
+      run_probes: ${{ steps.decide.outputs.run_probes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 0 = fetch the whole history. The step below compares two commits,
+          # and both must be present in the checkout.
+          fetch-depth: 0
+
+      - name: Decide
+        id: decide
+        shell: bash
+        # The values from GitHub are handed over as environment variables and
+        # not pasted into the script text. That is the safe way to use them.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          run_probes=false
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            # The job condition has already checked that run_probes is ticked.
+            run_probes=true
+            echo "Manual start with run_probes ticked: the probes run."
+          else
+            # A push to dev-v2.1. BEFORE_SHA is the commit the branch pointed
+            # to before the push, AFTER_SHA the commit it points to now.
+            if git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+              base="$BEFORE_SHA"
+            else
+              # After a forced push, or for the first push of a branch, the
+              # old commit is not available. Then look at the newest commit only.
+              base="${AFTER_SHA}~1"
+              echo "The commit before the push is not available; comparing with the parent of the newest commit."
+            fi
+            changed="$(git diff --name-only "$base" "$AFTER_SHA" -- tests/Probes/ || true)"
+            if [ -n "$changed" ]; then
+              run_probes=true
+              echo "This push changed files under tests/Probes/, so the probes run:"
+              echo "$changed"
+            else
+              echo "This push changed nothing under tests/Probes/: the probes do not run."
+            fi
+          fi
+          # Lines written to the file named in GITHUB_OUTPUT become outputs of this step.
+          echo "run_probes=$run_probes" >> "$GITHUB_OUTPUT"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  PROBE 1 - SSH tunnel on Windows (temporary)
+  #  Question: can a Windows runner be its own SSH server, so that a later
+  #  test tier can start the tunnel exactly as the GUI will (hidden ssh.exe
+  #  with -N -L ...) and request a page through it?
+  #  Script with all details: tests/Probes/Probe-WindowsTunnel.ps1
+  # ─────────────────────────────────────────────────────────────────────────
+  probe-tunnel-windows:
+    name: 'PROBE (temporary): SSH tunnel on Windows'
+    runs-on: windows-latest
+    needs: [probe-gate]
+    if: needs.probe-gate.outputs.run_probes == 'true'
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the Windows tunnel probe
+        shell: pwsh
+        # Installing the Windows OpenSSH Server can take several minutes. The
+        # limit on this step (and not only on the job) makes sure that the
+        # upload step below still runs when the probe hangs.
+        timeout-minutes: 35
+        run: |
+          ./tests/Probes/Probe-WindowsTunnel.ps1 -OutputDirectory ./tests/artifacts/probes/windows-tunnel
+
+      # always() = upload also when the step above failed or ran out of time.
+      # The artifact contains probe-output.txt (everything the script
+      # printed), the log files of the tunnels and the log of the SSH server.
+      - name: Upload probe output and tunnel logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-tunnel-windows
+          path: tests/artifacts/probes/windows-tunnel/
+          if-no-files-found: warn
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  PROBE 2 - workstation on Ubuntu (temporary)
+  #  Question: can an Ubuntu runner play the shared workstation, so that a
+  #  later test tier can run the real set-up commands (personal accounts with
+  #  key-only login, sshd rules for the group "impact", Docker through SSH,
+  #  tunnel to a container on 127.0.0.1:8787)?
+  #  Script with all details: tests/Probes/probe-workstation.sh
+  # ─────────────────────────────────────────────────────────────────────────
+  probe-workstation-ubuntu:
+    name: 'PROBE (temporary): workstation on Ubuntu'
+    runs-on: ubuntu-latest
+    needs: [probe-gate]
+    if: needs.probe-gate.outputs.run_probes == 'true'
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the workstation probe
+        timeout-minutes: 20
+        run: |
+          bash tests/Probes/probe-workstation.sh --output-dir tests/artifacts/probes/workstation
+
+      # The artifact contains probe-output.txt (everything the script
+      # printed), the ssh log of every tunnel attempt, the settings sshd
+      # applied, and the log of the SSH server.
+      - name: Upload probe output and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-workstation-ubuntu
+          path: tests/artifacts/probes/workstation/
+          if-no-files-found: warn
