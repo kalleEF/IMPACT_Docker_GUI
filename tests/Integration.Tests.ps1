@@ -1,7 +1,9 @@
 <#
 .SYNOPSIS
-    Pester 5 integration tests for IMPACT Docker GUI.
+    Pester integration tests for IMPACT Docker GUI.
     Uses mocks for Docker CLI and SSH - no real containers or remote hosts required.
+    (A mock is a stand-in for a command during a test: Pester's 'Mock' command
+    replaces the command with a small piece of test code.)
 
     Run:  pwsh -File tests/Invoke-Tests.ps1 -Tag Integration
 #>
@@ -137,10 +139,15 @@ Describe 'Ensure-GitKeySetup in NonInteractive mode' -Tag Integration {
     #  - Join-Path is mocked for the "$HOME/.ssh" call inside the module, so the
     #    function looks at a temp folder;
     #  - guard mocks make any write below the real ~/.ssh fail loudly;
+    #  - default mocks pass every other call of these commands on to the real command;
     #  - ssh-keygen, Set-Clipboard and Ensure-SshAgentRunning are mocked, and the
     #    tests check which of them ran.
     BeforeAll {
         $script:realSshDir = Join-Path $HOME '.ssh'
+        # The same folder written with '/' only. The safety nets below turn every '\'
+        # into '/' before they compare paths, so they also catch a path that mixes the
+        # two, such as "$HOME/.ssh/config" on Windows (C:\Users\me/.ssh/config).
+        $script:realSshDirSlash = $script:realSshDir -replace '\\', '/'
         # Pester can only mock commands that exist. On machines without OpenSSH (for
         # example a Linux CI container) define a stand-in that is removed in AfterAll.
         $script:keygenStubAdded = $false
@@ -160,6 +167,19 @@ Describe 'Ensure-GitKeySetup in NonInteractive mode' -Tag Integration {
         $script:fakeSshDir = Join-Path ([System.IO.Path]::GetTempPath()) "impact_gitkey_$([guid]::NewGuid().ToString('N').Substring(0,8))"
         New-Item -ItemType Directory -Path $script:fakeSshDir -Force | Out-Null
 
+        # Default mocks: every call of these commands that none of the mocks with a
+        # -ParameterFilter below accepts goes on to the real command, with the same
+        # parameters (see Invoke-RealCommand in Helpers/TestSessionState.ps1). Without
+        # them Pester stops such a call with "No mock for command ... matched the call",
+        # for example the Join-Path that builds the key path in the temp folder.
+        Mock Join-Path   -ModuleName 'IMPACT_Docker_GUI' { Invoke-RealCommand -Name 'Join-Path'   -Parameters $PesterBoundParameters }
+        Mock Add-Content -ModuleName 'IMPACT_Docker_GUI' { Invoke-RealCommand -Name 'Add-Content' -Parameters $PesterBoundParameters }
+        Mock Set-Content -ModuleName 'IMPACT_Docker_GUI' { Invoke-RealCommand -Name 'Set-Content' -Parameters $PesterBoundParameters }
+        Mock New-Item    -ModuleName 'IMPACT_Docker_GUI' { Invoke-RealCommand -Name 'New-Item'    -Parameters $PesterBoundParameters }
+        Mock Copy-Item   -ModuleName 'IMPACT_Docker_GUI' { Invoke-RealCommand -Name 'Copy-Item'   -Parameters $PesterBoundParameters }
+        Mock Remove-Item -ModuleName 'IMPACT_Docker_GUI' { Invoke-RealCommand -Name 'Remove-Item' -Parameters $PesterBoundParameters }
+
+        # Redirect "$HOME/.ssh" inside the module to the temp folder.
         Mock Join-Path -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { $Path -eq $HOME -and $ChildPath -eq '.ssh' } { $script:fakeSshDir }
         # Safety net: never touch the real ~/.ssh, whatever the module does.
         # The filters look at "$Path$LiteralPath" (TS-2): the module writes the ssh config
@@ -167,12 +187,13 @@ Describe 'Ensure-GitKeySetup in NonInteractive mode' -Tag Integration {
         # safety net did not fire for exactly the writes it is meant to catch. Only one of
         # the two parameters is ever given, so joining them gives the path that was used.
         # Copy-Item (the config backup) is checked on its -Destination, and Remove-Item
-        # (a stray .pub file is deleted) is guarded too.
-        Mock Add-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path$LiteralPath" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path$LiteralPath" }
-        Mock Set-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path$LiteralPath" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path$LiteralPath" }
-        Mock New-Item    -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like "$($script:realSshDir)*" } { throw "Test tried to create something in the real SSH folder: $Path" }
-        Mock Copy-Item   -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Destination" -like "$($script:realSshDir)*" } { throw "Test tried to copy a file into the real SSH folder: $Destination" }
-        Mock Remove-Item -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path$LiteralPath" -like "$($script:realSshDir)*" } { throw "Test tried to delete something in the real SSH folder: $Path$LiteralPath" }
+        # (a stray .pub file is deleted) is guarded too. Both paths are compared with '/'
+        # only (see $script:realSshDirSlash in BeforeAll).
+        Mock Add-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { ("$Path$LiteralPath" -replace '\\', '/') -like "$($script:realSshDirSlash)*" } { throw "Test tried to write the real SSH folder: $Path$LiteralPath" }
+        Mock Set-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { ("$Path$LiteralPath" -replace '\\', '/') -like "$($script:realSshDirSlash)*" } { throw "Test tried to write the real SSH folder: $Path$LiteralPath" }
+        Mock New-Item    -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { ("$Path" -replace '\\', '/') -like "$($script:realSshDirSlash)*" } { throw "Test tried to create something in the real SSH folder: $Path" }
+        Mock Copy-Item   -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { ("$Destination" -replace '\\', '/') -like "$($script:realSshDirSlash)*" } { throw "Test tried to copy a file into the real SSH folder: $Destination" }
+        Mock Remove-Item -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { ("$Path$LiteralPath" -replace '\\', '/') -like "$($script:realSshDirSlash)*" } { throw "Test tried to delete something in the real SSH folder: $Path$LiteralPath" }
 
         Mock Set-Clipboard -ModuleName 'IMPACT_Docker_GUI' { }
         Mock Ensure-SshAgentRunning -ModuleName 'IMPACT_Docker_GUI' { }
@@ -181,11 +202,17 @@ Describe 'Ensure-GitKeySetup in NonInteractive mode' -Tag Integration {
         #  - '-y -f <path>' (print the public key, also used to check that a key has
         #    no passphrase): prints the .pub content
         # It always reports success through $LASTEXITCODE, like the real program.
+        # The body of a mock runs in this test file, outside the module, so the guard
+        # mocks above do not see its Set-Content calls. It therefore checks the key path
+        # itself and refuses to write below the real ~/.ssh.
         Mock ssh-keygen -ModuleName 'IMPACT_Docker_GUI' {
             $all = @($args)
             $fIndex = [array]::IndexOf($all, '-f')
             $keyFile = if ($fIndex -ge 0 -and $fIndex + 1 -lt $all.Count) { [string]$all[$fIndex + 1] } else { $null }
             if ($all -contains '-t' -and $keyFile) {
+                if (($keyFile -replace '\\', '/') -like "$($script:realSshDirSlash)*") {
+                    throw "Test tried to create a key in the real SSH folder: $keyFile"
+                }
                 Set-Content -LiteralPath $keyFile -Value 'dummy-private-key'
                 Set-Content -LiteralPath "$keyFile.pub" -Value 'ssh-ed25519 AAAAgeneratedTestKey IMPACT_gitgen'
             } elseif ($all -contains '-y' -and $keyFile -and (Test-Path -LiteralPath "$keyFile.pub")) {
@@ -1833,6 +1860,10 @@ Describe 'Get-GitRepositoryState: git missing, detached HEAD, never-pushed branc
     }
 
     It 'Local: returns null with reason GitMissing when git is not installed' {
+        # Only the lookup of git pretends that git is missing. Any other Get-Command call
+        # goes to the default mock and gets the real answer, asked from inside the module
+        # (see Invoke-RealCommand in Helpers/TestSessionState.ps1).
+        Mock Get-Command { Invoke-RealCommand -Name 'Get-Command' -Parameters $PesterBoundParameters } -ModuleName 'IMPACT_Docker_GUI'
         Mock Get-Command { return $null } -ParameterFilter { $Name -eq 'git' } -ModuleName 'IMPACT_Docker_GUI'
         $state = New-TestSessionState -Location 'LOCAL'
         $why = $null

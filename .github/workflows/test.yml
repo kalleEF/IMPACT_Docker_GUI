@@ -38,15 +38,19 @@ on:
     - cron: '0 3 * * 0'
 
 # The version of Pester (the test tool for PowerShell) that every job installs.
-# It is fixed on purpose. The tests are written and checked with this version.
-# Pester 6 changed how "mocks" behave (a mock is a stand-in for a command
-# during a test): a mock that only handles some calls no longer passes the
-# other calls on to the real command, and several tests rely on that. With a
+# It is fixed on purpose: the tests are checked with this version, and a new
+# Pester release can change how tests behave, for example how "mocks" (the
+# stand-ins for commands during a test) handle the calls they are given. With a
 # fixed version, a new Pester release cannot turn the tests red overnight.
-# To move to a newer version: change this one line and
-# $requiredPesterVersion in tests/Invoke-Tests.ps1, and run all tests.
+# The tests need PowerShell 7.4 or newer (pwsh): the IMPACT module needs 7.3 or
+# newer, and in PowerShell 7 Pester 6 needs 7.4 or newer. Every step that runs
+# Pester uses "shell: pwsh", and the windows-latest and ubuntu-latest runners
+# come with a new enough version.
+# To move to a newer version: read its release notes, change this line and
+# $requiredPesterVersion in tests/Invoke-Tests.ps1 to the same value, and run
+# all test suites with it.
 env:
-  PESTER_VERSION: '5.7.1'
+  PESTER_VERSION: '6.2.0'
 
 permissions:
   contents: read

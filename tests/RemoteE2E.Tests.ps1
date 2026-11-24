@@ -43,11 +43,14 @@ BeforeAll {
     Import-Module $modulePath -Force -DisableNameChecking
     . (Join-Path $PSScriptRoot 'Helpers' 'TestSessionState.ps1')
 
-    # Re-read env vars in run scope
+    # Re-read env vars in run scope (values set in BeforeDiscovery are only there
+    # while -Skip: is evaluated, not while the tests run). $script:SkipTests is
+    # needed here too: BeforeAll and AfterAll of the Describe below check it.
     $script:SshHost = if ($env:IMPACT_REMOTE_E2E_SSH_HOST) { $env:IMPACT_REMOTE_E2E_SSH_HOST } else { 'localhost' }
     $script:SshPort = if ($env:IMPACT_REMOTE_E2E_SSH_PORT) { $env:IMPACT_REMOTE_E2E_SSH_PORT } else { '2222' }
     $script:SshUser = if ($env:IMPACT_REMOTE_E2E_SSH_USER) { $env:IMPACT_REMOTE_E2E_SSH_USER } else { 'testuser' }
     $script:SshKey  = $env:IMPACT_REMOTE_E2E_SSH_KEY
+    $script:SkipTests = -not ($script:SshHost -and $script:SshKey -and (Test-Path $script:SshKey -ErrorAction SilentlyContinue))
 
     # Preflight state (NEVER throw in BeforeAll — use flags)
     $script:PreflightFailed = $false

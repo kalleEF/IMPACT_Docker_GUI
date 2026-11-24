@@ -1,7 +1,9 @@
 <#
 .SYNOPSIS
-    Pester 5 unit tests for IMPACT Docker GUI pure-logic functions.
+    Pester unit tests for IMPACT Docker GUI pure-logic functions.
     These tests do NOT require Docker, SSH, or a network connection.
+    Many tests use mocks: a mock is a stand-in for a command during a test (Pester's
+    'Mock' command replaces the command with a small piece of test code).
 
     Run:  pwsh -File tests/Invoke-Tests.ps1 -Tag Unit
 #>
@@ -774,10 +776,15 @@ Describe 'Ensure-SshConfigEntry' -Tag Unit {
     #  - Join-Path is mocked for the one call inside the module that builds "$HOME/.ssh",
     #    so the module reads and writes <temp>/.ssh/config instead;
     #  - guard mocks make any write below the real ~/.ssh fail loudly (and do nothing)
-    #    in case the module ever builds that path in another way.
+    #    in case the module ever builds that path in another way;
+    #  - default mocks pass every other call of these commands on to the real command.
     BeforeAll {
         $script:testIp = '198.51.100.99'  # RFC 5737 TEST-NET-3, won't collide with real entries
         $script:realSshDir = Join-Path $HOME '.ssh'
+        # The same folder written with '/' only. The safety nets below turn every '\'
+        # into '/' before they compare paths, so they also catch a path that mixes the
+        # two, such as "$HOME/.ssh/config" on Windows (C:\Users\me/.ssh/config).
+        $script:realSshDirSlash = $script:realSshDir -replace '\\', '/'
 
         # Reads the IdentityFile value(s) of the test host block. Quotes are allowed around
         # the value, so these tests keep working if the module starts quoting the path
@@ -806,8 +813,21 @@ Describe 'Ensure-SshConfigEntry' -Tag Unit {
         Set-Content -LiteralPath $script:keyA -Value 'dummy-key-a'
         Set-Content -LiteralPath $script:keyB -Value 'dummy-key-b'
 
+        # Default mocks: every call of these commands that none of the mocks with a
+        # -ParameterFilter below accepts goes on to the real command, with the same
+        # parameters (see Invoke-RealCommand in Helpers/TestSessionState.ps1). Without
+        # them Pester stops such a call with "No mock for command ... matched the call",
+        # and the module would lose, for example, the Join-Path that builds
+        # <temp>/.ssh/config, or its log lines (Write-Log ignores errors of Add-Content).
+        Mock Join-Path   -ModuleName 'IMPACT_Docker_GUI' { Invoke-RealCommand -Name 'Join-Path'   -Parameters $PesterBoundParameters }
+        Mock Add-Content -ModuleName 'IMPACT_Docker_GUI' { Invoke-RealCommand -Name 'Add-Content' -Parameters $PesterBoundParameters }
+        Mock Set-Content -ModuleName 'IMPACT_Docker_GUI' { Invoke-RealCommand -Name 'Set-Content' -Parameters $PesterBoundParameters }
+        Mock New-Item    -ModuleName 'IMPACT_Docker_GUI' { Invoke-RealCommand -Name 'New-Item'    -Parameters $PesterBoundParameters }
+        Mock Copy-Item   -ModuleName 'IMPACT_Docker_GUI' { Invoke-RealCommand -Name 'Copy-Item'   -Parameters $PesterBoundParameters }
+        Mock Remove-Item -ModuleName 'IMPACT_Docker_GUI' { Invoke-RealCommand -Name 'Remove-Item' -Parameters $PesterBoundParameters }
+
         # Redirect "$HOME/.ssh" inside the module to the temp folder. All other Join-Path
-        # calls do not match the filter and run normally.
+        # calls go to the default mock above and run normally.
         Mock Join-Path -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { $Path -eq $HOME -and $ChildPath -eq '.ssh' } { $script:fakeSshDir }
         # Safety net: never touch the real ~/.ssh, whatever the module does.
         # The filters look at "$Path$LiteralPath" (TS-2): the module writes the ssh config
@@ -815,12 +835,13 @@ Describe 'Ensure-SshConfigEntry' -Tag Unit {
         # safety net did not fire for exactly the writes it is meant to catch. Only one of
         # the two parameters is ever given, so joining them gives the path that was used.
         # Copy-Item (the config backup) is checked on its -Destination, and Remove-Item
-        # (a stray .pub file is deleted) is guarded too.
-        Mock Add-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path$LiteralPath" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path$LiteralPath" }
-        Mock Set-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path$LiteralPath" -like "$($script:realSshDir)*" } { throw "Test tried to write the real SSH folder: $Path$LiteralPath" }
-        Mock New-Item    -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like "$($script:realSshDir)*" } { throw "Test tried to create something in the real SSH folder: $Path" }
-        Mock Copy-Item   -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Destination" -like "$($script:realSshDir)*" } { throw "Test tried to copy a file into the real SSH folder: $Destination" }
-        Mock Remove-Item -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path$LiteralPath" -like "$($script:realSshDir)*" } { throw "Test tried to delete something in the real SSH folder: $Path$LiteralPath" }
+        # (a stray .pub file is deleted) is guarded too. Both paths are compared with '/'
+        # only (see $script:realSshDirSlash in BeforeAll).
+        Mock Add-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { ("$Path$LiteralPath" -replace '\\', '/') -like "$($script:realSshDirSlash)*" } { throw "Test tried to write the real SSH folder: $Path$LiteralPath" }
+        Mock Set-Content -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { ("$Path$LiteralPath" -replace '\\', '/') -like "$($script:realSshDirSlash)*" } { throw "Test tried to write the real SSH folder: $Path$LiteralPath" }
+        Mock New-Item    -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { ("$Path" -replace '\\', '/') -like "$($script:realSshDirSlash)*" } { throw "Test tried to create something in the real SSH folder: $Path" }
+        Mock Copy-Item   -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { ("$Destination" -replace '\\', '/') -like "$($script:realSshDirSlash)*" } { throw "Test tried to copy a file into the real SSH folder: $Destination" }
+        Mock Remove-Item -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { ("$Path$LiteralPath" -replace '\\', '/') -like "$($script:realSshDirSlash)*" } { throw "Test tried to delete something in the real SSH folder: $Path$LiteralPath" }
     }
 
     AfterEach {
@@ -851,6 +872,9 @@ Describe 'Ensure-SshConfigEntry' -Tag Unit {
     # skipped outside Windows because of an older version of that check.)
     It 'Leaves a valid entry byte-for-byte unchanged' {
         Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile $script:keyA
+        # Without this check the test would also pass when no config file is written at
+        # all: both reads below would then give $null.
+        Test-Path -LiteralPath $script:configPath | Should -BeTrue -Because 'the redirected config file must have been written'
         $before = Get-Content -LiteralPath $script:configPath -Raw
         Ensure-SshConfigEntry -RemoteHostIp $script:testIp -RemoteUser 'php-workstation' -IdentityFile $script:keyA
         Get-Content -LiteralPath $script:configPath -Raw | Should -BeExactly $before
@@ -2926,6 +2950,9 @@ Describe 'Repair-SshConfigIdentityFileQuoting (all sections of the ssh config)' 
         $global:C3rOrder = [System.Collections.Generic.List[string]]::new()
         $c3rUser = "c3rtest$([guid]::NewGuid().ToString('N').Substring(0,6))"
         Mock Initialize-ImpactSshKeyPair { [pscustomobject]@{ Success = $true; Generated = $false; Status = 'Ready'; Message = ''; Details = '' } } -ModuleName 'IMPACT_Docker_GUI'
+        # Only the test user's public key file is faked; any other Get-Content call goes to
+        # the default mock and reads the real file (see Invoke-RealCommand).
+        Mock Get-Content { Invoke-RealCommand -Name 'Get-Content' -Parameters $PesterBoundParameters } -ModuleName 'IMPACT_Docker_GUI'
         Mock Get-Content { 'ssh-ed25519 AAAAC3NzaTEST IMPACT_c3r' } -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$LiteralPath$Path" -like '*id_ed25519_c3rtest*.pub' }
         Mock Repair-SshConfigIdentityFileQuoting { $global:C3rOrder.Add('repair'); 0 } -ModuleName 'IMPACT_Docker_GUI'
         Mock Ensure-SshAgentRunning { } -ModuleName 'IMPACT_Docker_GUI'
@@ -3130,7 +3157,10 @@ Describe 'Ensure-SshConfigEntry when the ssh config cannot be backed up' -Tag Un
         Set-Content -Path $c3rConfig -Value 'Host x'
         $global:C3rCopyTargets = [System.Collections.Generic.List[string]]::new()
         # The second folder is in the real home folder, so creating it and copying there are
-        # only recorded, never done.
+        # only recorded, never done. Any other New-Item call goes to the default mock and
+        # runs normally (see Invoke-RealCommand). The two Copy-Item filters together accept
+        # every possible call, so Copy-Item needs no default mock.
+        Mock New-Item { Invoke-RealCommand -Name 'New-Item' -Parameters $PesterBoundParameters } -ModuleName 'IMPACT_Docker_GUI'
         Mock New-Item { } -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Path" -like '*ssh-config-backups*' }
         Mock Copy-Item { $global:C3rCopyTargets.Add("$Destination"); throw 'Access to the path is denied.' } -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Destination" -notlike '*ssh-config-backups*' }
         Mock Copy-Item { $global:C3rCopyTargets.Add("$Destination") } -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { "$Destination" -like '*ssh-config-backups*' }

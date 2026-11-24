@@ -17,7 +17,7 @@
 #>
 
 # Skip logic MUST be in BeforeDiscovery so that -Skip: evaluates correctly
-# (Pester 5 evaluates -Skip at discovery time, before BeforeAll runs)
+# (Pester evaluates -Skip at discovery time, before BeforeAll runs)
 BeforeDiscovery {
     $script:SshHost = $env:IMPACT_TEST_SSH_HOST
     $script:SshPort = if ($env:IMPACT_TEST_SSH_PORT) { $env:IMPACT_TEST_SSH_PORT } else { '2222' }
