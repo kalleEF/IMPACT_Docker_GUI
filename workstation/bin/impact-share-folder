@@ -1,0 +1,419 @@
+#!/bin/bash
+# =============================================================================
+# impact-share-folder: give a folder on the shared storage the group rules
+#
+# Purpose
+#   Makes every folder and file below a folder of the shared storage usable
+#   by all members of the shared group (SHARED_GROUP in
+#   /etc/impact/impact.conf), whoever created it:
+#     folders: group = the shared group, the group may read, write and
+#              enter, "setgid" is set (new entries inherit the group), and a
+#              "default ACL" makes new entries group-writable whatever the
+#              creating account's own default (its "umask") says;
+#     files:   group = the shared group, the group may read and write, and
+#              execute where the file is executable.
+#   The owner and the rights of all others never change.
+#   An ACL (access control list) is a list of extra access entries next to
+#   the usual owner, group and mode of a file.
+#   The command walks once through the whole tree, changes only the entries
+#   that deviate, and saves the previous owner, group, mode and ACL of each
+#   of them BEFORE it changes it, to /opt/impact/admin/acl-backups/.
+#   It is safe to interrupt and to run again.
+#
+# Who runs it
+#   The administrator, with sudo: once per model folder after
+#   impact-add-model, and with --repair later on.
+#
+# Usage
+#   sudo impact-share-folder <folder> [--dry-run]
+#   sudo impact-share-folder <folder> --repair [--dry-run]
+#   sudo impact-share-folder <folder> --transition-user <account> [--dry-run]
+#   sudo impact-share-folder <folder> --remove-transition-user <account> [--dry-run]
+#   sudo impact-share-folder --restore <backup folder> [--dry-run]
+#
+# Examples
+#   Count what would change, change nothing:
+#     sudo impact-share-folder /mnt/disk_a/shared/Example --dry-run
+#   Apply the rules:
+#     sudo impact-share-folder /mnt/disk_a/shared/Example
+#   During the switch-over, keep write access for the old shared account:
+#     sudo impact-share-folder /mnt/disk_a/shared/Example --transition-user oldshared
+#   Fix entries that were moved in with old rights (quick):
+#     sudo impact-share-folder /mnt/disk_a/shared/Example --repair
+#   Put the previous rights back from a backup:
+#     sudo impact-share-folder --restore /opt/impact/admin/acl-backups/20261124T201500Z_mnt_disk_a_shared_Example
+#
+#   A walk over terabytes takes hours. Start it so that it keeps running
+#   after you log out, as a temporary service of the system:
+#     sudo systemd-run --unit=impact-share-folder --collect \
+#          /usr/local/bin/impact-share-folder /mnt/disk_a/shared/Example
+#   Watch it (Ctrl+C ends only the watching):
+#     sudo journalctl -u impact-share-folder -f
+#   Is it still running?   systemctl status impact-share-folder
+#   Stop it (safe; the same command later continues the work):
+#     sudo systemctl stop impact-share-folder
+#
+# Options
+#   --dry-run    walk through the tree, print the counts of what a real run
+#                would change, change nothing
+#   --repair     the quick way for a tree that was converted before: reads
+#                the ACL of every folder, and of the files whose plain mode
+#                already shows a deviation (other group, group may not read
+#                and write, owner may execute and group may not, more than
+#                one name). It finds files that were moved in with their
+#                old rights. A file whose only deviation lies inside its
+#                ACL is found by the full run (without --repair).
+#   --transition-user <account>
+#                also give this account (for example the old shared account
+#                of version 2.0) read and write access to every entry and,
+#                through the default ACL, to every new entry
+#   --remove-transition-user <account>
+#                take that access entry away again (end of the transition)
+#   --restore <backup folder>
+#                put back the rights saved by an earlier run (see "How to
+#                undo")
+#   --help       show this text
+#
+# Which folders are accepted
+#   A folder inside one of the storage roots (SHARED_ROOTS), after every
+#   symbolic link on the way is resolved; not the storage root itself; no
+#   top folder of a file system; no system folder and no home folder; a
+#   path written below a storage root that leads out of it through a
+#   symbolic link is refused; the folder must lie on the file system of its
+#   storage root (ext4, xfs or btrfs).
+#   Inside the folder the command stays on that one file system: other
+#   disks and "bind" mounts inside are left out with everything below them.
+#   Symbolic links inside are never followed and never changed. A file with
+#   further names (hard links) outside the folder is left alone and named.
+#
+# What it changes on the system
+#   For each folder and file below <folder> that deviates from the rules:
+#   group, group rights, setgid (folders), ACL and default ACL (folders).
+#   A backup folder /opt/impact/admin/acl-backups/<time>_<folder>/ (root
+#   only) with run.info and the previous rights in part-*.facl.gz.
+#   One block in /opt/impact/admin/log/impact-admin.log.
+#
+# How to undo
+#   sudo impact-share-folder --restore /opt/impact/admin/acl-backups/<backup folder>
+#   It puts back owner, group, mode and ACL of every saved entry that has
+#   not changed in another way since. With several runs on the same folder,
+#   restore the newest backup first. The command prints the exact line.
+#   Look at a backup with: sudo zless <backup folder>/part-000001.facl.gz
+#
+# Cost
+#   One walk through the tree (find), one read of the ACL of every entry
+#   it examines (getfacl, in groups of 500), and for each entry that
+#   deviates: about ten short program starts per folder and three per group
+#   of up to 500 files, plus the backup (about 20 bytes per entry after
+#   compression). Each group is saved and written to disk before it is
+#   changed, so an interruption loses at most one group of work.
+#
+# Exit codes
+#   0 done or nothing to do; 1 single entries could not be changed, or the
+#   walk reported problems; 2 wrong usage or a folder that is not accepted;
+#   3 the workstation is not prepared; 4 another impact-share-folder runs.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Reading help: bash constructs that appear in this file
+#   NAME=text            store a text in the variable NAME; "$NAME" reads it
+#   local NAME           a variable that exists only inside one function
+#   "$1" "$2" "$@" "$#"  first parameter, second parameter, all parameters,
+#                        number of parameters
+#   "${NAME:-text}"      the value of NAME, or "text" when NAME is unset or empty
+#   $( command )         the text that the command prints
+#   [[ ... ]]            a test: -f plain file, -d folder, -L symbolic link,
+#                        -e exists, -r readable, -x executable, -z empty text,
+#                        -n text with content, == equal, != different,
+#                        =~ matches a pattern
+#   (( ... ))            arithmetic: true when the result is not zero
+#   A && B               run B only when A succeeded
+#   A || B               run B only when A failed
+#   ! command            true when the command fails
+#   if / case / for / while   branches and loops; "case" compares one value
+#                        with several patterns
+#   >file >>file <file   write to a file (replace it / add to its end), read
+#                        from a file
+#   2>/dev/null  >&2     throw error messages away / write to the error channel
+#   command1 | command2  hand the output of command1 to command2
+#   return N / exit N    end the function / the script with status N; 0 means
+#                        success
+#   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+# Constructs beyond these are explained where they are first used.
+# -----------------------------------------------------------------------------
+
+# "set -e" stops the script at the first command that fails, "-u" stops it
+# when a variable is read that was never set, and "-o pipefail" makes a chain
+# of commands joined with "|" fail when any part of it fails.
+set -euo pipefail
+
+# Find this file's real place (the name in /usr/local/bin is a link) and load
+# the shared functions that lie next to it in ../lib.
+IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# The comment lines that start with "shellcheck" tell the checking tool
+# where the loaded files are.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-common.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-sharing.sh
+source "$IMPACT_LIB_DIR/impact-sharing.sh"
+impact_init "$IMPACT_SELF"
+
+# -----------------------------------------------------------------------------
+# 1. Options and arguments
+# -----------------------------------------------------------------------------
+impact_parse_args 'dry-run repair' 'transition-user remove-transition-user restore' '' "$@"
+
+RESTORE_MODE=0
+if impact_opt_given restore; then
+    RESTORE_MODE=1
+    impact_require_arg_count 0 0
+    for option in repair transition-user remove-transition-user; do
+        if impact_opt_given "$option"; then
+            impact_die_usage "--restore cannot be combined with --$option."
+        fi
+    done
+else
+    impact_require_arg_count 1 1
+fi
+if impact_opt_given transition-user && impact_opt_given remove-transition-user; then
+    impact_die_usage "Give either --transition-user or --remove-transition-user, not both."
+fi
+if impact_opt_given repair && { impact_opt_given transition-user || impact_opt_given remove-transition-user; }; then
+    impact_die_usage "--repair cannot be combined with a transition option: its quick test cannot see access entries of single accounts. Run without --repair; that run reads the ACL of every entry."
+fi
+
+# -----------------------------------------------------------------------------
+# 2. Who runs it, settings, log
+# -----------------------------------------------------------------------------
+impact_require_root
+impact_require_conf
+impact_log_enable "$@"
+GROUP="${IMPACT_CONF[SHARED_GROUP]}"
+if ! GID_NUMBER="$(impact_group_gid "$GROUP")"; then
+    impact_die "$IMPACT_EXIT_NOT_PREPARED" "The shared group '$GROUP' does not exist." \
+        "Create it with: sudo impact-workstation-setup (see its --help)."
+fi
+impact_require_tools find getfacl setfacl chgrp chmod chown stat realpath gzip awk sync df tr
+
+# -----------------------------------------------------------------------------
+# 3. Validate every name and path from input before any use
+# -----------------------------------------------------------------------------
+
+# check_transition_account NAME
+#   Stops the command unless NAME is an existing account of a person (user
+#   number 1000 or higher). Sets IMPACT_SHARING_UID to its user number.
+check_transition_account() {
+    local name="$1" number
+    if ! impact_valid_account_name "$name"; then
+        impact_die_usage "'$(impact_display "$name")' is no valid account name (a lower-case letter, then lower-case letters, digits, - or _; at most 32 characters)."
+    fi
+    if ! number="$(impact_account_uid "$name")"; then
+        impact_die_usage "The account '$name' does not exist on this machine."
+    fi
+    if ((number < 1000 || number == 65534)); then
+        impact_die_usage "The account '$name' (number $number) is a system account. Only accounts of people get an access entry."
+    fi
+    IMPACT_SHARING_UID="$number"
+}
+
+IMPACT_SHARING_GROUP="$GROUP"
+IMPACT_SHARING_GID="$GID_NUMBER"
+if impact_opt_given transition-user; then
+    IMPACT_SHARING_ACCOUNT="$(impact_opt transition-user)"
+    IMPACT_SHARING_STATE='present'
+elif impact_opt_given remove-transition-user; then
+    IMPACT_SHARING_ACCOUNT="$(impact_opt remove-transition-user)"
+    IMPACT_SHARING_STATE='absent'
+fi
+if [[ -n "$IMPACT_SHARING_ACCOUNT" ]]; then
+    check_transition_account "$IMPACT_SHARING_ACCOUNT"
+fi
+if impact_opt_given repair; then
+    IMPACT_SHARING_QUICK=1
+    IMPACT_SHARING_MODE_WORD='repair'
+fi
+
+BACKUP_FOLDER=''
+if ((RESTORE_MODE == 1)); then
+    BACKUP_FOLDER="$(impact_opt restore)"
+    # A backup folder is a folder directly inside the backup place, with a
+    # name of the form the command gives.
+    if [[ "$BACKUP_FOLDER" != /* ]]; then
+        BACKUP_FOLDER="$IMPACT_ACL_BACKUP_DIR/$BACKUP_FOLDER"
+    fi
+    BACKUP_FOLDER="${BACKUP_FOLDER%/}"
+    if [[ "$(dirname -- "$BACKUP_FOLDER")" != "$IMPACT_ACL_BACKUP_DIR" ]] ||
+        ! impact_sharing_valid_backup_name "$(basename -- "$BACKUP_FOLDER")"; then
+        impact_die_usage "'$(impact_display "$BACKUP_FOLDER")' is no backup folder of this command. List them with: sudo ls $IMPACT_ACL_BACKUP_DIR"
+    fi
+    if [[ -L "$IMPACT_ACL_BACKUP_DIR" || -L "$BACKUP_FOLDER" || ! -d "$BACKUP_FOLDER" ]]; then
+        impact_die_usage "The backup folder $BACKUP_FOLDER does not exist (or is a symbolic link). List them with: sudo ls $IMPACT_ACL_BACKUP_DIR"
+    fi
+    if ! impact_sharing_read_run_info "$BACKUP_FOLDER"; then
+        impact_die "$IMPACT_EXIT_FAILED" "$IMPACT_STORAGE_ERROR" "Check the folder by hand: sudo ls -l $BACKUP_FOLDER"
+    fi
+    TARGET_TEXT="${IMPACT_SHARING_RUN[TARGET]}"
+else
+    TARGET_TEXT="${IMPACT_ARGS[0]}"
+fi
+
+if ! impact_sharing_check_target "$TARGET_TEXT"; then
+    impact_die_usage "$IMPACT_STORAGE_ERROR"
+fi
+if ((RESTORE_MODE == 1)) && [[ "$IMPACT_STORAGE_PATH" != "$TARGET_TEXT" ]]; then
+    impact_die "$IMPACT_EXIT_CONFLICT" "The folder of the backup, $TARGET_TEXT, now leads to another place ($IMPACT_STORAGE_PATH) through a symbolic link." \
+        "Nothing was changed. Look at the path by hand: namei -l $TARGET_TEXT"
+fi
+IMPACT_SHARING_TARGET="$IMPACT_STORAGE_PATH"
+IMPACT_SHARING_ROOT="$IMPACT_STORAGE_ROOT"
+
+# Only one impact-share-folder at a time (no lock in a dry run). Other IMPACT
+# commands use other locks and are not held up by a long walk.
+impact_lock share-folder
+# When the command stops early, the backup is marked as interrupted and the
+# changes made so far appear in the summary and the log.
+impact_on_exit impact__sharing_on_exit
+
+# -----------------------------------------------------------------------------
+# 4. Checks that only read. They run in a dry run too.
+# -----------------------------------------------------------------------------
+impact_step "Checks"
+impact_ok "Folder: $IMPACT_SHARING_TARGET (inside the storage root $IMPACT_SHARING_ROOT, file system $(impact_fs_type "$IMPACT_SHARING_TARGET"))."
+if [[ "$TARGET_TEXT" != "$IMPACT_SHARING_TARGET" ]]; then
+    impact_info "The path you gave, $(impact_display "$TARGET_TEXT"), leads there through a symbolic link."
+fi
+impact_ok "Shared group: $GROUP (number $GID_NUMBER)."
+if [[ "$IMPACT_SHARING_STATE" == 'present' ]]; then
+    impact_info "Transition account: $IMPACT_SHARING_ACCOUNT (number $IMPACT_SHARING_UID) gets read and write access on every entry."
+elif [[ "$IMPACT_SHARING_STATE" == 'absent' ]]; then
+    impact_info "Transition account: the access entry of $IMPACT_SHARING_ACCOUNT (number $IMPACT_SHARING_UID) is taken away from every entry."
+fi
+
+# Folders above the target that members cannot enter.
+mapfile -t BLOCKING < <(impact_sharing_blocking_parents "$IMPACT_SHARING_TARGET" "$GID_NUMBER")
+for folder in "${BLOCKING[@]}"; do
+    impact_warn "Members of '$GROUP' cannot enter $folder (neither all others nor the group may enter it), so they cannot reach $IMPACT_SHARING_TARGET. If they should: sudo chmod o+x $folder"
+done
+
+# The transition account needs to reach the folder at all.
+if [[ "$IMPACT_SHARING_STATE" == 'present' ]]; then
+    mapfile -t BLOCKING < <(impact_sharing_blocking_parents_for "$IMPACT_SHARING_TARGET" "$IMPACT_SHARING_ACCOUNT")
+    for folder in "${BLOCKING[@]}"; do
+        impact_warn "The transition account $IMPACT_SHARING_ACCOUNT cannot enter $folder, so it cannot reach $IMPACT_SHARING_TARGET. If it should, give it the right to pass through: sudo setfacl -m u:$IMPACT_SHARING_ACCOUNT:x $folder"
+    done
+fi
+
+# The backup place.
+if [[ -L "$IMPACT_ACL_BACKUP_DIR" || (-e "$IMPACT_ACL_BACKUP_DIR" && ! -d "$IMPACT_ACL_BACKUP_DIR") ]]; then
+    impact_die "$IMPACT_EXIT_FAILED" "$IMPACT_ACL_BACKUP_DIR is no real folder." "Look at it: ls -ld $IMPACT_ACL_BACKUP_DIR"
+fi
+if ((RESTORE_MODE == 0)); then
+    if FREE_KIB="$(impact_sharing_free_kib "$IMPACT_ADMIN_DIR")" && ((FREE_KIB < IMPACT_SHARING_MIN_FREE_KIB)); then
+        if impact_is_dry_run; then
+            impact_warn "Only $((FREE_KIB / 1024)) MiB are free for the backup in $IMPACT_ADMIN_DIR. A real run needs at least 1 GiB and stops before any change."
+        else
+            impact_die "$IMPACT_EXIT_FAILED" "Only $((FREE_KIB / 1024)) MiB are free for the backup in $IMPACT_ADMIN_DIR; at least 1 GiB is needed. Nothing was changed." \
+                "Free space on that disk, then run the command again."
+        fi
+    else
+        impact_ok "There is room for the backup in $IMPACT_ACL_BACKUP_DIR."
+    fi
+    # Earlier runs on this folder that did not finish.
+    shopt -s nullglob
+    for info_file in "$IMPACT_ACL_BACKUP_DIR"/*/run.info; do
+        if grep -qx -- "TARGET=$IMPACT_SHARING_TARGET" "$info_file" 2>/dev/null &&
+            ! grep -qx -- 'STATE=finished' "$info_file" 2>/dev/null; then
+            impact_info "An earlier run on this folder did not finish; its backup stays in $(dirname -- "$info_file"). This run continues the work."
+        fi
+    done
+    shopt -u nullglob
+else
+    impact_ok "Backup: $BACKUP_FOLDER (run of ${IMPACT_SHARING_RUN[STARTED]:-unknown time}, state ${IMPACT_SHARING_RUN[STATE]})."
+    # Newer backups of the same folder should be restored first.
+    shopt -s nullglob
+    for info_file in "$IMPACT_ACL_BACKUP_DIR"/*/run.info; do
+        other="$(dirname -- "$info_file")"
+        if [[ "$(basename -- "$other")" > "$(basename -- "$BACKUP_FOLDER")" ]] &&
+            grep -qx -- "TARGET=$IMPACT_SHARING_TARGET" "$info_file" 2>/dev/null; then
+            impact_warn "A newer backup of the same folder exists: $other. To go back step by step, restore that one first (unless you did so already)."
+        fi
+    done
+    shopt -u nullglob
+fi
+
+# -----------------------------------------------------------------------------
+# 5. The work
+# -----------------------------------------------------------------------------
+WORK_STATUS=0
+if ((RESTORE_MODE == 1)); then
+    impact_step "Saved rights"
+    TEXT="Put back the saved owner, group, mode and ACL of the entries in $BACKUP_FOLDER that differ from it now (entries that changed in another way since the backup are left alone)"
+    if impact_is_dry_run; then
+        impact_do --transient "$TEXT" true
+        IMPACT_SHARING_APPLY=0
+        impact_sharing_restore "$BACKUP_FOLDER" || WORK_STATUS=$?
+    else
+        IMPACT_SHARING_APPLY=1
+        impact_do --transient "$TEXT" impact_sharing_restore "$BACKUP_FOLDER" || WORK_STATUS=$?
+    fi
+    impact_sharing_restore_report
+    if ((IMPACT_SHARING_APPLY == 1)); then
+        DONE_COUNT="${IMPACT_SHARING_COUNT[restored]}"
+    else
+        DONE_COUNT="${IMPACT_SHARING_COUNT[to_restore]}"
+    fi
+    if ((DONE_COUNT > 0)); then
+        impact_changed "Put back the saved rights of $(impact_sharing_count "$DONE_COUNT" entry entries) below $IMPACT_SHARING_TARGET from $BACKUP_FOLDER"
+        impact_undo "Apply the shared rules again: sudo impact-share-folder $IMPACT_SHARING_TARGET"
+    fi
+else
+    impact_step "Shared rules below $IMPACT_SHARING_TARGET"
+    if ((IMPACT_SHARING_QUICK == 1)); then
+        TEXT="Examine every folder below $IMPACT_SHARING_TARGET, and the files that the quick test picks out; apply the shared rules to each entry that deviates, after saving its previous rights"
+    else
+        TEXT="Examine every folder and file below $IMPACT_SHARING_TARGET; apply the shared rules to each entry that deviates, after saving its previous rights"
+    fi
+    if impact_is_dry_run; then
+        impact_do --transient "$TEXT" true
+        IMPACT_SHARING_APPLY=0
+        impact_sharing_walk || WORK_STATUS=$?
+    else
+        IMPACT_SHARING_APPLY=1
+        impact_do --transient "$TEXT" impact_sharing_walk || WORK_STATUS=$?
+    fi
+    impact_sharing_report
+    if ((IMPACT_SHARING_APPLY == 1)); then
+        CHANGED_FOLDERS="${IMPACT_SHARING_COUNT[changed_folders]}"
+        CHANGED_FILES="${IMPACT_SHARING_COUNT[changed_files]}"
+        WHERE="$IMPACT_SHARING_BACKUP"
+    else
+        CHANGED_FOLDERS="${IMPACT_SHARING_COUNT[deviating_folders]}"
+        CHANGED_FILES="${IMPACT_SHARING_COUNT[deviating_files]}"
+        WHERE="a new folder in $IMPACT_ACL_BACKUP_DIR"
+    fi
+    if ((CHANGED_FOLDERS + CHANGED_FILES > 0)); then
+        impact_changed "Apply the shared rules to $(impact_sharing_count "$CHANGED_FOLDERS" folder folders) and $(impact_sharing_count "$CHANGED_FILES" file files) below $IMPACT_SHARING_TARGET (previous rights saved in $WHERE)"
+        if ((IMPACT_SHARING_APPLY == 1)); then
+            impact_undo "Put the previous rights back: sudo impact-share-folder --restore $IMPACT_SHARING_BACKUP"
+            impact_log_note "backup: $IMPACT_SHARING_BACKUP"
+        else
+            impact_undo "Put the previous rights back: sudo impact-share-folder --restore <the backup folder that the real run names>"
+        fi
+    fi
+fi
+
+if ((WORK_STATUS == 2)); then
+    impact_die "$IMPACT_EXIT_FAILED" "The command stopped because the backup could not be written. The group of entries that was being handled was not changed." \
+        "Check the free space and the folder $IMPACT_ACL_BACKUP_DIR, then run the same command again. It continues where it stopped."
+fi
+
+# -----------------------------------------------------------------------------
+# 6. End: "What changed" and "How to undo", or "Nothing to do".
+# -----------------------------------------------------------------------------
+impact_summary
+if ((WORK_STATUS != 0)); then
+    impact_say "Some entries could not be handled (see the warnings above). Fix the cause and run the same command again; it only touches what still deviates."
+    exit "$IMPACT_EXIT_FAILED"
+fi

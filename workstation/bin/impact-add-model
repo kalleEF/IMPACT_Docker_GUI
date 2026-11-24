@@ -1,0 +1,424 @@
+#!/bin/bash
+# =============================================================================
+# impact-add-model: register a model repository on the workstation
+#
+# Purpose
+#   Makes a model known to the workstation, so that colleagues can get their
+#   own working copy of it (impact-get-repo, impact-give-repo). It creates
+#     - the model folder <MODEL_DIR>/<model> with the model file model.conf
+#       (GitHub address, branch, storage name, storage roots) and an empty
+#       folder "extras" for files that are not on GitHub,
+#     - on each named storage root the folders <name>/outputs and
+#       <name>/inputs/synthpop for the model's results and synthetic
+#       populations, with the shared group rules (group, setgid, default
+#       access list) on these new folders themselves.
+#   It never walks through existing content. A storage folder that exists
+#   already is left exactly as it is; when it does not follow the shared
+#   rules, the command says so and names the impact-share-folder line that
+#   applies them to the folder and everything inside it.
+#   A later run with another --storage adds that storage root to the model.
+#
+# Who runs it
+#   The administrator, with sudo.
+#
+# Usage
+#   sudo impact-add-model <model> <github address> --storage <storage root>
+#        --storage-name <name> [--storage <second root>] [--branch <branch>]
+#        [--dry-run]
+#
+# Examples
+#   Show every step without changing anything:
+#     sudo impact-add-model Example-Model git@github.com:example-org/Example-Model.git \
+#          --storage /mnt/disk_a/shared --storage-name Example --dry-run
+#   The same for real: leave out --dry-run.
+#   Later, allow the model on the second disk as well:
+#     sudo impact-add-model Example-Model https://github.com/example-org/Example-Model \
+#          --storage /mnt/disk_b/shared
+#
+# Arguments and options
+#   <model>               the folder name people see in their repository
+#                         folder: a letter or digit, then up to 79 letters,
+#                         digits, _ . or - (for example Example-Model)
+#   <github address>      git@github.com:<owner>/<repository>.git or
+#                         https://github.com/<owner>/<repository>; the model
+#                         file stores the first (SSH) form
+#   --storage <root>      a storage root listed in SHARED_ROOTS of
+#                         /etc/impact/impact.conf; may be given twice. A new
+#                         model needs at least one.
+#   --storage-name <name> the model's folder name on the storage (for example
+#                         Example); needed for a new model. It must match
+#                         "storage_name" in docker_setup/impact_model.json of
+#                         the repository.
+#   --branch <branch>     the branch new working copies start on; without it,
+#                         the default branch of the repository
+#   --dry-run             print every step, change nothing
+#   --help                show this text
+#
+# What it changes on the system
+#   <MODEL_DIR>/<model>/          created (owner root, group SHARED_GROUP,
+#                                 mode 2750: members may read)
+#   <MODEL_DIR>/<model>/extras/   created empty, same owner and mode
+#   <MODEL_DIR>/<model>/model.conf  written (mode 640, root:SHARED_GROUP);
+#                                 a later run only adds storage roots
+#   <storage root>/<name>, .../outputs, .../inputs, .../inputs/synthpop:
+#                                 each folder that does not exist is created
+#                                 (owner root, group SHARED_GROUP, mode 2770)
+#                                 and gets the default access list that makes
+#                                 new files group-writable. Existing folders
+#                                 and all content are never changed.
+#   One block in /opt/impact/admin/log/impact-admin.log.
+#
+# How to undo
+#   The command prints the exact lines at its end. In general:
+#   remove a new storage folder while it is empty: sudo rmdir <folder>
+#   remove the model folder: sudo rm -r <MODEL_DIR>/<model>
+#   (this also deletes the extras; save them first).
+#   A storage root that was added: set the line STORAGE_ROOTS back to its
+#   old value with: sudoedit <MODEL_DIR>/<model>/model.conf
+#
+# Exit codes
+#   0 done or nothing to do; 1 a check or step failed; 2 wrong usage;
+#   3 the workstation is not prepared (run impact-workstation-setup);
+#   4 the request conflicts with the current state (the model exists with
+#   another address, storage name or branch, or a symbolic link or file is
+#   in the place of a folder).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Reading help: bash constructs that appear in this file
+#   NAME=text            store a text in the variable NAME; "$NAME" reads it
+#   local NAME           a variable that exists only inside one function
+#   "$1" "$2" "$@" "$#"  first parameter, second parameter, all parameters,
+#                        number of parameters
+#   "${NAME:-text}"      the value of NAME, or "text" when NAME is unset or empty
+#   $( command )         the text that the command prints
+#   [[ ... ]]            a test: -f plain file, -d folder, -L symbolic link,
+#                        -e exists, -r readable, -x executable, -z empty text,
+#                        -n text with content, == equal, != different,
+#                        =~ matches a pattern
+#   (( ... ))            arithmetic: true when the result is not zero
+#   A && B               run B only when A succeeded
+#   A || B               run B only when A failed
+#   ! command            true when the command fails
+#   if / case / for / while   branches and loops; "case" compares one value
+#                        with several patterns
+#   >file >>file <file   write to a file (replace it / add to its end), read
+#                        from a file
+#   2>/dev/null  >&2     throw error messages away / write to the error channel
+#   command1 | command2  hand the output of command1 to command2
+#   return N / exit N    end the function / the script with status N; 0 means
+#                        success
+#   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+# Constructs beyond these are explained where they are first used.
+# -----------------------------------------------------------------------------
+
+# "set -e" stops the script at the first command that fails, "-u" stops it
+# when a variable is read that was never set, and "-o pipefail" makes a chain
+# of commands joined with "|" fail when any part of it fails.
+set -euo pipefail
+
+# Find this file's real place (the name in /usr/local/bin is a link) and load
+# the shared functions that lie next to it in ../lib.
+IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# The comment lines that start with "shellcheck" tell the checking tool
+# where the loaded files are.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-common.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-models.sh
+source "$IMPACT_LIB_DIR/impact-models.sh"
+impact_init "$IMPACT_SELF"
+
+# -----------------------------------------------------------------------------
+# 1. Options and arguments
+# -----------------------------------------------------------------------------
+impact_parse_args 'dry-run' 'storage-name branch' 'storage' "$@"
+impact_require_arg_count 2 2
+MODEL="${IMPACT_ARGS[0]}"
+ADDRESS="${IMPACT_ARGS[1]}"
+
+# -----------------------------------------------------------------------------
+# 2. Who runs it, settings, log
+# -----------------------------------------------------------------------------
+impact_require_root
+impact_require_conf
+impact_log_enable "$@"
+GROUP="${IMPACT_CONF[SHARED_GROUP]}"
+
+# -----------------------------------------------------------------------------
+# 3. Validate every name and path from input before any use
+# -----------------------------------------------------------------------------
+if ! impact_valid_model_name "$MODEL"; then
+    impact_die_usage "'$(impact_display "$MODEL")' is no valid model name: a letter or digit, then up to 79 letters, digits, _ . or - (and no '.partial' at the end)."
+fi
+if ! impact_parse_github_address "$ADDRESS"; then
+    impact_die_usage "'$(impact_display "$ADDRESS")' is no GitHub repository address. Give git@github.com:<owner>/<repository>.git or https://github.com/<owner>/<repository>."
+fi
+GIVEN_URL="$IMPACT_GH_SSH_URL"
+
+GIVEN_NAME=''
+if impact_opt_given storage-name; then
+    GIVEN_NAME="$(impact_opt storage-name)"
+    if ! impact_valid_storage_name "$GIVEN_NAME"; then
+        impact_die_usage "'$(impact_display "$GIVEN_NAME")' is no valid storage name: a letter or digit, then up to 39 letters, digits, _ . or -."
+    fi
+fi
+
+GIVEN_BRANCH=''
+if impact_opt_given branch; then
+    GIVEN_BRANCH="$(impact_opt branch)"
+    # An empty value (--branch "") means: the default branch.
+    if [[ -n "$GIVEN_BRANCH" ]] && ! impact_valid_branch_name "$GIVEN_BRANCH"; then
+        impact_die_usage "'$(impact_display "$GIVEN_BRANCH")' is no safe git branch name (letters, digits and . _ / - only; see --help)."
+    fi
+fi
+
+GIVEN_ROOTS=()       # the --storage values, each once
+CONFIGURED_ROOTS=()  # SHARED_ROOTS of the settings file
+impact_split_list "${IMPACT_CONF[SHARED_ROOTS]}" CONFIGURED_ROOTS
+RAW_ROOTS=()         # the --storage values as given
+impact_opt_list storage RAW_ROOTS
+for root in "${RAW_ROOTS[@]}"; do
+    if ! impact_valid_abs_path "$root"; then
+        impact_die_usage "'$(impact_display "$root")' is no clean absolute path (letters, digits and . _ / - only, no '..', no '/' at the end)."
+    fi
+    if ! impact_in_list "$root" "${CONFIGURED_ROOTS[@]}"; then
+        impact_die_usage "The storage root $root is not listed in SHARED_ROOTS of $IMPACT_CONF_FILE (${IMPACT_CONF[SHARED_ROOTS]}). Give one of these exactly as written there, or add it with: sudo impact-workstation-setup --shared-roots ..."
+    fi
+    if ! impact_in_list "$root" "${GIVEN_ROOTS[@]}"; then
+        GIVEN_ROOTS+=("$root")
+    fi
+done
+
+# Only one impact-add-model at a time (no lock in a dry run).
+impact_lock models
+
+MODEL_FOLDER="$(impact_model_dir "$MODEL")"
+MODEL_FILE="$MODEL_FOLDER/model.conf"
+EXTRAS_FOLDER="$MODEL_FOLDER/extras"
+
+# -----------------------------------------------------------------------------
+# 4. Checks that only read (they run in a dry run too)
+# -----------------------------------------------------------------------------
+impact_step "Checks"
+impact_require_tools setfacl getfacl realpath stat chown chmod mkdir flock
+
+if ! impact_group_exists "$GROUP"; then
+    impact_die "$IMPACT_EXIT_NOT_PREPARED" "The shared group '$GROUP' does not exist." \
+        "Set the workstation up first: sudo impact-workstation-setup --help"
+fi
+impact_ok "The shared group '$GROUP' exists."
+
+# MODEL_DIR must be a real folder of root: the model files in it steer what
+# the commands do, so no other account may be able to replace them.
+if [[ -L "${IMPACT_CONF[MODEL_DIR]}" || ! -d "${IMPACT_CONF[MODEL_DIR]}" ]] ||
+    [[ "$(stat -c '%U' -- "${IMPACT_CONF[MODEL_DIR]}" 2>/dev/null)" != 'root' ]]; then
+    impact_die "$IMPACT_EXIT_NOT_PREPARED" "The model folder ${IMPACT_CONF[MODEL_DIR]} (MODEL_DIR) is missing or is no folder of root." \
+        "Run sudo impact-workstation-setup, which creates it."
+fi
+impact_ok "The folder for models ${IMPACT_CONF[MODEL_DIR]} exists."
+
+# refuse_if_no_folder PATH
+#   Stops the command (exit code 4) when PATH exists and is no real folder:
+#   a symbolic link (it could lead the following steps somewhere else) or a
+#   file.
+refuse_if_no_folder() {
+    if [[ -L "$1" ]]; then
+        impact_die "$IMPACT_EXIT_CONFLICT" "$1 is a symbolic link. A real folder is expected here, and the command does not work through links." \
+            "Look at it with: ls -ld $1   Remove the link (sudo rm $1) if it is not needed, then run the command again."
+    fi
+    if [[ -e "$1" && ! -d "$1" ]]; then
+        impact_die "$IMPACT_EXIT_CONFLICT" "$1 exists and is no folder." \
+            "Look at it with: ls -ld $1   Move it away, then run the command again."
+    fi
+}
+refuse_if_no_folder "$MODEL_FOLDER"
+refuse_if_no_folder "$EXTRAS_FOLDER"
+if [[ -L "$MODEL_FILE" || (-e "$MODEL_FILE" && ! -f "$MODEL_FILE") ]]; then
+    impact_die "$IMPACT_EXIT_CONFLICT" "$MODEL_FILE is no plain file." "Look at it with: ls -ld $MODEL_FILE"
+fi
+
+# Is the model known already? Then the new values must agree with the file.
+OLD_ROOTS_TEXT=''
+if [[ -e "$MODEL_FILE" ]]; then
+    load_status=0
+    impact_model_load "$MODEL" || load_status=$?
+    if ((load_status != 0)); then
+        for text in "${IMPACT_MODEL_ERRORS[@]}"; do
+            impact_error "$text"
+        done
+        impact_die "$IMPACT_EXIT_FAILED" "The existing model file $MODEL_FILE is invalid, so it is not changed." \
+            "Correct the lines named above with: sudoedit $MODEL_FILE   Then run the command again."
+    fi
+    OLD_ROOTS_TEXT="${IMPACT_MODEL[STORAGE_ROOTS]}"
+    impact_ok "The model '$MODEL' exists already. This run only adds what is missing."
+    if ! impact_git_same_repo "$GIVEN_URL" "${IMPACT_MODEL[REPO_URL]}"; then
+        impact_die "$IMPACT_EXIT_CONFLICT" "The model '$MODEL' is registered with the address ${IMPACT_MODEL[REPO_URL]}, and this run names $GIVEN_URL." \
+            "Check the address. If the model really moved to another repository, change the line REPO_URL with: sudoedit $MODEL_FILE   (existing working copies keep their old address)."
+    fi
+    if [[ -n "$GIVEN_NAME" && "$GIVEN_NAME" != "${IMPACT_MODEL[STORAGE_NAME]}" ]]; then
+        impact_die "$IMPACT_EXIT_CONFLICT" "The model '$MODEL' uses the storage name ${IMPACT_MODEL[STORAGE_NAME]}, and this run names $GIVEN_NAME." \
+            "Leave out --storage-name to keep the existing name. A different name would separate the model from its existing results."
+    fi
+    if impact_opt_given branch && [[ "$GIVEN_BRANCH" != "${IMPACT_MODEL[BRANCH]}" ]]; then
+        impact_die "$IMPACT_EXIT_CONFLICT" "The model '$MODEL' uses the branch '${IMPACT_MODEL[BRANCH]:-(default branch)}', and this run names '${GIVEN_BRANCH:-(default branch)}'." \
+            "Leave out --branch to keep it. To change it on purpose, edit the line BRANCH with: sudoedit $MODEL_FILE   (existing working copies keep their branch)."
+    fi
+    REPO_URL="${IMPACT_MODEL[REPO_URL]}"
+    STORAGE_NAME="${IMPACT_MODEL[STORAGE_NAME]}"
+    BRANCH="${IMPACT_MODEL[BRANCH]}"
+else
+    if [[ -z "$GIVEN_NAME" ]]; then
+        impact_die_usage "A new model needs --storage-name <name>: the model's folder name on the storage (\"storage_name\" in docker_setup/impact_model.json)."
+    fi
+    if ((${#GIVEN_ROOTS[@]} == 0)); then
+        impact_die_usage "A new model needs at least one --storage <storage root> (one of: ${IMPACT_CONF[SHARED_ROOTS]})."
+    fi
+    REPO_URL="$GIVEN_URL"
+    STORAGE_NAME="$GIVEN_NAME"
+    BRANCH="$GIVEN_BRANCH"
+fi
+ROOTS_TEXT="$(impact_models_roots_union "$OLD_ROOTS_TEXT" "${GIVEN_ROOTS[@]}")"
+ROOTS=()
+impact_split_list "$ROOTS_TEXT" ROOTS
+
+# Check every storage root and every folder the model needs there.
+declare -A REAL_ROOT=()   # storage root as written -> the same with links resolved
+for root in "${ROOTS[@]}"; do
+    if ! real="$(impact_storage_real_root "$root")"; then
+        impact_die "$IMPACT_EXIT_NOT_PREPARED" "The storage root $root does not exist." \
+            "Run sudo impact-workstation-setup, which creates missing storage roots, or mount the disk."
+    fi
+    if impact_is_system_path "$real" || impact_is_home_path "$real"; then
+        impact_die "$IMPACT_EXIT_FAILED" "The storage root $root leads to $real, a system or home folder." \
+            "Correct SHARED_ROOTS with impact-workstation-setup."
+    fi
+    REAL_ROOT[$root]="$real"
+    # "mapfile -t" reads the lines of a command's output into a list; "< <(...)"
+    # (process substitution) hands it that output.
+    mapfile -t folders < <(impact_models_storage_folders "$real/$STORAGE_NAME")
+    for folder in "${folders[@]}"; do
+        refuse_if_no_folder "$folder"
+    done
+    impact_ok "The storage root $root can take the model's folders."
+done
+
+# The values of the model file. "declare -A" creates a list whose entries
+# are found by name.
+# shellcheck disable=SC2034
+# Reason for SC2034 (variable appears unused): the library functions read
+# VALUES through its name (impact_model_validate VALUES).
+declare -A VALUES=(
+    [MODEL_CONF_VERSION]=1
+    [REPO_URL]="$REPO_URL"
+    [BRANCH]="$BRANCH"
+    [STORAGE_NAME]="$STORAGE_NAME"
+    [STORAGE_ROOTS]="$ROOTS_TEXT"
+)
+if ! impact_model_validate VALUES; then
+    for text in "${IMPACT_MODEL_ERRORS[@]}"; do
+        impact_error "$text"
+    done
+    impact_die "$IMPACT_EXIT_FAILED" "The values for the model file do not pass the checks." ""
+fi
+impact_info "Address:       $REPO_URL"
+impact_info "Branch:        ${BRANCH:-(the default branch of the repository)}"
+impact_info "Storage name:  $STORAGE_NAME"
+impact_info "Storage roots: $ROOTS_TEXT"
+
+# -----------------------------------------------------------------------------
+# 5. Steps. Pattern for every change: look first, change only what deviates.
+# -----------------------------------------------------------------------------
+
+# ensure_model_folder PATH TEXT
+#   Creates the folder PATH with owner root, group GROUP and mode 2750, or
+#   corrects these three facts of the existing folder itself. Its content
+#   is never touched.
+ensure_model_folder() {
+    local path="$1" text="$2"
+    if impact_dir_is "$path" "$IMPACT_MODEL_FOLDER_MODE" root "$GROUP"; then
+        impact_ok "$path is in order."
+    elif [[ -d "$path" ]]; then
+        impact_do "Correct the folder $path ($text) to owner root, group $GROUP, mode $IMPACT_MODEL_FOLDER_MODE (its content is not touched)" \
+            impact_make_dir "$path" "$IMPACT_MODEL_FOLDER_MODE" root "$GROUP" ||
+            impact_die "$IMPACT_EXIT_FAILED" "The folder $path could not be corrected." ""
+    else
+        impact_do "Create the folder $path ($text; owner root, group $GROUP, mode $IMPACT_MODEL_FOLDER_MODE)" \
+            impact_make_dir "$path" "$IMPACT_MODEL_FOLDER_MODE" root "$GROUP" ||
+            impact_die "$IMPACT_EXIT_FAILED" "The folder $path could not be created." ""
+        NEW_MODEL_FOLDERS+=("$path")
+    fi
+}
+
+NEW_MODEL_FOLDERS=()
+impact_step "Model folder"
+ensure_model_folder "$MODEL_FOLDER" "the administrator's folder of the model"
+ensure_model_folder "$EXTRAS_FOLDER" "extra files for new working copies"
+if ((${#NEW_MODEL_FOLDERS[@]} > 0)); then
+    impact_undo "Remove the model folder (this deletes model.conf and the extras; save extras first): sudo rm -r $MODEL_FOLDER"
+fi
+
+impact_step "Model file"
+if [[ ! -e "$MODEL_FILE" ]]; then
+    impact_do "Write $MODEL_FILE (address, branch, storage name, storage roots; mode 640, owner root, group $GROUP)" \
+        impact_model_conf_write "$MODEL_FILE" VALUES ||
+        impact_die "$IMPACT_EXIT_FAILED" "The model file could not be written." ""
+elif impact_model_conf_needs_write "$MODEL_FILE" VALUES; then
+    impact_do "Update $MODEL_FILE: STORAGE_ROOTS=$ROOTS_TEXT (it was $OLD_ROOTS_TEXT)" \
+        impact_model_conf_write "$MODEL_FILE" VALUES ||
+        impact_die "$IMPACT_EXIT_FAILED" "The model file could not be written." ""
+    impact_undo "Set the line back to STORAGE_ROOTS=$OLD_ROOTS_TEXT with: sudoedit $MODEL_FILE"
+elif ! impact_file_is "$MODEL_FILE" 640 root "$GROUP"; then
+    # The content is right, owner, group or mode are not. Writing the same
+    # content again sets all three.
+    impact_do "Correct owner, group and mode of $MODEL_FILE to root, $GROUP, 640" \
+        impact_model_conf_write "$MODEL_FILE" VALUES ||
+        impact_die "$IMPACT_EXIT_FAILED" "The model file could not be written." ""
+else
+    impact_ok "$MODEL_FILE is up to date."
+fi
+
+impact_step "Storage folders"
+EXISTING_BASES=()   # model folders on the storage that existed before this run
+for root in "${ROOTS[@]}"; do
+    base="${REAL_ROOT[$root]}/$STORAGE_NAME"
+    if [[ -d "$base" ]]; then
+        EXISTING_BASES+=("$base")
+    fi
+    created_here=()
+    mapfile -t folders < <(impact_models_storage_folders "$base")
+    for folder in "${folders[@]}"; do
+        if [[ -d "$folder" ]]; then
+            if impact_shared_dir_is_ok "$folder" "$GROUP"; then
+                impact_ok "$folder exists and follows the shared rules."
+            else
+                impact_warn "$folder exists and does not follow the shared rules (group $GROUP, setgid, default access list). It was left as it is. To apply the rules to it and to everything inside it, run: sudo impact-share-folder $folder --dry-run   and then the same without --dry-run."
+            fi
+        else
+            impact_do "Create the folder $folder (owner root, group $GROUP, mode $IMPACT_MODEL_STORAGE_MODE, default access list; this folder only)" \
+                impact_models_create_shared_dir "$folder" "$GROUP" ||
+                impact_die "$IMPACT_EXIT_FAILED" "The storage folder $folder could not be created with the shared rules." \
+                    "Read the error above. The command is safe to run again after the cause is fixed."
+            # The newest folder goes first: "rmdir" must remove the inner
+            # folders before the outer ones.
+            created_here=("$folder" "${created_here[@]}")
+        fi
+    done
+    if ((${#created_here[@]} > 0)); then
+        impact_undo "Remove the new storage folders while they are empty: sudo rmdir ${created_here[*]}"
+    fi
+done
+
+# -----------------------------------------------------------------------------
+# 6. Next steps, then the summary
+# -----------------------------------------------------------------------------
+impact_step "Next steps"
+for base in "${EXISTING_BASES[@]}"; do
+    impact_info "$base existed before this run. Its content was not examined. If it holds files from before the shared rules, run: sudo impact-share-folder $base --dry-run"
+done
+impact_info "Extra files that are not on GitHub go into $EXTRAS_FOLDER, at their path inside the repository."
+impact_info "Then check them with: sudo impact-check-model $MODEL"
+impact_info "Give a person a working copy with: sudo impact-give-repo <account> $MODEL"
+
+impact_summary

@@ -1,0 +1,328 @@
+#!/bin/bash
+# =============================================================================
+# impact-clean-images: list, and on request remove, Docker images of the GUI
+#               that nobody needs any more
+#
+# Purpose
+#   The GUI builds one Docker image per person and model on this machine,
+#   named <repository>:<account> and labelled impact.account=<account>.
+#   Images take a lot of space on the system disk. This command lists every
+#   such image with its size and one of these decisions:
+#     REMOVE  the account was removed (impact-remove-user) or no longer
+#             exists;
+#     REMOVE  the person has no working copy of that model any more (no
+#             folder of that name in the person's repository folder);
+#     REMOVE  an old build without a name (a newer build took its name);
+#     KEEP    a container uses the image (running or stopped), or the person
+#             still has the working copy, or the label is no account name.
+#   Images without the label impact.account (base images, images of other
+#   tools) are never touched.
+#   By default the command only lists. With --remove it asks for a
+#   confirmation and then removes the images marked REMOVE.
+#
+# Who runs it
+#   The administrator, with sudo, when the system disk fills up and after
+#   people were removed.
+#
+# Usage
+#   sudo impact-clean-images [--remove [--yes]] [--dry-run]
+#
+# Examples
+#   List the images and the decisions (changes nothing):
+#     sudo impact-clean-images
+#   Remove the images marked REMOVE, after a question:
+#     sudo impact-clean-images --remove
+#   Show what --remove would do, remove nothing:
+#     sudo impact-clean-images --remove --dry-run
+#
+# Options
+#   --remove     remove the images marked REMOVE (after a confirmation)
+#   --yes        answer the confirmation with yes (for --remove)
+#   --dry-run    show every step, remove nothing
+#   --help       show this text
+#
+# What it changes on the system
+#   Without --remove: nothing.
+#   With --remove: removes the listed images from Docker ("docker image rm",
+#   never forced: Docker refuses to remove an image that a container uses).
+#   One block in /opt/impact/admin/log/impact-admin.log.
+#
+# How to undo
+#   A removed image cannot be brought back. The GUI builds it again at the
+#   next Start of that person and model; this takes as long as a first
+#   build. No data is lost: the work of a person lives in the working copy
+#   and on the shared storage, never in an image.
+#
+# Exit codes
+#   0 done or nothing to do; 1 a step failed, Docker does not answer, or the
+#   confirmation was not given; 2 wrong usage; 3 the workstation is not
+#   prepared; 4 another impact-clean-images runs.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Reading help: bash constructs that appear in this file
+#   NAME=text            store a text in the variable NAME; "$NAME" reads it
+#   local NAME           a variable that exists only inside one function
+#   "$1" "$2" "$@" "$#"  first parameter, second parameter, all parameters,
+#                        number of parameters
+#   "${NAME:-text}"      the value of NAME, or "text" when NAME is unset or empty
+#   $( command )         the text that the command prints
+#   [[ ... ]]            a test: -f plain file, -d folder, -L symbolic link,
+#                        -e exists, -r readable, -x executable, -z empty text,
+#                        -n text with content, == equal, != different,
+#                        =~ matches a pattern
+#   (( ... ))            arithmetic: true when the result is not zero
+#   A && B               run B only when A succeeded
+#   A || B               run B only when A failed
+#   ! command            true when the command fails
+#   if / case / for / while   branches and loops; "case" compares one value
+#                        with several patterns
+#   >file >>file <file   write to a file (replace it / add to its end), read
+#                        from a file
+#   2>/dev/null  >&2     throw error messages away / write to the error channel
+#   command1 | command2  hand the output of command1 to command2
+#   return N / exit N    end the function / the script with status N; 0 means
+#                        success
+#   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+# Constructs beyond these are explained where they are first used.
+# -----------------------------------------------------------------------------
+
+# "set -e" stops the script at the first command that fails, "-u" stops it
+# when a variable is read that was never set, and "-o pipefail" makes a chain
+# of commands joined with "|" fail when any part of it fails.
+set -euo pipefail
+
+# Find this file's real place (the name in /usr/local/bin is a link) and load
+# the shared functions that lie next to it in ../lib.
+IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# The comment lines that start with "shellcheck" tell the checking tool
+# where the loaded files are.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-common.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-sharing.sh
+source "$IMPACT_LIB_DIR/impact-sharing.sh"
+impact_init "$IMPACT_SELF"
+
+# -----------------------------------------------------------------------------
+# 1. Options and arguments
+# -----------------------------------------------------------------------------
+impact_parse_args 'dry-run remove yes' '' '' "$@"
+impact_require_arg_count 0 0
+REMOVE=0
+if impact_opt_given remove; then
+    REMOVE=1
+elif impact_opt_given yes; then
+    impact_die_usage "--yes answers the question of --remove; give it together with --remove."
+fi
+
+# -----------------------------------------------------------------------------
+# 2. Who runs it, settings, log
+# -----------------------------------------------------------------------------
+impact_require_root
+impact_require_conf
+if ((REMOVE == 1)); then
+    # Only a run with --remove changes something and writes a log block.
+    impact_log_enable "$@"
+fi
+impact_require_tools docker getent find timeout
+if ((REMOVE == 1)); then
+    impact_lock images
+fi
+
+# -----------------------------------------------------------------------------
+# 3. Checks that only read. They run in a dry run too.
+# -----------------------------------------------------------------------------
+impact_step "Checks"
+if ! impact_docker_daemon_reachable; then
+    impact_die "$IMPACT_EXIT_FAILED" "Docker does not answer on this machine." \
+        "Check the service: systemctl status docker   (start it with: sudo systemctl start docker)"
+fi
+impact_ok "Docker answers (server version $(impact_docker_server_version || printf 'unknown'))."
+
+# -----------------------------------------------------------------------------
+# 4. The images of the GUI and the decisions
+# -----------------------------------------------------------------------------
+impact_step "Images of the GUI"
+
+# The images with the label impact.account (their full numbers, each once).
+mapfile -t IMAGE_IDS < <(impact_docker_ro image ls --all --no-trunc --quiet --filter label=impact.account | LC_ALL=C sort -u)
+# The images that containers use, running or stopped.
+declare -A IN_USE=()
+mapfile -t CONTAINERS < <(impact_docker_ro ps --all --no-trunc --quiet)
+if ((${#CONTAINERS[@]} > 0)); then
+    while IFS='|' read -r image name; do
+        if impact_sharing_valid_image_id "$image"; then
+            IN_USE[$image]+="${IN_USE[$image]:+, }${name#/}"
+        fi
+    done < <(impact_docker_ro container inspect --format '{{.Image}}|{{.Name}}' "${CONTAINERS[@]}")
+fi
+
+# account_state ACCOUNT
+#   Prints active, removed (record says removed, or the account is
+#   expired), gone (no such account) or invalid (no account name).
+account_state() {
+    local account="$1"
+    if ! impact_valid_account_name "$account"; then
+        printf 'invalid\n'
+    elif ! impact_account_exists "$account"; then
+        printf 'gone\n'
+    elif impact_account_is_expired "$account" ||
+        { impact_account_record_load "$account" >/dev/null 2>&1 && [[ "${IMPACT_ACCOUNT_RECORD[STATE]}" == 'removed' ]]; }; then
+        printf 'removed\n'
+    else
+        printf 'active\n'
+    fi
+}
+
+# The script below runs with the rights of the person and prints the names
+# of the folders in the person's repository folder ($1). Exit code 4: the
+# repository folder does not exist. It is stored in a variable with a
+# here-document; 'END' in quotes keeps every character as written.
+LIST_COPIES_SCRIPT="$(
+    cat <<'END'
+[ -d "$1" ] || exit 4
+cd -- "$1" || exit 1
+find . -mindepth 1 -maxdepth 1 -type d -printf '%f\n'
+END
+)"
+
+declare -A COPIES=()       # account -> folder names in lower case
+declare -A COPIES_OK=()    # account -> 1 when the list could be read
+# read_copies ACCOUNT
+#   Fills COPIES and COPIES_OK for ACCOUNT, once. The folders are listed
+#   with the rights of the person (a home folder is never read by root).
+read_copies() {
+    local account="$1" base output status=0 name list=''
+    [[ -v COPIES_OK[$account] ]] && return 0
+    COPIES_OK[$account]=0
+    base="$(impact_repo_base_for "$account")" || return 0
+    output="$(impact_run_as "$account" /bin/sh -c "$LIST_COPIES_SCRIPT" impact-list-copies "$base" 2>/dev/null)" || status=$?
+    if ((status != 0 && status != 4)); then
+        return 0
+    fi
+    while IFS= read -r name; do
+        if [[ -n "$name" ]] && impact_valid_model_name "$name"; then
+            list+=" $(impact_lower "$name")"
+        fi
+    done <<<"$output"
+    COPIES[$account]="$list"
+    COPIES_OK[$account]=1
+}
+
+# reason_text WORD
+#   Prints the decision reason in plain words.
+reason_text() {
+    case "$1" in
+        in_use) printf 'a container uses it (%s)' "$2" ;;
+        not_impact) printf 'its label impact.account is no account name' ;;
+        account_removed) printf 'the account %s was removed' "$2" ;;
+        no_repository_copy) printf '%s has no working copy of this model any more' "$2" ;;
+        unnamed) printf 'an old build without a name' ;;
+        repository_copy) printf '%s has a working copy of this model' "$2" ;;
+        copies_unknown) printf 'the working copies of %s could not be listed' "$2" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+CANDIDATES=()        # references to remove: name:tag or image number
+CANDIDATE_TEXTS=()   # the matching step texts
+KEEP_COUNT=0
+REMOVE_BYTES=0
+for id in "${IMAGE_IDS[@]}"; do
+    impact_sharing_valid_image_id "$id" || continue
+    facts="$(impact_docker_ro image inspect --format '{{index .Config.Labels "impact.account"}}|{{.Size}}|{{.Created}}|{{join .RepoTags " "}}' "$id")" || continue
+    IFS='|' read -r account size created tags <<<"$facts"
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+    state="$(account_state "$account")"
+    shown_account="$(impact_display "$account")"
+    if [[ "$state" == 'active' ]]; then
+        read_copies "$account"
+        if [[ "${COPIES_OK[$account]}" != '1' ]]; then
+            state='unknown'
+        fi
+    fi
+    names=()
+    read -r -a names <<<"$tags"
+    if ((${#names[@]} == 0)); then
+        names=('')
+    fi
+    for name in "${names[@]}"; do
+        if [[ -n "$name" ]] && ! impact_sharing_valid_image_name "$name"; then
+            impact_info "$(printf 'KEEP    %s: a name of another form, left alone' "$(impact_display "$name")")"
+            KEEP_COUNT=$((KEEP_COUNT + 1))
+            continue
+        fi
+        in_use='no'
+        [[ -v IN_USE[$id] ]] && in_use='yes'
+        decision="$(impact_sharing_image_decision "$in_use" "$state" "$name" "${COPIES[$account]:-}")"
+        word="${decision#* }"
+        detail="$shown_account"
+        [[ "$word" == 'in_use' ]] && detail="${IN_USE[$id]}"
+        label="${name:-$id}"
+        line="$(printf '%-40s account %s, %s, built %s' "$label" "$shown_account" "$(impact_sharing_bytes "$size")" "${created%%T*}")"
+        if [[ "$decision" == remove* ]]; then
+            impact_info "REMOVE  $line: $(reason_text "$word" "$detail")"
+            CANDIDATES+=("${name:-$id}")
+            CANDIDATE_TEXTS+=("Remove the image $label (account $shown_account): $(reason_text "$word" "$detail")")
+            REMOVE_BYTES=$((REMOVE_BYTES + size))
+        else
+            impact_info "KEEP    $line: $(reason_text "$word" "$detail")"
+            KEEP_COUNT=$((KEEP_COUNT + 1))
+        fi
+    done
+done
+if ((${#IMAGE_IDS[@]} == 0)); then
+    impact_ok "No image carries the label impact.account."
+fi
+impact_ok "To keep: $KEEP_COUNT. To remove: ${#CANDIDATES[@]} (about $(impact_sharing_bytes "$REMOVE_BYTES"); layers that other images share stay)."
+
+# -----------------------------------------------------------------------------
+# 5. Removal (only with --remove)
+# -----------------------------------------------------------------------------
+
+# remove_image REFERENCE
+#   Removes one image name, or an image without a name by its number. Never
+#   forced: Docker refuses when a container uses the image.
+remove_image() {
+    timeout 300 docker image rm -- "$1" >/dev/null
+}
+
+if ((REMOVE == 0)); then
+    if ((${#CANDIDATES[@]} > 0)); then
+        impact_say ""
+        impact_say "Nothing was removed. To remove the $(impact_sharing_count "${#CANDIDATES[@]}" image images) marked REMOVE: sudo impact-clean-images --remove"
+    else
+        impact_say ""
+        impact_say "Nothing to remove."
+    fi
+    exit "$IMPACT_EXIT_OK"
+fi
+
+impact_step "Remove images"
+FAILED=0
+if ((${#CANDIDATES[@]} > 0)); then
+    if ! impact_confirm "Remove $(impact_sharing_count "${#CANDIDATES[@]}" image images) (about $(impact_sharing_bytes "$REMOVE_BYTES"))? They cannot be brought back; the GUI builds them again when they are needed."; then
+        impact_die "$IMPACT_EXIT_FAILED" "Stopped: the removal was not confirmed. Nothing was removed." \
+            "Run the command again in a terminal and type yes, or add --yes after checking the list."
+    fi
+    for index in "${!CANDIDATES[@]}"; do
+        reference="${CANDIDATES[index]}"
+        # Every name that reaches docker is checked once more.
+        if ! impact_sharing_valid_image_name "$reference" && ! impact_sharing_valid_image_id "$reference"; then
+            impact_error "The image reference '$(impact_display "$reference")' has an unexpected form; it is left alone."
+            FAILED=1
+            continue
+        fi
+        impact_do "${CANDIDATE_TEXTS[index]}" remove_image "$reference" || FAILED=1
+    done
+    impact_undo "A removed image cannot be brought back. The GUI builds it again at the next Start of that person and model."
+else
+    impact_ok "Nothing to remove."
+fi
+impact_summary
+if ((FAILED == 1)); then
+    impact_say "Some images could not be removed (see the errors above). A container that uses an image keeps it; remove the container first if it is not needed."
+    exit "$IMPACT_EXIT_FAILED"
+fi

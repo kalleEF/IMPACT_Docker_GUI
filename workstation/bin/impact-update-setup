@@ -1,0 +1,315 @@
+#!/bin/bash
+# =============================================================================
+# impact-update-setup: bring the folder docker_setup of your copy up to date
+#
+# Purpose
+#   Copies the folder docker_setup (the files from which the container image
+#   is built) from the current state of the model's repository on GitHub
+#   into your working copy, and shows the result with "git status". Nothing
+#   else in the copy changes: no other folder, no branch, no commit. The new
+#   files are staged ("Changes to be committed"); they go to GitHub with
+#   your next commit, for example at Stop in the GUI.
+#   The GUI offers this when the docker_setup of a copy is too old to start.
+#   When your copy has changes of its own in docker_setup that are not
+#   committed, the command stops and changes nothing, so no work is lost.
+#
+# Who runs it
+#   Each person, as themselves and never with sudo, usually through the GUI.
+#
+# Usage
+#   impact-update-setup <model> [--github-name <name>] [--branch <branch>] [--dry-run]
+#
+# Examples
+#   impact-update-setup Example-Model --dry-run    show every step, change nothing
+#   impact-update-setup Example-Model              copy docker_setup from GitHub
+#   impact-update-setup Example-Model --branch dev-example
+#
+# Options
+#   --github-name <name>  use the key copy ~/.ssh/id_ed25519_<name>. Without
+#                         it, the only key copy of that form is used.
+#   --branch <branch>     take docker_setup from this branch on GitHub.
+#                         Without it: the branch of the model settings
+#                         (BRANCH in model.conf), or the repository's default
+#                         branch.
+#   --dry-run             print every step, change nothing (GitHub is not
+#                         contacted)
+#   --help                show this text
+#
+# What it changes on the system
+#   In your copy <REPO_BASE>/<model>: the files of docker_setup (changed,
+#   new and removed files, in the folder and in git's list of staged
+#   changes). Fetching from GitHub stores the downloaded data in the copy's
+#   .git folder under a temporary name that is removed at the end; that is
+#   no visible change.
+#
+# How to undo
+#   Put the previous docker_setup back (the last committed state):
+#     git -C <copy> restore --source=HEAD --staged --worktree -- docker_setup
+#   (the command prints the exact line).
+#
+# Last line of the output (for the GUI)
+#   IMPACT_RESULT status=<ok|error> code=<exit code> path=<copy> reason=<word>
+#   Reasons: updated, up_to_date, dry_run, no_copy, wrong_origin,
+#   local_changes, no_docker_setup, no_key, several_keys, key_unusable,
+#   key_refused, no_access, host_key, network, branch_missing, busy,
+#   git_failed, unknown_model, model_invalid, not_prepared, run_as_root,
+#   usage, interrupted.
+#
+# Exit codes
+#   0 done or nothing to do (also a dry run); 1 a check or step failed (for
+#   example no copy of the model); 2 wrong usage (also: started as root);
+#   3 the workstation is not prepared; 4 the copy conflicts (changes of your
+#   own in docker_setup, or the copy belongs to another repository, or
+#   another command works in the folder); 5 no access; 6 network problem.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Reading help: bash constructs that appear in this file
+#   NAME=text            store a text in the variable NAME; "$NAME" reads it
+#   local NAME           a variable that exists only inside one function
+#   "$1" "$2" "$@" "$#"  first parameter, second parameter, all parameters,
+#                        number of parameters
+#   "${NAME:-text}"      the value of NAME, or "text" when NAME is unset or empty
+#   $( command )         the text that the command prints
+#   [[ ... ]]            a test: -f plain file, -d folder, -L symbolic link,
+#                        -e exists, -r readable, -x executable, -z empty text,
+#                        -n text with content, == equal, != different,
+#                        =~ matches a pattern
+#   (( ... ))            arithmetic: true when the result is not zero
+#   A && B               run B only when A succeeded
+#   A || B               run B only when A failed
+#   ! command            true when the command fails
+#   if / case / for / while   branches and loops; "case" compares one value
+#                        with several patterns
+#   >file >>file <file   write to a file (replace it / add to its end), read
+#                        from a file
+#   2>/dev/null  >&2     throw error messages away / write to the error channel
+#   command1 | command2  hand the output of command1 to command2
+#   return N / exit N    end the function / the script with status N; 0 means
+#                        success
+#   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+# Constructs beyond these are explained where they are first used.
+# -----------------------------------------------------------------------------
+
+# "set -e" stops the script at the first command that fails, "-u" stops it
+# when a variable is read that was never set, and "-o pipefail" makes a chain
+# of commands joined with "|" fail when any part of it fails.
+set -euo pipefail
+
+# Find this file's real place (the name in /usr/local/bin is a link) and load
+# the shared functions that lie next to it in ../lib.
+IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-common.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-models.sh
+source "$IMPACT_LIB_DIR/impact-models.sh"
+impact_init "$IMPACT_SELF"
+
+# From here on the last line of output is the IMPACT_RESULT line, however the
+# command ends.
+impact_result_enable
+
+# -----------------------------------------------------------------------------
+# 1. Options, who runs it, settings, model
+# -----------------------------------------------------------------------------
+impact_parse_args 'dry-run' 'github-name branch' '' "$@"
+impact_require_arg_count 1 1
+MODEL="${IMPACT_ARGS[0]}"
+impact_require_not_root
+impact_require_conf
+if ! impact_valid_model_name "$MODEL"; then
+    impact_die_usage "'$(impact_display "$MODEL")' is no valid model name."
+fi
+impact_require_model "$MODEL"
+impact_git_clean_env
+
+GITHUB_NAME=''
+if impact_opt_given github-name; then
+    GITHUB_NAME="$(impact_opt github-name)"
+    if ! impact_valid_github_name "$GITHUB_NAME"; then
+        impact_die_usage "'$(impact_display "$GITHUB_NAME")' is no valid GitHub name."
+    fi
+fi
+BRANCH="${IMPACT_MODEL[BRANCH]}"
+if impact_opt_given branch; then
+    BRANCH="$(impact_opt branch)"
+    if ! impact_valid_branch_name "$BRANCH"; then
+        impact_die_usage "'$(impact_display "$BRANCH")' is no safe git branch name (letters, digits and . _ / - only)."
+    fi
+fi
+
+ACCOUNT="$(id -un)"
+if ! impact_valid_account_name "$ACCOUNT"; then
+    impact_die "$IMPACT_EXIT_FAILED" "The account name '$(impact_display "$ACCOUNT")' does not follow the rules for IMPACT accounts." \
+        "Contact $(impact_contact_text)."
+fi
+HOME_DIR="$(impact_account_home "$ACCOUNT")" || HOME_DIR=''
+if ! impact_valid_abs_path "$HOME_DIR"; then
+    impact_die "$IMPACT_EXIT_FAILED" "The home folder of '$ACCOUNT' is no usable path." "Contact $(impact_contact_text)."
+fi
+if ! REPO_BASE_DIR="$(impact_repo_base_for "$ACCOUNT")"; then
+    impact_die "$IMPACT_EXIT_FAILED" "The repository folder cannot be worked out from REPO_BASE in $IMPACT_CONF_FILE." \
+        "Contact $(impact_contact_text)."
+fi
+COPY="$REPO_BASE_DIR/$MODEL"
+REPO_URL="${IMPACT_MODEL[REPO_URL]}"
+impact_result_set "$COPY"
+
+# -----------------------------------------------------------------------------
+# 2. Checks that only read (they run in a dry run too)
+# -----------------------------------------------------------------------------
+impact_step "Checks"
+impact_require_tools git ssh flock
+impact_info "Model: $MODEL ($REPO_URL)"
+impact_info "Copy:  $COPY"
+
+if [[ -L "$COPY" || ! -d "$COPY" ]] ||
+    [[ "$(impact_git -C "$COPY" rev-parse --show-toplevel 2>/dev/null)" != "$COPY" ]]; then
+    impact_die_reason "$IMPACT_EXIT_FAILED" no_copy "There is no working copy of $MODEL at $COPY." \
+        "Make one first with the GUI (Add repository) or: impact-get-repo $MODEL"
+fi
+origin="$(impact_git -C "$COPY" config --get remote.origin.url 2>/dev/null)" || origin=''
+if ! impact_git_same_repo "$origin" "$REPO_URL"; then
+    impact_die_reason "$IMPACT_EXIT_CONFLICT" wrong_origin "The copy $COPY belongs to '$(impact_display "$origin")', and the model $MODEL to $REPO_URL. Nothing was changed." \
+        "Contact $(impact_contact_text)."
+fi
+impact_ok "$COPY is a working copy of $REPO_URL."
+
+# The key copy (same rules as impact-get-repo).
+if [[ -n "$GITHUB_NAME" ]]; then
+    KEY="$(impact_key_copy_path "$HOME_DIR" "$GITHUB_NAME")"
+else
+    KEY_NAMES=()
+    mapfile -t KEY_NAMES < <(impact_key_copy_names "$HOME_DIR")
+    if ((${#KEY_NAMES[@]} == 0)); then
+        impact_die_reason "$IMPACT_EXIT_NO_ACCESS" no_key "There is no key copy in $HOME_DIR/.ssh (a file named id_ed25519_<GitHub name>)." \
+            "The GUI places the key copy at your REMOTE start. Contact: $(impact_contact_text)."
+    fi
+    if ((${#KEY_NAMES[@]} > 1)); then
+        impact_die_reason "$IMPACT_EXIT_USAGE" several_keys "There are several key copies in $HOME_DIR/.ssh (${KEY_NAMES[*]})." \
+            "Name your GitHub name: $IMPACT_CMD $MODEL --github-name <name>"
+    fi
+    KEY="$(impact_key_copy_path "$HOME_DIR" "${KEY_NAMES[0]}")"
+fi
+if ! impact_key_copy_usable "$KEY"; then
+    if [[ ! -e "$KEY" && ! -L "$KEY" ]]; then
+        impact_die_reason "$IMPACT_EXIT_NO_ACCESS" no_key "There is no key copy $KEY." \
+            "The GUI places the key copy at your REMOTE start. Contact: $(impact_contact_text)."
+    fi
+    impact_die_reason "$IMPACT_EXIT_FAILED" key_unusable "The key copy cannot be used: $IMPACT_KEY_COPY_PROBLEM" \
+        "Correct it as described, or let the GUI place the key copy again."
+fi
+impact_ok "The key copy $KEY is in order."
+
+# Only one of these commands at a time in the repository folder.
+if ! impact_is_dry_run; then
+    impact_models_lock_dir "$REPO_BASE_DIR" ||
+        impact_die_reason "$IMPACT_EXIT_CONFLICT" busy "Another impact-get-repo or impact-update-setup works in $REPO_BASE_DIR right now." \
+            "Wait until it has finished, then try again."
+fi
+
+impact_mktemp_file
+ERROR_FILE="$IMPACT_TMP"
+
+# remove_fetched_ref EXIT_CODE
+#   Runs when the command ends (registered with impact_on_exit): removes the
+#   temporary name under which the state from GitHub was fetched.
+FETCHED=0
+remove_fetched_ref() {
+    if ((FETCHED == 1)); then
+        impact_git -C "$COPY" update-ref -d "$IMPACT_UPDATE_REF" 2>/dev/null || true
+    fi
+}
+impact_on_exit remove_fetched_ref
+
+# -----------------------------------------------------------------------------
+# 3. Steps
+# -----------------------------------------------------------------------------
+
+# fetch_state
+#   Fetches the newest commit of the branch from GitHub into the copy's .git
+#   folder under the temporary name IMPACT_UPDATE_REF. "+" in the refspec
+#   (the "from:to" pair) allows git to replace an older value of that name.
+#   --no-write-fetch-head and --no-tags leave every other name in the copy
+#   as it is. Result: the exit code of git.
+fetch_state() {
+    local status=0 source='HEAD'
+    if [[ -n "$BRANCH" ]]; then
+        source="refs/heads/$BRANCH"
+    fi
+    local -x GIT_SSH_COMMAND
+    GIT_SSH_COMMAND="$(impact_git_ssh_command "$KEY")" || return 1
+    FETCHED=1
+    impact_git -C "$COPY" fetch --no-tags --no-write-fetch-head --no-recurse-submodules \
+        -- "$REPO_URL" "+$source:$IMPACT_UPDATE_REF" 2>"$ERROR_FILE" || status=$?
+    sed -e 's/^/    git: /' -- "$ERROR_FILE" >&2
+    return "$status"
+}
+
+impact_step "State on GitHub"
+branch_text="${BRANCH:+branch $BRANCH}"
+branch_text="${branch_text:-the default branch}"
+fetch_status=0
+impact_do --transient "Fetch the current state of $branch_text from $REPO_URL with the key copy $KEY" fetch_state || fetch_status=$?
+if ((fetch_status != 0)); then
+    impact_git_classify_error "$(cat -- "$ERROR_FILE")"
+    impact_die_reason "$IMPACT_GIT_ERROR_CODE" "$IMPACT_GIT_ERROR_REASON" "$IMPACT_GIT_ERROR_CAUSE Nothing was changed." \
+        "Try again later. If it stays like this, contact $(impact_contact_text)."
+fi
+
+if impact_is_dry_run; then
+    impact_step "docker_setup"
+    impact_info "[dry run] A real run compares docker_setup of the copy with the state on GitHub."
+    impact_do "Copy docker_setup from $branch_text into $COPY (when it differs and holds no changes of your own)" true
+    impact_do --transient "Show the result with: git status" true
+    impact_result_set "$COPY" dry_run
+    impact_summary
+    exit "$IMPACT_EXIT_OK"
+fi
+
+COMMIT="$(impact_git -C "$COPY" rev-parse --verify --quiet "$IMPACT_UPDATE_REF^{commit}")" || COMMIT=''
+if [[ -z "$COMMIT" ]]; then
+    impact_die "$IMPACT_EXIT_FAILED" "The state fetched from GitHub cannot be read." "Try again. Contact: $(impact_contact_text)."
+fi
+SHORT="${COMMIT:0:10}"
+impact_ok "The newest commit of $branch_text on GitHub is $SHORT."
+if [[ "$(impact_git -C "$COPY" cat-file -t "$COMMIT:docker_setup" 2>/dev/null)" != 'tree' ]]; then
+    impact_die_reason "$IMPACT_EXIT_FAILED" no_docker_setup "The state on GitHub ($branch_text, $SHORT) has no folder docker_setup. Nothing was changed." \
+        "Contact $(impact_contact_text)."
+fi
+
+impact_step "docker_setup"
+# Untracked files of docker_setup (not ignored ones) count as changes too.
+UNTRACKED="$(impact_git -C "$COPY" ls-files --others --exclude-standard -- docker_setup)"
+# "git diff --quiet A -- path" succeeds when the files at path equal commit
+# A; "--cached" compares git's list of staged files instead.
+if impact_git -C "$COPY" diff --quiet "$COMMIT" -- docker_setup &&
+    impact_git -C "$COPY" diff --cached --quiet "$COMMIT" -- docker_setup &&
+    [[ -z "$UNTRACKED" ]]; then
+    impact_ok "docker_setup of your copy equals the state on GitHub ($SHORT)."
+    impact_result_set "$COPY" up_to_date
+    impact_summary
+    exit "$IMPACT_EXIT_OK"
+fi
+# "--no-optional-locks" keeps "git status" from updating git's own files.
+LOCAL_CHANGES="$(impact_git --no-optional-locks -C "$COPY" status --porcelain --untracked-files=all -- docker_setup)"
+if [[ -n "$LOCAL_CHANGES" ]]; then
+    impact_error "Changes of your own in docker_setup that are not committed:"
+    printf '%s\n' "$LOCAL_CHANGES" | sed -e 's/^/    /' >&2
+    impact_die_reason "$IMPACT_EXIT_CONFLICT" local_changes "docker_setup of your copy has changes of its own that are not committed. They would be lost, so nothing was changed." \
+        "Commit them (they then stay in the history) or discard them, then run the command again. Contact: $(impact_contact_text)."
+fi
+
+impact_do "Copy docker_setup from $branch_text (commit $SHORT) into $COPY" \
+    impact_git -C "$COPY" restore --source="$COMMIT" --staged --worktree -- docker_setup ||
+    impact_die "$IMPACT_EXIT_FAILED" "docker_setup could not be copied." "Contact $(impact_contact_text)."
+impact_undo "Put the previous docker_setup back: git -C $COPY restore --source=HEAD --staged --worktree -- docker_setup"
+
+impact_step "Result (git status)"
+impact_git --no-optional-locks -C "$COPY" status --short --branch | sed -e 's/^/    /'
+impact_info "The new docker_setup is staged. It reaches GitHub with your next commit, for example at Stop in the GUI."
+impact_result_set "$COPY" updated
+
+impact_summary

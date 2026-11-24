@@ -1,0 +1,479 @@
+#!/bin/bash
+# =============================================================================
+# impact-remove-user: close the account of a person who leaves
+#
+# Purpose
+#   Closes the personal account of a colleague, in this order:
+#     1. sets the account to expired, so no new login is possible;
+#     2. moves its login keys (~/.ssh/authorized_keys) to the key archive in
+#        /opt/impact/admin/keys;
+#     3. takes it out of the shared group and out of the group docker;
+#     4. ends its processes: open SSH sessions, SSH tunnels, programs;
+#     5. stops its containers (the label impact.account=<account>);
+#     6. deletes its private key copies (~/.ssh/id_ed25519_<name>);
+#     7. notes the state "removed" in the account record.
+#   The account, its home folder and its files stay. So the user number is
+#   never given to a new account, and files on the shared storage keep their
+#   owner. At the end the command prints the commands that bring the person
+#   back.
+#   With --delete the command also deletes the account, its home folder and
+#   its personal group. Before that it lists the files the person still owns
+#   on the shared storage and asks twice.
+#
+# Who runs it
+#   The administrator, with sudo.
+#
+# Usage
+#   sudo impact-remove-user <account> [--delete] [--yes] [--dry-run]
+#
+# Examples
+#   sudo impact-remove-user alice --dry-run     show every step, change nothing
+#   sudo impact-remove-user alice               close the account (asks once)
+#   sudo impact-remove-user alice --delete      close and delete (asks twice)
+#
+# Options
+#   --delete     also delete the account, its home folder (with everything in
+#                it, for example the person's repositories) and its personal
+#                group. The two questions are answered on the terminal only;
+#                --yes does not answer them
+#   --yes        answer the question of a plain removal with yes
+#   --dry-run    print every step, change nothing (with --delete it still
+#                lists the files on the shared storage, which can take long)
+#   --help       show this text
+#
+# What it changes on the system
+#   the expiry date of the account; ~/.ssh/authorized_keys (moved to
+#   /opt/impact/admin/keys/<account>/account-removed-<time>/); membership
+#   in the shared group and in docker; processes and containers of the
+#   person; ~/.ssh/id_ed25519_* of the person; the account record in
+#   /opt/impact/admin/accounts; one block in the log
+#   /opt/impact/admin/log/impact-admin.log. With --delete: the account, its
+#   home folder and its personal group are deleted.
+#
+# How to undo
+#   The command prints the exact commands at its end, under "How to bring
+#   the person back". Containers are not started again; the person starts
+#   them in the GUI. After --delete the home folder is gone for good.
+#
+# Exit codes
+#   0 done, or nothing to do; 1 a step failed or could not be done (for
+#   example Docker did not answer); 2 wrong usage; 3 the workstation is not
+#   prepared; 4 the account is no enrolled account of a colleague.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Reading help: bash constructs that appear in this file
+#   NAME=text            store a text in the variable NAME; "$NAME" reads it
+#   local NAME           a variable that exists only inside one function
+#   "$1" "$2" "$@" "$#"  first parameter, second parameter, all parameters,
+#                        number of parameters
+#   "${NAME:-text}"      the value of NAME, or "text" when NAME is unset or empty
+#   $( command )         the text that the command prints
+#   [[ ... ]]            a test: -f plain file, -d folder, -L symbolic link,
+#                        -e exists, -r readable, -x executable, -z empty text,
+#                        -n text with content, == equal, != different,
+#                        =~ matches a pattern
+#   (( ... ))            arithmetic: true when the result is not zero
+#   A && B               run B only when A succeeded
+#   A || B               run B only when A failed
+#   ! command            true when the command fails
+#   if / case / for / while   branches and loops; "case" compares one value
+#                        with several patterns
+#   >file >>file <file   write to a file (replace it / add to its end), read
+#                        from a file
+#   2>/dev/null  >&2     throw error messages away / write to the error channel
+#   command1 | command2  hand the output of command1 to command2
+#   return N / exit N    end the function / the script with status N; 0 means
+#                        success
+#   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+# Constructs beyond these are explained where they are first used.
+# -----------------------------------------------------------------------------
+
+# "set -e" stops the script at the first command that fails, "-u" stops it
+# when a variable is read that was never set, and "-o pipefail" makes a chain
+# of commands joined with "|" fail when any part of it fails.
+set -euo pipefail
+
+# Find this file's real place (the name in /usr/local/bin is a link) and load
+# the shared functions that lie next to it in ../lib.
+IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# The comment lines below tell the checking tool "shellcheck" where the
+# loaded files are.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-common.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-users.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-users.sh"
+impact_init "$IMPACT_SELF"
+
+impact_parse_args 'dry-run yes delete' '' '' "$@"
+impact_require_arg_count 1 1
+ACCOUNT="${IMPACT_ARGS[0]}"
+impact_require_root
+impact_require_conf
+impact_log_enable "$@"
+
+if ! impact_valid_account_name "$ACCOUNT"; then
+    impact_die_usage "'$(impact_display "$ACCOUNT")' is no valid account name (a lower-case letter first, then lower-case letters, digits, - or _; at most 32 characters)."
+fi
+DELETE=0
+if impact_opt_given delete; then
+    DELETE=1
+fi
+
+# Only one command that changes accounts may run at a time.
+impact_lock accounts
+
+GROUP="${IMPACT_CONF[SHARED_GROUP]}"
+GITHUB=''
+USER_NUMBER=''
+HOME_DIR=''
+RECORD_STATE=''
+KEYS_READABLE=1      # 0 when ~/.ssh could not be read safely
+KEY_COUNT=0          # number of login keys
+AK_PRESENT=0         # 1 when something exists at ~/.ssh/authorized_keys
+PROCESSES=''         # the processes of the person, one per line
+CONTAINERS=''        # the containers of the person, one per line
+CONTAINER_STATUS=0   # 0 list complete, 1 Docker does not answer, 2 no Docker
+COPIES=()            # names of the key copies in ~/.ssh
+INCOMPLETE=0         # 1 when a step could not be done
+
+# -----------------------------------------------------------------------------
+# Functions
+# -----------------------------------------------------------------------------
+
+# print_bring_back DELETED
+#   Prints the section "How to bring the person back" with the commands
+#   built from the newest archive folder of the person's keys.
+print_bring_back() {
+    local folder=''
+    impact_say ''
+    impact_say "How to bring the person back (type each line exactly as shown):"
+    folder="$(impact_users_latest_account_archive "$ACCOUNT")" || folder=''
+    impact_users_bring_back_text "$ACCOUNT" "$GITHUB" "$USER_NUMBER" "$1" "$folder"
+    impact_say "  The GUI places the key copy for git again at the next start; containers are started again from the GUI."
+    if (($1 == 1)); then
+        impact_say "  The home folder was deleted; the person fetches the repositories again (\"Add repository\" in the GUI)."
+    fi
+}
+
+# account_deleted_earlier
+#   The account does not exist and its record remains: it was deleted
+#   earlier with --delete. Nothing to do; the way back is printed.
+account_deleted_earlier() {
+    GITHUB="${IMPACT_ACCOUNT_RECORD[GITHUB_NAME]}"
+    USER_NUMBER="${IMPACT_ACCOUNT_RECORD[USER_NUMBER]}"
+    impact_ok "The account '$ACCOUNT' does not exist any more: it was deleted earlier. Its record remains in $(impact_account_record_file "$ACCOUNT") (user number $USER_NUMBER, GitHub name $GITHUB)."
+    impact_summary
+    print_bring_back 1
+    exit "$IMPACT_EXIT_OK"
+}
+
+# check_account
+#   The account must be an enrolled account of a colleague. Reads every
+#   fact the later steps need. Read-only.
+check_account() {
+    local status=0 text
+    impact_require_tools getent usermod gpasswd ps pkill runuser ssh-keygen find
+    if ((DELETE == 1)); then
+        impact_require_tools userdel du
+    fi
+    impact_account_record_load "$ACCOUNT" || status=$?
+    if ((status == 2)); then
+        for text in "${IMPACT_ACCOUNT_RECORD_ERRORS[@]}"; do
+            impact_error "$text"
+        done
+        impact_die "$IMPACT_EXIT_FAILED" "The record $(impact_account_record_file "$ACCOUNT") cannot be used." \
+            "Look at it with: sudo cat $(impact_account_record_file "$ACCOUNT")"
+    fi
+    if ! impact_account_exists "$ACCOUNT"; then
+        if ((status == 0)); then
+            account_deleted_earlier
+        fi
+        impact_die "$IMPACT_EXIT_FAILED" "The account '$ACCOUNT' does not exist." "Check the name: sudo impact-list-users"
+    fi
+    if ((status == 1)); then
+        impact_die "$IMPACT_EXIT_CONFLICT" "The account '$ACCOUNT' was not enrolled with impact-add-user, so this command does not touch it." \
+            "If it is the account of a colleague, adopt it first (sudo impact-add-user <GitHub name> --account $ACCOUNT --existing ...), or close it by hand."
+    fi
+    GITHUB="${IMPACT_ACCOUNT_RECORD[GITHUB_NAME]}"
+    RECORD_STATE="${IMPACT_ACCOUNT_RECORD[STATE]}"
+    if ! impact_users_check_changeable "$ACCOUNT"; then
+        impact_die "$IMPACT_EXIT_CONFLICT" "$IMPACT_USERS_REASON" "Choose the account of the colleague."
+    fi
+    USER_NUMBER="$(impact_account_uid "$ACCOUNT")"
+    HOME_DIR="$(impact_account_home "$ACCOUNT")"
+    impact_ok "The account '$ACCOUNT' (GitHub name '$GITHUB', user number $USER_NUMBER, record state '$RECORD_STATE')."
+    if [[ "${IMPACT_ACCOUNT_RECORD[USER_NUMBER]}" != "$USER_NUMBER" ]]; then
+        impact_warn "The record notes the user number ${IMPACT_ACCOUNT_RECORD[USER_NUMBER]}; the account has $USER_NUMBER."
+    fi
+
+    status=0
+    impact_users_read_authorized_keys "$ACCOUNT" || status=$?
+    if ((status != 0)); then
+        KEYS_READABLE=0
+        impact_warn "The login keys of '$ACCOUNT' cannot be read safely: $HOME_DIR/.ssh or authorized_keys in it is a symbolic link or belongs to another account. The expiry date closes the account all the same; look at it by hand: sudo ls -la $HOME_DIR/.ssh"
+    else
+        KEY_COUNT="$(impact_users_count_keys "$IMPACT_USERS_AK_TEXT")"
+        status=0
+        impact_user_file_exists "$ACCOUNT" "$(impact_users_authorized_keys_path "$HOME_DIR")" 2>/dev/null || status=$?
+        if ((status != 4)); then
+            AK_PRESENT=1
+        fi
+        impact_ok "Login keys: $KEY_COUNT."
+    fi
+
+    PROCESSES="$(impact_users_processes "$USER_NUMBER")" || PROCESSES=''
+    impact_ok "Running processes of '$ACCOUNT': $(count_lines "$PROCESSES")."
+
+    CONTAINER_STATUS=0
+    CONTAINERS="$(impact_users_containers "$ACCOUNT")" || CONTAINER_STATUS=$?
+    case "$CONTAINER_STATUS" in
+        0) impact_ok "Running containers with the label impact.account=$ACCOUNT: $(count_lines "$CONTAINERS")." ;;
+        2) impact_ok "Docker is not installed, so there are no containers." ;;
+        *) impact_warn "Docker does not answer, so the containers of '$ACCOUNT' cannot be found and stopped now. Start Docker (sudo systemctl start docker) and run this command again." ;;
+    esac
+
+    mapfile -t COPIES < <(impact_users_key_copies "$ACCOUNT")
+    impact_ok "Key copies in $HOME_DIR/.ssh: ${#COPIES[@]}."
+}
+
+# count_lines TEXT
+#   Prints the number of lines with content in TEXT.
+count_lines() {
+    if [[ -z "$1" ]]; then
+        printf '0\n'
+    else
+        printf '%s\n' "$1" | grep -c .
+    fi
+}
+
+# something_to_do
+#   Result: success when at least one step of the removal has work to do.
+something_to_do() {
+    ! impact_account_is_expired "$ACCOUNT" && return 0
+    ((AK_PRESENT == 1 || KEYS_READABLE == 0)) && return 0
+    impact_account_in_group "$ACCOUNT" "$GROUP" && return 0
+    impact_account_in_group "$ACCOUNT" docker && return 0
+    [[ -n "$PROCESSES" || -n "$CONTAINERS" ]] && return 0
+    ((${#COPIES[@]} > 0)) && return 0
+    [[ "$RECORD_STATE" != 'removed' ]]
+}
+
+# list_storage_files
+#   For --delete: lists the files the person owns on the shared storage
+#   (every root of SHARED_ROOTS), and the size of the home folder.
+list_storage_files() {
+    local list total home_size root
+    local -a roots=()
+    impact_split_list "${IMPACT_CONF[SHARED_ROOTS]}" roots
+    impact_mktemp_file
+    list="$IMPACT_TMP"
+    impact_info "Searching the shared storage for entries of the user number $USER_NUMBER (this can take long on a large disk):"
+    for root in "${roots[@]}"; do
+        impact_info "  $root"
+    done
+    impact_users_storage_files "$USER_NUMBER" "$list" "${roots[@]}"
+    total="$(wc -l <"$list")"
+    if ((total == 0)); then
+        impact_ok "'$ACCOUNT' owns no files or folders on the shared storage."
+    else
+        impact_warn "'$ACCOUNT' owns $total files and folders on the shared storage:"
+        head -n 50 -- "$list" | while IFS= read -r line; do
+            impact_info "  $(impact_display "$line")"
+        done
+        if ((total > 50)); then
+            impact_info "  ... and $((total - 50)) more. The full list: sudo find <storage root> -xdev -user $USER_NUMBER"
+        fi
+        impact_info "After the deletion these entries belong to the number $USER_NUMBER without an account. A new account that gets this number would own them."
+        impact_info "Hand them over first, for example: sudo chown -R --from=$USER_NUMBER <new owner> <folder>"
+    fi
+    # "du -s -h" adds up the size of a folder and prints it in a short form.
+    home_size="$(du -s -h -- "$HOME_DIR" 2>/dev/null | cut -f1)" || home_size='?'
+    impact_info "The home folder $HOME_DIR ($home_size) is deleted with everything in it, including the person's repositories."
+}
+
+# confirm_removal
+#   Asks before anything is changed. A plain removal asks once (--yes
+#   answers it). --delete asks twice, on the terminal only.
+confirm_removal() {
+    if ((DELETE == 0)); then
+        if ! impact_confirm "Remove '$ACCOUNT' now? Open SSH sessions, tunnels and containers of '$ACCOUNT' end, and '$ACCOUNT' can no longer log in. The account, its home folder and its files stay."; then
+            impact_die "$IMPACT_EXIT_FAILED" "Stopped: the removal was not confirmed. Nothing was changed." \
+                "Run the command again in a terminal, or add --yes after checking the request."
+        fi
+        return 0
+    fi
+    # "local" gives this function its own IMPACT_ASSUME_YES with the value 0,
+    # so --yes cannot answer the two questions of a deletion.
+    local IMPACT_ASSUME_YES=0
+    if ! impact_confirm "DELETE the account '$ACCOUNT', its home folder $HOME_DIR with everything in it, and its personal group? This cannot be undone. (Question 1 of 2)"; then
+        impact_die "$IMPACT_EXIT_FAILED" "Stopped: the deletion was not confirmed. Nothing was changed." \
+            "To close the account and keep its files, run the command without --delete."
+    fi
+    if ! impact_confirm "Question 2 of 2: type the account name to delete it." "$ACCOUNT"; then
+        impact_die "$IMPACT_EXIT_FAILED" "Stopped: the account name was not typed. Nothing was changed." \
+            "To close the account and keep its files, run the command without --delete."
+    fi
+}
+
+# step_failed TEXT
+#   Notes that a step could not be done; the command goes on with the next
+#   steps (each closes the account a bit more) and ends with exit code 1.
+step_failed() {
+    impact_warn "$1"
+    INCOMPLETE=1
+}
+
+# move_login_keys FOLDER
+#   Saves the login keys in the archive folder, then removes the file
+#   authorized_keys with the rights of the person.
+move_login_keys() {
+    impact_users_save_key_lines "$1" "$IMPACT_USERS_AK_TEXT" && impact_users_remove_authorized_keys "$ACCOUNT"
+}
+
+# leave_group GROUP
+#   Takes the account out of GROUP. gpasswd prints a line of its own, which
+#   is not needed here.
+leave_group() {
+    gpasswd --delete "$ACCOUNT" -- "$1" >/dev/null
+}
+
+# delete_account
+#   Ends processes that may have started since step "Processes" (there
+#   should be none) and deletes the account with its home folder. userdel
+#   also deletes the personal group when nobody else is a member.
+delete_account() {
+    impact_users_end_processes "$USER_NUMBER" || return 1
+    userdel --remove -- "$ACCOUNT" 2>&1 | grep -v 'mail spool' >&2
+    # "PIPESTATUS[0]" is the exit code of the first command of the pipe
+    # above (userdel); grep only filters a harmless note about mail.
+    local code="${PIPESTATUS[0]}"
+    ((code == 0)) || return "$code"
+    ! impact_account_exists "$ACCOUNT"
+}
+
+# -----------------------------------------------------------------------------
+# The steps
+# -----------------------------------------------------------------------------
+
+impact_step "Checks (nothing is changed in this step)"
+check_account
+
+if ((DELETE == 1)); then
+    impact_step "Files of '$ACCOUNT' on the shared storage"
+    list_storage_files
+fi
+
+impact_step "Confirmation"
+if ((DELETE == 0)) && ! something_to_do; then
+    impact_ok "'$ACCOUNT' is removed already; nothing to confirm."
+else
+    confirm_removal
+fi
+
+impact_step "Close the account"
+if impact_account_is_expired "$ACCOUNT"; then
+    impact_ok "The account has expired: no login is possible."
+else
+    impact_do "Set the account '$ACCOUNT' to expired (no login is possible from now on)" usermod --expiredate 1 -- "$ACCOUNT" ||
+        step_failed "The expiry date could not be set."
+fi
+
+impact_step "Login keys"
+if ((KEYS_READABLE == 0)); then
+    impact_do "Remove $HOME_DIR/.ssh/authorized_keys (a symbolic link is removed itself)" impact_users_remove_authorized_keys "$ACCOUNT" ||
+        step_failed "The login keys could not be removed safely. Look at $HOME_DIR/.ssh by hand."
+elif ((AK_PRESENT == 1)); then
+    ARCHIVE_DIR="$(impact_users_new_archive_name "$ACCOUNT" account)"
+    impact_do "Move the login keys of '$ACCOUNT' (number of keys: $KEY_COUNT) to $ARCHIVE_DIR (root only) and remove $HOME_DIR/.ssh/authorized_keys" \
+        move_login_keys "$ARCHIVE_DIR" || step_failed "The login keys could not be moved."
+else
+    impact_ok "'$ACCOUNT' has no login keys."
+fi
+
+impact_step "Groups"
+for group_name in "$GROUP" docker; do
+    if impact_account_in_group "$ACCOUNT" "$group_name"; then
+        impact_do "Take '$ACCOUNT' out of the group '$group_name'" leave_group "$group_name" ||
+            step_failed "'$ACCOUNT' could not be taken out of '$group_name'."
+    else
+        impact_ok "'$ACCOUNT' is no member of the group '$group_name'."
+    fi
+done
+if ! impact_is_dry_run; then
+    for group_name in "$GROUP" docker; do
+        if impact_account_in_group "$ACCOUNT" "$group_name"; then
+            step_failed "'$ACCOUNT' is still a member of '$group_name', probably as its primary group. Change it with: sudo usermod --gid $ACCOUNT $ACCOUNT"
+        fi
+    done
+fi
+
+impact_step "Sessions, tunnels and processes"
+if [[ -n "$PROCESSES" ]]; then
+    while IFS= read -r line; do
+        impact_info "$(impact_display "$line")"
+    done < <(printf '%s\n' "$PROCESSES" | head -n 20)
+    impact_do "End the processes of '$ACCOUNT' (open SSH sessions, tunnels and programs; number of processes: $(count_lines "$PROCESSES"))" \
+        impact_users_end_processes "$USER_NUMBER" || step_failed "Not every process of '$ACCOUNT' could be ended."
+else
+    impact_ok "'$ACCOUNT' has no running processes."
+fi
+
+impact_step "Containers"
+case "$CONTAINER_STATUS" in
+    0)
+        if [[ -z "$CONTAINERS" ]]; then
+            impact_ok "'$ACCOUNT' has no running containers."
+        fi
+        while read -r container_id container_name container_state; do
+            [[ -n "$container_id" ]] || continue
+            impact_do "Stop the container $(impact_display "$container_name") (state $container_state, number ${container_id:0:12})" \
+                impact_users_stop_container "$container_id" || step_failed "The container $(impact_display "$container_name") could not be stopped."
+        done <<<"$CONTAINERS"
+        ;;
+    2) impact_ok "Docker is not installed." ;;
+    *) step_failed "Docker does not answer: the containers of '$ACCOUNT' were not stopped." ;;
+esac
+
+impact_step "Key copies for git"
+if ((${#COPIES[@]} == 0)); then
+    impact_ok "There is no key copy in $HOME_DIR/.ssh."
+fi
+for copy in "${COPIES[@]}"; do
+    impact_do "Delete the key copy $HOME_DIR/.ssh/$copy (with the rights of '$ACCOUNT')" \
+        impact_user_remove_file "$ACCOUNT" "$HOME_DIR/.ssh/$copy" || step_failed "The key copy $copy could not be deleted."
+done
+
+impact_step "Account record"
+if [[ "$RECORD_STATE" == 'removed' ]]; then
+    impact_ok "$(impact_account_record_file "$ACCOUNT") notes the state 'removed'."
+else
+    impact_do "Note the state 'removed' in $(impact_account_record_file "$ACCOUNT")" \
+        impact_account_record_write "$ACCOUNT" "$GITHUB" removed || step_failed "The record could not be written."
+fi
+impact_undo "Bring the person back with the commands under 'How to bring the person back' below."
+
+if ((DELETE == 1)); then
+    impact_step "Delete the account"
+    if ((INCOMPLETE == 1)); then
+        impact_die "$IMPACT_EXIT_FAILED" "A step of the removal failed (see the warnings above), so the account is not deleted." \
+            "Fix the cause and run the command again."
+    fi
+    impact_do "Delete the account '$ACCOUNT', its home folder $HOME_DIR and its personal group (user number $USER_NUMBER becomes free)" delete_account ||
+        impact_die "$IMPACT_EXIT_FAILED" "The account could not be deleted (see the message above)." \
+            "Check for remaining processes (ps -u $USER_NUMBER) and run the command again."
+fi
+
+impact_summary
+if impact_is_dry_run; then
+    impact_say ''
+    impact_say "A real run prints here the commands that bring the person back."
+else
+    print_bring_back "$DELETE"
+fi
+if ((INCOMPLETE == 1)); then
+    impact_die "$IMPACT_EXIT_FAILED" "The removal is not complete (see the warnings above)." \
+        "Fix the cause and run the command again; the finished steps are not repeated."
+fi

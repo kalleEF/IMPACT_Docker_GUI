@@ -1,0 +1,251 @@
+#!/bin/bash
+# =============================================================================
+# impact-give-repo: make a working copy of a model for a person
+#
+# Purpose
+#   Runs impact-get-repo with the rights of a person, so that the person gets
+#   a working copy of a model in their own repository folder (see
+#   impact-get-repo --help for what happens there). Everything inside the
+#   person's home folder is done as the person.
+#   Which way to GitHub is used:
+#     - the person's key copy ~/.ssh/id_ed25519_<GitHub name>, when it exists;
+#     - otherwise anonymous HTTPS (public repositories only); the copy's
+#       address is then set to the SSH form, so the person's later pushes
+#       use the key. The output says which way was used.
+#   The GitHub name comes from the account record that impact-add-user
+#   wrote, or from --github-name.
+#
+# Who runs it
+#   The administrator, with sudo.
+#
+# Usage
+#   sudo impact-give-repo <account> <model> [--github-name <name>]
+#        [--anonymous-https] [--dry-run]
+#
+# Examples
+#   sudo impact-give-repo alice Example-Model --dry-run   show the steps only
+#   sudo impact-give-repo alice Example-Model             make the copy
+#   sudo impact-give-repo alice Example-Model --github-name alice-example
+#
+# Options
+#   --github-name <name>  the person's GitHub name, when the account record
+#                         has none (accounts made before impact-add-user)
+#   --anonymous-https     use anonymous HTTPS even when a key copy exists
+#   --dry-run             print every step, change nothing
+#   --help                show this text
+#
+# What it changes on the system
+#   In the person's repository folder (REPO_BASE): the new folder <model>,
+#   owned by the person. When the repository folder is missing, it is
+#   created (owner the person, mode 750). One block in
+#   /opt/impact/admin/log/impact-admin.log.
+#   When the person already has a working copy of this model, nothing is
+#   changed and the command ends with exit code 0.
+#
+# How to undo
+#   Remove the new copy while the person has not worked in it:
+#     sudo rm -rf <repository folder>/<model>
+#   (the command prints the exact line).
+#
+# Exit codes
+#   0 done or nothing to do; 1 a check or step failed; 2 wrong usage;
+#   3 the workstation is not prepared; 4 another folder has the name of the
+#   copy; 5 no access (GitHub refused the key or the repository); 6 network
+#   problem. The codes 1, 4, 5 and 6 of impact-get-repo are passed on.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Reading help: bash constructs that appear in this file
+#   NAME=text            store a text in the variable NAME; "$NAME" reads it
+#   local NAME           a variable that exists only inside one function
+#   "$1" "$2" "$@" "$#"  first parameter, second parameter, all parameters,
+#                        number of parameters
+#   "${NAME:-text}"      the value of NAME, or "text" when NAME is unset or empty
+#   $( command )         the text that the command prints
+#   [[ ... ]]            a test: -f plain file, -d folder, -L symbolic link,
+#                        -e exists, -r readable, -x executable, -z empty text,
+#                        -n text with content, == equal, != different,
+#                        =~ matches a pattern
+#   (( ... ))            arithmetic: true when the result is not zero
+#   A && B               run B only when A succeeded
+#   A || B               run B only when A failed
+#   ! command            true when the command fails
+#   if / case / for / while   branches and loops; "case" compares one value
+#                        with several patterns
+#   >file >>file <file   write to a file (replace it / add to its end), read
+#                        from a file
+#   2>/dev/null  >&2     throw error messages away / write to the error channel
+#   command1 | command2  hand the output of command1 to command2
+#   return N / exit N    end the function / the script with status N; 0 means
+#                        success
+#   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+# Constructs beyond these are explained where they are first used.
+# -----------------------------------------------------------------------------
+
+# "set -e" stops the script at the first command that fails, "-u" stops it
+# when a variable is read that was never set, and "-o pipefail" makes a chain
+# of commands joined with "|" fail when any part of it fails.
+set -euo pipefail
+
+# Find this file's real place (the name in /usr/local/bin is a link) and load
+# the shared functions that lie next to it in ../lib.
+IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-common.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-models.sh
+source "$IMPACT_LIB_DIR/impact-models.sh"
+impact_init "$IMPACT_SELF"
+
+# -----------------------------------------------------------------------------
+# 1. Options, who runs it, settings, log
+# -----------------------------------------------------------------------------
+impact_parse_args 'dry-run anonymous-https' 'github-name' '' "$@"
+impact_require_arg_count 2 2
+ACCOUNT="${IMPACT_ARGS[0]}"
+MODEL="${IMPACT_ARGS[1]}"
+impact_require_root
+impact_require_conf
+impact_log_enable "$@"
+GROUP="${IMPACT_CONF[SHARED_GROUP]}"
+GET_REPO="$IMPACT_BASE_DIR/bin/impact-get-repo"
+
+# -----------------------------------------------------------------------------
+# 2. Validate every name from input before any use
+# -----------------------------------------------------------------------------
+if ! impact_valid_account_name "$ACCOUNT"; then
+    impact_die_usage "'$(impact_display "$ACCOUNT")' is no valid account name (a lower-case letter, then lower-case letters, digits, - or _; at most 32 characters)."
+fi
+if ! impact_valid_model_name "$MODEL"; then
+    impact_die_usage "'$(impact_display "$MODEL")' is no valid model name."
+fi
+GITHUB_NAME=''
+if impact_opt_given github-name; then
+    GITHUB_NAME="$(impact_opt github-name)"
+    if ! impact_valid_github_name "$GITHUB_NAME"; then
+        impact_die_usage "'$(impact_display "$GITHUB_NAME")' is no valid GitHub name."
+    fi
+    GITHUB_NAME="$(impact_lower "$GITHUB_NAME")"
+fi
+
+# -----------------------------------------------------------------------------
+# 3. Checks that only read (they run in a dry run too)
+# -----------------------------------------------------------------------------
+impact_step "Checks"
+impact_require_tools runuser git getent
+if [[ ! -x "$GET_REPO" ]]; then
+    impact_die "$IMPACT_EXIT_NOT_PREPARED" "The command $GET_REPO is missing." "Install the IMPACT commands again with install.sh."
+fi
+if ! impact_account_exists "$ACCOUNT"; then
+    impact_die "$IMPACT_EXIT_FAILED" "The account '$ACCOUNT' does not exist." \
+        "Enrol the person first: sudo impact-add-user --help"
+fi
+uid="$(impact_account_uid "$ACCOUNT")"
+if ! [[ "$uid" =~ ^[0-9]+$ ]] || ((uid < 1000)); then
+    impact_die "$IMPACT_EXIT_FAILED" "'$ACCOUNT' is a system account (user number $uid). Working copies are for personal accounts only." ""
+fi
+if impact_account_is_expired "$ACCOUNT"; then
+    impact_die "$IMPACT_EXIT_FAILED" "The account '$ACCOUNT' is expired (removed with impact-remove-user)." \
+        "Bring the person back first, as impact-remove-user described."
+fi
+if ! impact_account_in_group "$ACCOUNT" "$GROUP"; then
+    impact_die "$IMPACT_EXIT_FAILED" "The account '$ACCOUNT' is no member of the group '$GROUP', so it cannot read the model files." \
+        "Enrol the person with impact-add-user, or add the group: sudo usermod --append --groups $GROUP -- $ACCOUNT"
+fi
+impact_ok "The account '$ACCOUNT' exists and is a member of '$GROUP'."
+impact_require_model "$MODEL"
+impact_ok "The model '$MODEL' is set up (${IMPACT_MODEL[REPO_URL]})."
+
+if [[ -z "$GITHUB_NAME" ]]; then
+    if ! GITHUB_NAME="$(impact_account_github_name "$ACCOUNT")"; then
+        impact_die_usage "The account '$ACCOUNT' has no record with its GitHub name. Give it with --github-name <name>."
+    fi
+fi
+impact_ok "GitHub name: $GITHUB_NAME"
+
+HOME_DIR="$(impact_account_home "$ACCOUNT")"
+if ! REPO_BASE_DIR="$(impact_repo_base_for "$ACCOUNT")"; then
+    impact_die "$IMPACT_EXIT_FAILED" "The repository folder of '$ACCOUNT' cannot be worked out from REPO_BASE." ""
+fi
+TARGET="$REPO_BASE_DIR/$MODEL"
+
+# Is there a copy already? Asked as the person: root never opens a path in a
+# home folder itself.
+copy_state='none'
+if impact_repo_base_is_ready "$ACCOUNT"; then
+    # "test -e X -o -L X": something exists at X (a symbolic link counts).
+    if impact_run_as "$ACCOUNT" test -e "$TARGET" -o -L "$TARGET"; then
+        copy_state='other'
+        top="$(impact_run_as "$ACCOUNT" git -C "$TARGET" rev-parse --show-toplevel 2>/dev/null)" || top=''
+        if [[ "$top" == "$TARGET" ]]; then
+            origin="$(impact_run_as "$ACCOUNT" git -C "$TARGET" config --get remote.origin.url 2>/dev/null)" || origin=''
+            if [[ -n "$origin" ]] && impact_git_same_repo "$origin" "${IMPACT_MODEL[REPO_URL]}"; then
+                copy_state='same'
+            fi
+        fi
+    fi
+fi
+if [[ "$copy_state" == 'same' ]]; then
+    impact_ok "$ACCOUNT has a working copy of $MODEL already: $TARGET"
+    impact_summary
+    exit "$IMPACT_EXIT_OK"
+fi
+if [[ "$copy_state" == 'other' ]]; then
+    impact_die "$IMPACT_EXIT_CONFLICT" "$TARGET exists and is no working copy of $MODEL. Nothing was changed." \
+        "Ask the person what the folder is. It must be renamed or moved before a copy can be made."
+fi
+impact_ok "$TARGET does not exist yet."
+
+# Which way to GitHub?
+KEY_PATH="$(impact_key_copy_path "$HOME_DIR" "$GITHUB_NAME")"
+# The check runs as the person: 0 a plain file of the person, 4 nothing
+# there, 3 something else (the reason is printed).
+key_status=0
+impact_user_file_exists "$ACCOUNT" "$KEY_PATH" || key_status=$?
+GET_REPO_OPTIONS=(--github-name "$GITHUB_NAME")
+if impact_opt_given anonymous-https; then
+    WAY="over anonymous HTTPS (chosen with --anonymous-https)"
+    GET_REPO_OPTIONS+=(--anonymous-https)
+elif ((key_status == 0)); then
+    WAY="with the key copy $KEY_PATH"
+elif ((key_status == 4)); then
+    WAY="over anonymous HTTPS, because $ACCOUNT has no key copy yet ($KEY_PATH); this works for public repositories only"
+    GET_REPO_OPTIONS+=(--anonymous-https)
+else
+    impact_die "$IMPACT_EXIT_FAILED" "Something other than a plain file of $ACCOUNT lies at $KEY_PATH (for example a symbolic link)." \
+        "Look at it with: sudo ls -l $KEY_PATH"
+fi
+impact_ok "The copy is made $WAY."
+
+# -----------------------------------------------------------------------------
+# 4. Steps
+# -----------------------------------------------------------------------------
+if ! impact_repo_base_is_ready "$ACCOUNT"; then
+    impact_step "Repository folder"
+    impact_do "Create the repository folder $REPO_BASE_DIR (owner $ACCOUNT, mode 750)" \
+        impact_repo_base_create "$ACCOUNT" ||
+        impact_die "$IMPACT_EXIT_FAILED" "The repository folder could not be created." ""
+    impact_undo "Remove the repository folder while it is empty: sudo rmdir $REPO_BASE_DIR"
+fi
+
+impact_step "Working copy (impact-get-repo as $ACCOUNT)"
+get_status=0
+impact_do "Make the working copy $TARGET for $ACCOUNT $WAY" \
+    impact_run_as "$ACCOUNT" "$GET_REPO" "${GET_REPO_OPTIONS[@]}" -- "$MODEL" || get_status=$?
+if ((get_status != 0)); then
+    case "$get_status" in
+        4 | 5 | 6) code="$get_status" ;;
+        *) code="$IMPACT_EXIT_FAILED" ;;
+    esac
+    impact_die "$code" "impact-get-repo did not make the copy for $ACCOUNT (exit code $get_status; its messages are above)." \
+        "Fix the cause it names, then run this command again."
+fi
+if ! impact_is_dry_run; then
+    impact_log_note "working copy made $WAY"
+    impact_undo "Remove the copy while $ACCOUNT has not worked in it: sudo rm -rf $TARGET"
+fi
+
+impact_say ''
+impact_say "Tell $ACCOUNT: the copy of $MODEL is in $TARGET."
+impact_summary

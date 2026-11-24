@@ -1,0 +1,380 @@
+#!/bin/bash
+# =============================================================================
+# impact-check-model: check a model, its extra files and the working copies
+#
+# Purpose
+#   Checks everything that belongs to one model on this workstation and
+#   changes nothing. The output has numbered blocks; each block ends with
+#   OK, WARN or FAIL, and a summary follows.
+#     1. The model file model.conf (valid, owner, mode).
+#     2. The model folder and its folder "extras" (owner, group, mode).
+#     3. The extra files: allowed names, plain files and folders only,
+#        owned by root, writable by root only, readable for the members of
+#        the shared group, and every file larger than 50 MB.
+#     4. The model's folders on the storage roots (present, shared rules).
+#     5. The extras rule in every working copy of the members: git must
+#        ignore every extra file, and no extra may be a file of the
+#        repository. Otherwise the first colleague who commits everything
+#        would put the file on GitHub, or an extra would hide a file of the
+#        repository.
+#   Where something is wrong, the output names the command that fixes it.
+#
+# Who runs it
+#   The administrator, with sudo.
+#
+# Usage
+#   sudo impact-check-model <model>
+#
+# Examples
+#   sudo impact-check-model Example-Model
+#   sudo impact-check-model Example-Model > check.txt   keep the result in a file
+#   impact-check-model --help                          show this text
+#
+# Options
+#   --help    show this text
+#
+# What it changes on the system
+#   Nothing. It only reads. Inside the members' home folders it reads with
+#   the rights of each member (git runs as that person).
+#
+# How to undo
+#   Nothing to undo.
+#
+# Exit codes
+#   0 no check failed (warnings may have been printed); 1 at least one
+#   check failed; 2 wrong usage; 3 the workstation is not prepared.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Reading help: bash constructs that appear in this file
+#   NAME=text            store a text in the variable NAME; "$NAME" reads it
+#   local NAME           a variable that exists only inside one function
+#   "$1" "$2" "$@" "$#"  first parameter, second parameter, all parameters,
+#                        number of parameters
+#   "${NAME:-text}"      the value of NAME, or "text" when NAME is unset or empty
+#   $( command )         the text that the command prints
+#   [[ ... ]]            a test: -f plain file, -d folder, -L symbolic link,
+#                        -e exists, -r readable, -x executable, -z empty text,
+#                        -n text with content, == equal, != different,
+#                        =~ matches a pattern
+#   (( ... ))            arithmetic: true when the result is not zero
+#   A && B               run B only when A succeeded
+#   A || B               run B only when A failed
+#   ! command            true when the command fails
+#   if / case / for / while   branches and loops; "case" compares one value
+#                        with several patterns
+#   >file >>file <file   write to a file (replace it / add to its end), read
+#                        from a file
+#   2>/dev/null  >&2     throw error messages away / write to the error channel
+#   command1 | command2  hand the output of command1 to command2
+#   return N / exit N    end the function / the script with status N; 0 means
+#                        success
+#   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+# Constructs beyond these are explained where they are first used.
+# -----------------------------------------------------------------------------
+
+# "set -e" stops the script at the first command that fails, "-u" stops it
+# when a variable is read that was never set, and "-o pipefail" makes a chain
+# of commands joined with "|" fail when any part of it fails.
+set -euo pipefail
+
+# Find this file's real place (the name in /usr/local/bin is a link) and load
+# the shared functions that lie next to it in ../lib.
+IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-common.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-models.sh
+source "$IMPACT_LIB_DIR/impact-models.sh"
+impact_init "$IMPACT_SELF"
+
+impact_parse_args '' '' '' "$@"
+impact_require_arg_count 1 1
+MODEL="${IMPACT_ARGS[0]}"
+impact_require_root
+impact_require_conf
+if ! impact_valid_model_name "$MODEL"; then
+    impact_die_usage "'$(impact_display "$MODEL")' is no valid model name."
+fi
+impact_require_tools git runuser find stat getfacl
+GROUP="${IMPACT_CONF[SHARED_GROUP]}"
+MODEL_FOLDER="$(impact_model_dir "$MODEL")"
+MODEL_FILE="$MODEL_FOLDER/model.conf"
+EXTRAS_FOLDER="$MODEL_FOLDER/extras"
+
+# block_begin TITLE / block_end
+#   Print the heading of a numbered block, and at its end the result of the
+#   block: FAIL when a check of the block failed, WARN when it printed a
+#   warning, else OK.
+BLOCK_WARN=0
+BLOCK_FAIL=0
+RESULTS=()
+block_begin() {
+    impact_step "$1"
+    BLOCK_TITLE="$1"
+    BLOCK_WARN="$IMPACT_WARN_COUNT"
+    BLOCK_FAIL="$IMPACT_FAIL_COUNT"
+}
+block_end() {
+    local block_result='OK'
+    if ((IMPACT_FAIL_COUNT > BLOCK_FAIL)); then
+        block_result='FAIL'
+    elif ((IMPACT_WARN_COUNT > BLOCK_WARN)); then
+        block_result='WARN'
+    fi
+    impact_say "    Result: $block_result"
+    RESULTS+=("$block_result  $IMPACT_STEP_NO. $BLOCK_TITLE")
+}
+
+# print_summary
+#   Prints the result of every block and the totals.
+print_summary() {
+    impact_say ''
+    impact_say "Summary for the model $MODEL:"
+    local line
+    for line in "${RESULTS[@]}"; do
+        impact_say "  $line"
+    done
+    impact_say "Failed checks: $IMPACT_FAIL_COUNT. Warnings: $IMPACT_WARN_COUNT."
+}
+
+# -----------------------------------------------------------------------------
+# 1. The model file
+# -----------------------------------------------------------------------------
+block_begin "Model file $MODEL_FILE"
+load_status=0
+impact_model_load "$MODEL" || load_status=$?
+if ((load_status != 0)); then
+    for text in "${IMPACT_MODEL_ERRORS[@]}"; do
+        impact_fail "$text"
+    done
+    if ((load_status == 1)); then
+        impact_info "Register the model with: sudo impact-add-model $MODEL <github address> --storage <root> --storage-name <name>"
+    else
+        impact_info "Correct the file with: sudoedit $MODEL_FILE"
+    fi
+    block_end
+    print_summary
+    exit "$IMPACT_EXIT_FAILED"
+fi
+for text in "${IMPACT_MODEL_WARNINGS[@]}"; do
+    impact_warn "$text"
+done
+impact_ok "The model file is valid: REPO_URL=${IMPACT_MODEL[REPO_URL]}, BRANCH=${IMPACT_MODEL[BRANCH]:-(default branch)}, STORAGE_NAME=${IMPACT_MODEL[STORAGE_NAME]}, STORAGE_ROOTS=${IMPACT_MODEL[STORAGE_ROOTS]}"
+if impact_file_is "$MODEL_FILE" 640 root "$GROUP"; then
+    impact_ok "Owner, group and mode are root, $GROUP, 640."
+else
+    impact_warn "Owner, group or mode of the model file are not root, $GROUP, 640 ($(stat -c '%U %G %a' -- "$MODEL_FILE")). Members may be unable to read it. Fix: sudo chown root:$GROUP $MODEL_FILE && sudo chmod 640 $MODEL_FILE"
+fi
+block_end
+
+# -----------------------------------------------------------------------------
+# 2. Model folder and extras folder
+# -----------------------------------------------------------------------------
+block_begin "Model folder and extras folder"
+for folder in "$MODEL_FOLDER" "$EXTRAS_FOLDER"; do
+    if [[ -L "$folder" ]]; then
+        impact_fail "$folder is a symbolic link. A real folder is expected."
+    elif [[ ! -d "$folder" ]]; then
+        if [[ "$folder" == "$EXTRAS_FOLDER" && ! -e "$folder" ]]; then
+            impact_warn "$folder does not exist. New copies get no extra files. impact-add-model creates it when it runs again."
+        else
+            impact_fail "$folder is no folder."
+        fi
+    elif impact_dir_is "$folder" "$IMPACT_MODEL_FOLDER_MODE" root "$GROUP"; then
+        impact_ok "$folder: owner root, group $GROUP, mode $IMPACT_MODEL_FOLDER_MODE."
+    else
+        impact_warn "$folder has owner, group and mode $(stat -c '%U %G %a' -- "$folder"); expected root $GROUP $IMPACT_MODEL_FOLDER_MODE. Fix: sudo chown root:$GROUP $folder && sudo chmod $IMPACT_MODEL_FOLDER_MODE $folder"
+    fi
+done
+block_end
+
+# -----------------------------------------------------------------------------
+# 3. The extra files
+# -----------------------------------------------------------------------------
+
+# member_can_read PATH IS_FOLDER
+#   Result: success when a member of the shared group (who is not the owner)
+#   can read PATH, and enter it when it is a folder: through the group
+#   rights when PATH belongs to the group, or through the rights of others.
+member_can_read() {
+    local facts mode group_name need=4
+    facts="$(stat -c '%a %G' -- "$1" 2>/dev/null)" || return 1
+    mode="${facts%% *}"
+    group_name="${facts##* }"
+    if (($2 == 1)); then
+        need=5   # read and enter
+    fi
+    # The last digit of the mode is "others", the one before it the group.
+    if (((8#$mode & need) == need)); then
+        return 0
+    fi
+    [[ "$group_name" == "$GROUP" ]] && (((8#$mode >> 3 & need) == need))
+}
+
+block_begin "Extra files in $EXTRAS_FOLDER"
+EXTRA_FILES=()
+FIX_RIGHTS=0
+if [[ -d "$EXTRAS_FOLDER" && ! -L "$EXTRAS_FOLDER" ]]; then
+    impact_extras_scan "$EXTRAS_FOLDER" || true
+    for text in "${IMPACT_EXTRAS_PROBLEMS[@]}"; do
+        impact_fail "$text"
+    done
+    if ((${#IMPACT_EXTRAS_PROBLEMS[@]} > 0)); then
+        impact_info "impact-get-repo refuses to copy extras that break these rules. Rename or remove the entries named above."
+    fi
+    EXTRA_FILES=("${IMPACT_EXTRAS_FILES[@]}")
+    for path in "${IMPACT_EXTRAS_DIRS[@]}" "${IMPACT_EXTRAS_FILES[@]}"; do
+        full="$EXTRAS_FOLDER/$path"
+        is_folder=0
+        [[ -d "$full" ]] && is_folder=1
+        facts="$(stat -c '%U %a' -- "$full")"
+        if [[ "${facts%% *}" != 'root' ]]; then
+            impact_fail "'$path' belongs to ${facts%% *}. Extras must belong to root: they go into every new working copy."
+            FIX_RIGHTS=1
+        elif (((8#${facts##* } & 8#022) != 0)); then
+            impact_fail "'$path' (mode ${facts##* }) can be changed by accounts other than root. Extras go into every new working copy."
+            FIX_RIGHTS=1
+        fi
+        if ! member_can_read "$full" "$is_folder"; then
+            impact_fail "Members of '$GROUP' cannot read '$path'. impact-get-repo would stop."
+            FIX_RIGHTS=1
+        fi
+    done
+    if ((FIX_RIGHTS == 1)); then
+        impact_info "Fix the owners and rights of all extras with:"
+        impact_info "  sudo chown -R root:$GROUP $EXTRAS_FOLDER && sudo chmod -R u=rwX,g=rX,o= $EXTRAS_FOLDER"
+    fi
+    impact_ok "${#IMPACT_EXTRAS_FILES[@]} extra files in ${#IMPACT_EXTRAS_DIRS[@]} folders."
+    LARGE=()
+    mapfile -t LARGE < <(impact_extras_large_files "$EXTRAS_FOLDER")
+    for line in "${LARGE[@]}"; do
+        impact_warn "Larger than $IMPACT_LARGE_FILE_MB MB: ${line#* } (${line%% *} MB). Every new working copy receives a copy of it."
+    done
+    if ((${#LARGE[@]} == 0)); then
+        impact_ok "No extra file is larger than $IMPACT_LARGE_FILE_MB MB."
+    fi
+else
+    impact_ok "There is no extras folder to check."
+fi
+block_end
+
+# -----------------------------------------------------------------------------
+# 4. Storage folders
+# -----------------------------------------------------------------------------
+block_begin "Storage folders"
+ROOTS=()
+impact_split_list "${IMPACT_MODEL[STORAGE_ROOTS]}" ROOTS
+for root in "${ROOTS[@]}"; do
+    if ! real="$(impact_storage_real_root "$root")"; then
+        impact_fail "The storage root $root does not exist."
+        continue
+    fi
+    mapfile -t folders < <(impact_models_storage_folders "$real/${IMPACT_MODEL[STORAGE_NAME]}")
+    for folder in "${folders[@]}"; do
+        if [[ -L "$folder" ]]; then
+            impact_fail "$folder is a symbolic link. A real folder is expected."
+        elif [[ ! -d "$folder" ]]; then
+            impact_fail "$folder is missing. Create it with: sudo impact-add-model $MODEL ${IMPACT_MODEL[REPO_URL]} --storage $root"
+        elif impact_shared_dir_is_ok "$folder" "$GROUP"; then
+            impact_ok "$folder follows the shared rules."
+        else
+            impact_warn "$folder does not follow the shared rules. Fix it with: sudo impact-share-folder $folder --dry-run   then without --dry-run."
+        fi
+    done
+done
+block_end
+
+# -----------------------------------------------------------------------------
+# 5. Working copies of the members
+# -----------------------------------------------------------------------------
+block_begin "Working copies of the members of '$GROUP'"
+MEMBERS=()
+mapfile -t MEMBERS < <(impact_group_members "$GROUP")
+copies=0
+VALID_EXTRAS=()
+for path in "${EXTRA_FILES[@]}"; do
+    impact_extras_valid_path "$path" && VALID_EXTRAS+=("$path")
+done
+impact_mktemp_file
+LIST_FILE="$IMPACT_TMP"
+printf '%s\0' "${VALID_EXTRAS[@]}" >"$LIST_FILE"
+
+# copy_git ACCOUNT COPY GIT_ARGUMENTS...
+#   Runs git in the working copy COPY with the rights of the person ACCOUNT
+#   (never as root), with no helper program that watches files.
+copy_git() {
+    local account="$1" copy="$2"
+    shift 2
+    impact_run_as "$account" git -c core.fsmonitor=false -C "$copy" "$@"
+}
+
+# in_extras_only
+#   Reads zero-ended paths on standard input and prints, one per line, those
+#   that are extra files (members of the list VALID_EXTRAS, through the
+#   lookup table IS_EXTRA).
+in_extras_only() {
+    local path
+    while IFS= read -r -d '' path; do
+        if [[ -v IS_EXTRA[$path] ]]; then
+            printf '%s\n' "$path"
+        fi
+    done
+}
+declare -A IS_EXTRA=()
+for path in "${VALID_EXTRAS[@]}"; do
+    IS_EXTRA[$path]=1
+done
+
+for account in "${MEMBERS[@]}"; do
+    impact_valid_account_name "$account" || continue
+    base="$(impact_repo_base_for "$account")" || continue
+    copy="$base/$MODEL"
+    top="$(copy_git "$account" "$copy" rev-parse --show-toplevel 2>/dev/null)" || top=''
+    if [[ "$top" != "$copy" ]]; then
+        continue
+    fi
+    copies=$((copies + 1))
+    origin="$(copy_git "$account" "$copy" config --get remote.origin.url 2>/dev/null)" || origin=''
+    if ! impact_git_same_repo "$origin" "${IMPACT_MODEL[REPO_URL]}"; then
+        impact_warn "$copy ($account) belongs to '$(impact_display "$origin")'. The address of the model is ${IMPACT_MODEL[REPO_URL]}."
+    fi
+    if ((${#VALID_EXTRAS[@]} == 0)); then
+        impact_ok "$copy ($account) is a working copy of the model."
+        continue
+    fi
+    tracked=()
+    visible=()
+    ignored=()
+    # "ls-files -z" lists the files git tracks; with "--others
+    # --exclude-standard" the files it does not track and does not ignore.
+    # "check-ignore --stdin" names the given paths that the ignore lists
+    # cover (a tracked file is never called ignored).
+    mapfile -t tracked < <(copy_git "$account" "$copy" ls-files -z 2>/dev/null | in_extras_only)
+    mapfile -t visible < <(copy_git "$account" "$copy" ls-files -z --others --exclude-standard 2>/dev/null | in_extras_only)
+    mapfile -t ignored < <(copy_git "$account" "$copy" check-ignore -z --stdin <"$LIST_FILE" 2>/dev/null | in_extras_only)
+    for path in "${tracked[@]}"; do
+        impact_fail "$copy ($account): the extra '$(impact_display "$path")' is a file of the repository. Extras and repository disagree about it: remove it from $EXTRAS_FOLDER when GitHub holds it now."
+    done
+    for path in "${visible[@]}"; do
+        impact_fail "$copy ($account): git does not ignore the extra '$(impact_display "$path")'; the next commit of everything would take it to GitHub. Add the line /$(impact_display "$path") to $copy/.git/info/exclude (as $account)."
+    done
+    uncovered=$((${#VALID_EXTRAS[@]} - ${#tracked[@]} - ${#visible[@]} - ${#ignored[@]}))
+    if ((${#tracked[@]} + ${#visible[@]} == 0)); then
+        impact_ok "$copy ($account): no extra is a file of the repository, and git ignores all ${#ignored[@]} extras its ignore lists name."
+    fi
+    if ((uncovered > 0)); then
+        impact_info "$copy ($account): $uncovered extra files are neither in this copy nor in its ignore list (for example extras added after the copy was made)."
+    fi
+done
+if ((copies == 0)); then
+    impact_ok "No member has a working copy of $MODEL yet."
+fi
+block_end
+
+print_summary
+if ((IMPACT_FAIL_COUNT > 0)); then
+    exit "$IMPACT_EXIT_FAILED"
+fi
+exit "$IMPACT_EXIT_OK"

@@ -1,0 +1,507 @@
+#!/bin/bash
+# =============================================================================
+# impact-get-repo: make your own working copy of a model repository
+#
+# Purpose
+#   Copies ("clones") the GitHub repository of a model into your repository
+#   folder on the workstation (REPO_BASE in /etc/impact/impact.conf, usually
+#   ~/Repositories/<model>), with your own key copy
+#   ~/.ssh/id_ed25519_<GitHub name>. Then it adds the model's extra files:
+#   files that the administrator keeps on the workstation because they are
+#   not on GitHub (<MODEL_DIR>/<model>/extras). Every extra file is listed in
+#   the copy's own ignore list (.git/info/exclude), so git never commits it.
+#   The work happens in the folder <model>.partial; only a complete and
+#   checked copy is renamed to <model> at the end. A leftover .partial folder
+#   of an earlier attempt is removed first. An existing <model> folder is
+#   never touched.
+#
+# Who runs it
+#   Each person, as themselves and never with sudo. The GUI runs it for the
+#   button "Add repository". The administrator runs it for a person with
+#   impact-give-repo.
+#
+# Usage
+#   impact-get-repo <model> [--github-name <name>] [--anonymous-https] [--dry-run]
+#
+# Examples
+#   impact-get-repo Example-Model --dry-run     show every step, change nothing
+#   impact-get-repo Example-Model               make the copy
+#   impact-get-repo Example-Model --github-name alice-example
+#                                               choose the key copy when
+#                                               ~/.ssh holds several
+#
+# Options
+#   --github-name <name>  use the key copy ~/.ssh/id_ed25519_<name>. Without
+#                         it, the only key copy of that form is used.
+#   --anonymous-https     copy over HTTPS without any key (works for public
+#                         repositories only), then set the copy's address to
+#                         the SSH form so that later pushes use the key.
+#                         impact-give-repo uses this for a person who has no
+#                         key copy yet.
+#   --dry-run             print every step, change nothing (GitHub is not
+#                         contacted)
+#   --help                show this text
+#
+# Connection to GitHub
+#   ssh accepts GitHub only when the server shows one of GitHub's published
+#   keys from /etc/impact/github_known_hosts ("strict host key checking").
+#   Settings files of ssh are not used, and only the key copy is offered.
+#
+# What extras may contain
+#   Plain files and folders whose names consist of letters, digits, spaces
+#   inside a name and . _ + @ ( ) , = - ; no symbolic links and no names
+#   that start with .git. When an extra lies where the repository has a file
+#   or a symbolic link of its own (a "clash"), the command stops before it
+#   copies anything, removes the unfinished copy, and names the paths. The
+#   repository's file is never replaced, because the right version can only
+#   be decided by the administrator (who checks it with impact-check-model).
+#
+# What it changes on the system
+#   Your repository folder (created with mode 750 when it is missing and lies
+#   in your home folder); the new folder <model> inside it. Nothing else.
+#   All work is done with your own rights.
+#
+# How to undo
+#   Delete the new copy while it holds no work of yours:  rm -rf <the folder>
+#   (the command prints the exact line).
+#
+# Last line of the output (for the GUI)
+#   IMPACT_RESULT status=<ok|error> code=<exit code> path=<copy> reason=<word>
+#   Reasons: cloned, dry_run, exists (your copy exists already),
+#   target_in_use (another folder has that name), no_key, several_keys,
+#   key_unusable, key_refused, no_access, host_key, network, branch_missing,
+#   extras_invalid, extras_clash, extras_not_ignored, repo_folder, busy,
+#   git_failed, unknown_model, model_invalid, not_prepared, run_as_root,
+#   usage, interrupted.
+#
+# Exit codes
+#   0 done (also a dry run); 1 a check or step failed; 2 wrong usage (also:
+#   started as root, several key copies); 3 the workstation is not prepared;
+#   4 the copy exists already, or another command works in the folder;
+#   5 no access (no key copy, the key or the repository refused by GitHub);
+#   6 network problem.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Reading help: bash constructs that appear in this file
+#   NAME=text            store a text in the variable NAME; "$NAME" reads it
+#   local NAME           a variable that exists only inside one function
+#   "$1" "$2" "$@" "$#"  first parameter, second parameter, all parameters,
+#                        number of parameters
+#   "${NAME:-text}"      the value of NAME, or "text" when NAME is unset or empty
+#   $( command )         the text that the command prints
+#   [[ ... ]]            a test: -f plain file, -d folder, -L symbolic link,
+#                        -e exists, -r readable, -x executable, -z empty text,
+#                        -n text with content, == equal, != different,
+#                        =~ matches a pattern
+#   (( ... ))            arithmetic: true when the result is not zero
+#   A && B               run B only when A succeeded
+#   A || B               run B only when A failed
+#   ! command            true when the command fails
+#   if / case / for / while   branches and loops; "case" compares one value
+#                        with several patterns
+#   >file >>file <file   write to a file (replace it / add to its end), read
+#                        from a file
+#   2>/dev/null  >&2     throw error messages away / write to the error channel
+#   command1 | command2  hand the output of command1 to command2
+#   return N / exit N    end the function / the script with status N; 0 means
+#                        success
+#   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+# Constructs beyond these are explained where they are first used.
+# -----------------------------------------------------------------------------
+
+# "set -e" stops the script at the first command that fails, "-u" stops it
+# when a variable is read that was never set, and "-o pipefail" makes a chain
+# of commands joined with "|" fail when any part of it fails.
+set -euo pipefail
+
+# Find this file's real place (the name in /usr/local/bin is a link) and load
+# the shared functions that lie next to it in ../lib.
+IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-common.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-models.sh
+source "$IMPACT_LIB_DIR/impact-models.sh"
+impact_init "$IMPACT_SELF"
+
+# From here on the last line of output is the IMPACT_RESULT line, however the
+# command ends.
+impact_result_enable
+
+# -----------------------------------------------------------------------------
+# 1. Options, who runs it, settings, model
+# -----------------------------------------------------------------------------
+impact_parse_args 'dry-run anonymous-https' 'github-name' '' "$@"
+impact_require_arg_count 1 1
+MODEL="${IMPACT_ARGS[0]}"
+impact_require_not_root
+impact_require_conf
+if ! impact_valid_model_name "$MODEL"; then
+    impact_die_usage "'$(impact_display "$MODEL")' is no valid model name."
+fi
+GITHUB_NAME=''
+if impact_opt_given github-name; then
+    GITHUB_NAME="$(impact_opt github-name)"
+    if ! impact_valid_github_name "$GITHUB_NAME"; then
+        impact_die_usage "'$(impact_display "$GITHUB_NAME")' is no valid GitHub name."
+    fi
+fi
+impact_require_model "$MODEL"
+impact_git_clean_env
+
+ACCOUNT="$(id -un)"
+if ! impact_valid_account_name "$ACCOUNT"; then
+    impact_die "$IMPACT_EXIT_FAILED" "The account name '$(impact_display "$ACCOUNT")' does not follow the rules for IMPACT accounts." \
+        "Contact $(impact_contact_text)."
+fi
+HOME_DIR="$(impact_account_home "$ACCOUNT")" || HOME_DIR=''
+if ! impact_valid_abs_path "$HOME_DIR"; then
+    impact_die "$IMPACT_EXIT_FAILED" "The home folder of '$ACCOUNT' is no usable path." "Contact $(impact_contact_text)."
+fi
+if ! REPO_BASE_DIR="$(impact_repo_base_for "$ACCOUNT")"; then
+    impact_die_reason "$IMPACT_EXIT_FAILED" repo_folder "The repository folder cannot be worked out from REPO_BASE in $IMPACT_CONF_FILE." \
+        "Contact $(impact_contact_text)."
+fi
+TARGET="$REPO_BASE_DIR/$MODEL"
+PARTIAL="$TARGET.partial"
+MODEL_FOLDER="$(impact_model_dir "$MODEL")"
+EXTRAS_FOLDER="$MODEL_FOLDER/extras"
+REPO_URL="${IMPACT_MODEL[REPO_URL]}"
+BRANCH="${IMPACT_MODEL[BRANCH]}"
+impact_parse_github_address "$REPO_URL"
+HTTPS_URL="$IMPACT_GH_HTTPS_URL"
+impact_result_set "$TARGET"
+
+# -----------------------------------------------------------------------------
+# 2. Checks that only read (they run in a dry run too)
+# -----------------------------------------------------------------------------
+impact_step "Checks"
+impact_require_tools git ssh find sort flock cp mkdir mv rm stat
+impact_info "Model:  $MODEL ($REPO_URL, branch: ${BRANCH:-the default branch})"
+impact_info "Copy:   $TARGET"
+
+# The key copy, unless the copy is made over anonymous HTTPS.
+KEY=''
+if impact_opt_given anonymous-https; then
+    impact_ok "The copy is made over anonymous HTTPS ($HTTPS_URL), without a key. This works for public repositories only."
+else
+    if [[ -n "$GITHUB_NAME" ]]; then
+        KEY="$(impact_key_copy_path "$HOME_DIR" "$GITHUB_NAME")"
+    else
+        KEY_NAMES=()
+        mapfile -t KEY_NAMES < <(impact_key_copy_names "$HOME_DIR")
+        if ((${#KEY_NAMES[@]} == 0)); then
+            impact_die_reason "$IMPACT_EXIT_NO_ACCESS" no_key "There is no key copy in $HOME_DIR/.ssh (a file named id_ed25519_<GitHub name>), so GitHub cannot be reached with your key." \
+                "The GUI places the key copy at your first REMOTE start. Or ask $(impact_contact_text) to run: sudo impact-give-repo $ACCOUNT $MODEL"
+        fi
+        if ((${#KEY_NAMES[@]} > 1)); then
+            impact_die_reason "$IMPACT_EXIT_USAGE" several_keys "There are several key copies in $HOME_DIR/.ssh (${KEY_NAMES[*]})." \
+                "Name your GitHub name: $IMPACT_CMD $MODEL --github-name <name>"
+        fi
+        KEY="$(impact_key_copy_path "$HOME_DIR" "${KEY_NAMES[0]}")"
+    fi
+    if ! impact_key_copy_usable "$KEY"; then
+        if [[ ! -e "$KEY" && ! -L "$KEY" ]]; then
+            impact_die_reason "$IMPACT_EXIT_NO_ACCESS" no_key "There is no key copy $KEY." \
+                "The GUI places the key copy at your first REMOTE start. Check the GitHub name, or contact $(impact_contact_text)."
+        fi
+        impact_die_reason "$IMPACT_EXIT_FAILED" key_unusable "The key copy cannot be used: $IMPACT_KEY_COPY_PROBLEM" \
+            "Correct it as described, or let the GUI place the key copy again."
+    fi
+    impact_ok "The key copy $KEY is in order."
+fi
+
+# The repository folder must be a real folder of this account. A missing one
+# is created when it lies inside the home folder.
+CREATE_REPO_BASE=0
+if [[ -L "$REPO_BASE_DIR" ]] || { [[ -e "$REPO_BASE_DIR" ]] && { [[ ! -d "$REPO_BASE_DIR" ]] || [[ ! -O "$REPO_BASE_DIR" ]]; }; }; then
+    impact_die_reason "$IMPACT_EXIT_FAILED" repo_folder "$REPO_BASE_DIR is no folder of the account $ACCOUNT (or it is a symbolic link)." \
+        "Contact $(impact_contact_text)."
+elif [[ ! -e "$REPO_BASE_DIR" ]]; then
+    if ! impact_path_is_below "$REPO_BASE_DIR" "$HOME_DIR"; then
+        impact_die_reason "$IMPACT_EXIT_FAILED" repo_folder "Your repository folder $REPO_BASE_DIR does not exist, and only the administrator can create it there." \
+            "Contact $(impact_contact_text)."
+    fi
+    CREATE_REPO_BASE=1
+    impact_ok "Your repository folder $REPO_BASE_DIR does not exist yet; it is created."
+else
+    impact_ok "Your repository folder $REPO_BASE_DIR exists."
+fi
+
+# An existing target is never touched.
+if [[ -e "$TARGET" || -L "$TARGET" ]]; then
+    origin=''
+    if [[ -d "$TARGET" && ! -L "$TARGET" ]] &&
+        [[ "$(impact_git -C "$TARGET" rev-parse --show-toplevel 2>/dev/null)" == "$TARGET" ]]; then
+        origin="$(impact_git -C "$TARGET" config --get remote.origin.url 2>/dev/null)" || origin=''
+    fi
+    if [[ -n "$origin" ]] && impact_git_same_repo "$origin" "$REPO_URL"; then
+        impact_die_reason "$IMPACT_EXIT_CONFLICT" exists "You have a working copy of $MODEL already: $TARGET. Nothing was changed." \
+            "Use the existing copy. To start again from GitHub, first move the old copy away (after saving your work)."
+    fi
+    impact_die_reason "$IMPACT_EXIT_CONFLICT" target_in_use "$TARGET exists and is no working copy of $MODEL. Nothing was changed." \
+        "Rename or move that folder, then try again."
+fi
+impact_ok "$TARGET does not exist yet."
+
+# The extras of the model.
+if ! impact_extras_scan "$EXTRAS_FOLDER"; then
+    for text in "${IMPACT_EXTRAS_PROBLEMS[@]}"; do
+        impact_error "$text"
+    done
+    impact_die_reason "$IMPACT_EXIT_FAILED" extras_invalid "The extra files of the model $MODEL break the rules (see above). The copy was not made." \
+        "Contact $(impact_contact_text). The administrator checks them with: sudo impact-check-model $MODEL"
+fi
+if ((${#IMPACT_EXTRAS_FILES[@]} + ${#IMPACT_EXTRAS_DIRS[@]} == 0)); then
+    impact_ok "The model has no extra files."
+else
+    impact_ok "The model has ${#IMPACT_EXTRAS_FILES[@]} extra files in ${#IMPACT_EXTRAS_DIRS[@]} folders; they are copied after the clone."
+fi
+EXTRA_FILES=("${IMPACT_EXTRAS_FILES[@]}")
+EXTRA_DIRS=("${IMPACT_EXTRAS_DIRS[@]}")
+
+# Only one of these commands at a time in the repository folder.
+if ! impact_is_dry_run && ((CREATE_REPO_BASE == 0)); then
+    impact_models_lock_dir "$REPO_BASE_DIR" ||
+        impact_die_reason "$IMPACT_EXIT_CONFLICT" busy "Another impact-get-repo or impact-update-setup works in $REPO_BASE_DIR right now." \
+            "Wait until it has finished, then try again."
+fi
+
+# Temporary files for git's messages and lists (removed at the end).
+impact_mktemp_file
+ERROR_FILE="$IMPACT_TMP"
+impact_mktemp_file
+LIST_FILE="$IMPACT_TMP"
+impact_mktemp_file
+IGNORED_FILE="$IMPACT_TMP"
+
+# remove_partial_on_failure EXIT_CODE
+#   Runs when the command ends (registered with impact_on_exit). After a
+#   failure it removes the unfinished copy, so nothing half-done is left.
+CLONE_STARTED=0
+remove_partial_on_failure() {
+    if (($1 != 0 && CLONE_STARTED == 1)) && [[ -e "$PARTIAL" || -L "$PARTIAL" ]]; then
+        rm -rf -- "$PARTIAL" && printf 'The unfinished copy %s was removed.\n' "$PARTIAL" >&2
+    fi
+}
+impact_on_exit remove_partial_on_failure
+
+# -----------------------------------------------------------------------------
+# 3. Steps
+# -----------------------------------------------------------------------------
+
+# create_repo_base
+#   Creates the person's repository folder (mode 750) and takes the lock on
+#   it. Missing parent folders inside the home folder are created as well.
+create_repo_base() {
+    mkdir -p -- "$(dirname -- "$REPO_BASE_DIR")" &&
+        mkdir -m 750 -- "$REPO_BASE_DIR" &&
+        impact_models_lock_dir "$REPO_BASE_DIR"
+}
+
+# run_clone
+#   Copies the repository into the .partial folder. git's messages go to
+#   ERROR_FILE (for the classification of a failure) and are shown.
+#   Result: the exit code of git.
+run_clone() {
+    local status=0
+    local -a options=(clone --origin origin --no-recurse-submodules)
+    if [[ -n "$BRANCH" ]]; then
+        options+=(--branch "$BRANCH")
+    fi
+    CLONE_STARTED=1
+    if [[ -n "$KEY" ]]; then
+        # "local -x" creates a variable that exists only in this function and
+        # is handed to the programs it starts (git, and through git: ssh).
+        local -x GIT_SSH_COMMAND
+        GIT_SSH_COMMAND="$(impact_git_ssh_command "$KEY")" || return 1
+        impact_git "${options[@]}" -- "$REPO_URL" "$PARTIAL" 2>"$ERROR_FILE" || status=$?
+    else
+        # No stored password helper and no question for a user name: a
+        # private repository then fails at once with a clear message.
+        impact_git -c credential.helper= -c core.askPass= "${options[@]}" -- "$HTTPS_URL" "$PARTIAL" 2>"$ERROR_FILE" || status=$?
+    fi
+    # "sed 's/^/    git: /'" puts a mark in front of every line.
+    sed -e 's/^/    git: /' -- "$ERROR_FILE" >&2
+    return "$status"
+}
+
+# copy_extras
+#   Copies the extra folders and files into the .partial folder (as the
+#   running account; the dates of the files are kept).
+copy_extras() {
+    local path
+    for path in "${EXTRA_DIRS[@]}"; do
+        mkdir -p -- "$PARTIAL/$path" || return 1
+    done
+    for path in "${EXTRA_FILES[@]}"; do
+        mkdir -p -- "$(dirname -- "$PARTIAL/$path")" || return 1
+        cp --preserve=timestamps -- "$EXTRAS_FOLDER/$path" "$PARTIAL/$path" || return 1
+    done
+}
+
+# write_exclude
+#   Adds the extra files to the copy's own ignore list .git/info/exclude.
+#   This file belongs to the copy alone and is never committed.
+write_exclude() {
+    mkdir -p -- "$PARTIAL/.git/info" &&
+        impact_extras_exclude_lines "${EXTRA_FILES[@]}" >>"$PARTIAL/.git/info/exclude"
+}
+
+# finish_copy
+#   Renames the checked .partial folder to its final name. "mv -n" never
+#   replaces something that appeared there in the meantime; then the
+#   .partial folder is still there, which counts as a failure.
+#   Result: 0 done; 4 the target appeared in the meantime; 1 other failure.
+finish_copy() {
+    if [[ -e "$TARGET" || -L "$TARGET" ]]; then
+        return 4
+    fi
+    mv -n -T -- "$PARTIAL" "$TARGET" || return 1
+    if [[ -e "$PARTIAL" ]]; then
+        return 4
+    fi
+    CLONE_STARTED=0
+}
+
+if ((CREATE_REPO_BASE == 1)); then
+    impact_step "Repository folder"
+    impact_do "Create your repository folder $REPO_BASE_DIR (mode 750)" create_repo_base ||
+        impact_die_reason "$IMPACT_EXIT_FAILED" repo_folder "The repository folder could not be created." "Contact $(impact_contact_text)."
+fi
+
+if [[ -e "$PARTIAL" || -L "$PARTIAL" ]]; then
+    impact_step "Unfinished copy of an earlier attempt"
+    impact_do "Remove the unfinished copy $PARTIAL left by an earlier attempt" rm -rf -- "$PARTIAL" ||
+        impact_die "$IMPACT_EXIT_FAILED" "The unfinished copy $PARTIAL could not be removed." "Contact $(impact_contact_text)."
+fi
+
+impact_step "Copy from GitHub"
+branch_text="${BRANCH:+branch $BRANCH}"
+branch_text="${branch_text:-the default branch}"
+if [[ -n "$KEY" ]]; then
+    clone_text="Clone $REPO_URL ($branch_text) into $PARTIAL with the key copy $KEY"
+else
+    clone_text="Clone $HTTPS_URL ($branch_text) into $PARTIAL over anonymous HTTPS"
+fi
+clone_status=0
+impact_do "$clone_text" run_clone || clone_status=$?
+if ((clone_status != 0)); then
+    impact_git_classify_error "$(cat -- "$ERROR_FILE")"
+    next="Try again later. If it stays like this, contact $(impact_contact_text)."
+    case "$IMPACT_GIT_ERROR_REASON" in
+        key_refused) next="Register your public key on GitHub (the GUI shows it), then try again. Contact: $(impact_contact_text)." ;;
+        no_access) next="Ask the owner of the repository on GitHub for access, then try again. Contact: $(impact_contact_text)." ;;
+        host_key) next="Do not work around this. Tell $(impact_contact_text)." ;;
+        network) next="Check the workstation's connection to github.com and try again later." ;;
+        *) ;;
+    esac
+    impact_die_reason "$IMPACT_GIT_ERROR_CODE" "$IMPACT_GIT_ERROR_REASON" "$IMPACT_GIT_ERROR_CAUSE The copy was not made." "$next"
+fi
+if [[ -z "$KEY" ]]; then
+    impact_do "Set the address of the copy to $REPO_URL (the SSH form, so later pushes use the key)" \
+        impact_git -C "$PARTIAL" config remote.origin.url "$REPO_URL" ||
+        impact_die "$IMPACT_EXIT_FAILED" "The address of the copy could not be set." "Contact $(impact_contact_text)."
+fi
+
+if ((${#EXTRA_FILES[@]} + ${#EXTRA_DIRS[@]} > 0)); then
+    impact_step "Extra files"
+    # Clash check: no extra may lie where the repository has an entry of its
+    # own, and no folder on the way to an extra may be a file or a symbolic
+    # link of the repository (that could lead the copy outside the folder).
+    if impact_is_dry_run; then
+        impact_info "[dry run] After the clone, every extra is checked against the files of the repository."
+    else
+        CLASHES=()
+        for path in "${EXTRA_DIRS[@]}" "${EXTRA_FILES[@]}"; do
+            is_file=0
+            if impact_in_list "$path" "${EXTRA_FILES[@]}"; then
+                is_file=1
+            fi
+            current="$PARTIAL"
+            # Split the path at "/" and walk down part by part.
+            IFS=/ read -r -a parts <<<"$path"
+            for index in "${!parts[@]}"; do
+                current="$current/${parts[index]}"
+                last=0
+                ((index == ${#parts[@]} - 1)) && last=1
+                if [[ -L "$current" ]]; then
+                    CLASHES+=("$path (the repository has a symbolic link at ${current#"$PARTIAL"/})")
+                    break
+                elif [[ -e "$current" ]]; then
+                    if ((last == 1 && is_file == 1)); then
+                        CLASHES+=("$path (the repository has a file of this name)")
+                        break
+                    elif [[ ! -d "$current" ]]; then
+                        CLASHES+=("$path (the repository has a file at ${current#"$PARTIAL"/})")
+                        break
+                    fi
+                else
+                    break
+                fi
+            done
+        done
+        if ((${#CLASHES[@]} > 0)); then
+            for text in "${CLASHES[@]}"; do
+                impact_error "Extra in the way of the repository: $(impact_display "$text")"
+            done
+            impact_die_reason "$IMPACT_EXIT_FAILED" extras_clash "${#CLASHES[@]} extra files of the workstation lie where the repository has files of its own. No file of the repository is replaced, so the copy was not made." \
+                "Contact $(impact_contact_text). The administrator checks the extras with: sudo impact-check-model $MODEL"
+        fi
+        impact_ok "No extra lies where the repository has a file."
+    fi
+    impact_do "Copy ${#EXTRA_FILES[@]} extra files and ${#EXTRA_DIRS[@]} folders from $EXTRAS_FOLDER into $PARTIAL" copy_extras ||
+        impact_die_reason "$IMPACT_EXIT_FAILED" extras_invalid "The extra files could not be copied." "Contact $(impact_contact_text)."
+    if ((${#EXTRA_FILES[@]} > 0)); then
+        impact_do "List the ${#EXTRA_FILES[@]} extra files in $PARTIAL/.git/info/exclude, so that git ignores them" write_exclude ||
+            impact_die_reason "$IMPACT_EXIT_FAILED" extras_not_ignored "The ignore list of the copy could not be written." "Contact $(impact_contact_text)."
+        if ! impact_is_dry_run; then
+            # Proof: git itself must call every extra file "ignored". git
+            # never calls a file of the repository ignored, so this also
+            # proves that no extra is a file of the repository. The list goes
+            # to git as zero-ended paths ("-z --stdin").
+            printf '%s\0' "${EXTRA_FILES[@]}" >"$LIST_FILE"
+            ignore_status=0
+            impact_git -C "$PARTIAL" check-ignore -z --stdin <"$LIST_FILE" >"$IGNORED_FILE" || ignore_status=$?
+            IGNORED=()
+            mapfile -d '' -t IGNORED <"$IGNORED_FILE"
+            NOT_IGNORED=()
+            for path in "${EXTRA_FILES[@]}"; do
+                if ! impact_in_list "$path" "${IGNORED[@]}"; then
+                    NOT_IGNORED+=("$path")
+                fi
+            done
+            if ((ignore_status > 1 || ${#NOT_IGNORED[@]} > 0)); then
+                for path in "${NOT_IGNORED[@]}"; do
+                    impact_error "git does not ignore the extra file: $(impact_display "$path")"
+                done
+                impact_die_reason "$IMPACT_EXIT_FAILED" extras_not_ignored "git does not ignore every extra file, so a later commit could take it to GitHub. The copy was not made." \
+                    "Contact $(impact_contact_text). The administrator checks the extras with: sudo impact-check-model $MODEL"
+            fi
+            impact_ok "git ignores all ${#EXTRA_FILES[@]} extra files, and none of them is a file of the repository."
+        fi
+    fi
+fi
+
+impact_step "Finish"
+finish_status=0
+impact_do "Rename $PARTIAL to $TARGET" finish_copy || finish_status=$?
+if ((finish_status == 4)); then
+    impact_die_reason "$IMPACT_EXIT_CONFLICT" exists "$TARGET appeared while the copy was made. It was left as it is." \
+        "Look at both folders. The new copy was removed."
+elif ((finish_status != 0)); then
+    impact_die "$IMPACT_EXIT_FAILED" "The copy could not be renamed to $TARGET." "Contact $(impact_contact_text)."
+fi
+if impact_is_dry_run; then
+    impact_result_set "$TARGET" dry_run
+else
+    head_text="$(impact_git -C "$TARGET" log -1 --format='%h %cd' --date=short 2>/dev/null)" || head_text=''
+    branch_name="$(impact_git -C "$TARGET" rev-parse --abbrev-ref HEAD 2>/dev/null)" || branch_name=''
+    impact_ok "Your copy is ready: $TARGET (branch $(impact_display "$branch_name"), last commit $(impact_display "$head_text"))."
+    impact_undo "Delete the copy while it holds no work of yours: rm -rf $TARGET"
+    impact_result_set "$TARGET" cloned
+fi
+
+impact_summary

@@ -1,0 +1,453 @@
+#!/bin/bash
+# =============================================================================
+# impact-export-state: write the backup archive of the workstation setup
+#
+# Purpose
+#   Writes one small archive with everything needed to rebuild the IMPACT
+#   setup of this workstation on a new machine with the same user and group
+#   numbers:
+#     - the site settings (/etc/impact) and the SSH rules for the group,
+#     - the workstation's own SSH host keys (/etc/ssh/ssh_host_*),
+#     - the list of accounts with their numbers, groups and GitHub names,
+#       the account records and the archive of received public keys,
+#     - each person's current login keys (~/.ssh/authorized_keys),
+#     - the model folders with model.conf and the extras (the extras are
+#       the only copy of files that are not on GitHub).
+#   The archive is SECRET: it contains the private SSH host keys. Anyone who
+#   has it can pretend to be this workstation. The command shows how to copy
+#   it to another machine; a backup that stays here is lost with the machine.
+#   When the newest archive already holds exactly the same content, nothing
+#   is written.
+#
+# Who runs it
+#   The administrator, with sudo: after every change of people or models,
+#   and before any work on the machine itself.
+#
+# Usage
+#   sudo impact-export-state [--dry-run]
+#
+# Examples
+#   Show what the archive would contain, write nothing:
+#     sudo impact-export-state --dry-run
+#   Write the archive:
+#     sudo impact-export-state
+#   List the archives:
+#     sudo ls -l /opt/impact/admin/state
+#
+# Options
+#   --dry-run    list the content, write nothing
+#   --help       show this text
+#
+# What it changes on the system
+#   Writes /opt/impact/admin/state/impact-state-<time>.tar.gz (mode 600,
+#   root only) and next to it impact-state-<time>.info (its content code
+#   and checksum). Creates /opt/impact/admin/state (mode 700) if missing.
+#   One block in /opt/impact/admin/log/impact-admin.log.
+#   Not in the archive: the data on the shared storage, home folders and
+#   working copies, Docker images, the administrator log, the ACL backups
+#   of impact-share-folder.
+#
+# How to undo
+#   Delete the archive and its .info file:
+#     sudo rm /opt/impact/admin/state/impact-state-<time>.tar.gz /opt/impact/admin/state/impact-state-<time>.info
+#   Delete every copy you made elsewhere as well.
+#
+# How to use the archive on a new machine
+#   Unpack it in a private folder:  sudo tar -xzf impact-state-<time>.tar.gz -C /root
+#   The file CONTENTS.txt inside explains each part and the order of the
+#   steps (group and accounts with the same numbers, settings, host keys,
+#   models).
+#
+# Exit codes
+#   0 done or nothing to do; 1 a step failed; 2 wrong usage;
+#   3 the workstation is not prepared; 4 another impact-export-state runs.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Reading help: bash constructs that appear in this file
+#   NAME=text            store a text in the variable NAME; "$NAME" reads it
+#   local NAME           a variable that exists only inside one function
+#   "$1" "$2" "$@" "$#"  first parameter, second parameter, all parameters,
+#                        number of parameters
+#   "${NAME:-text}"      the value of NAME, or "text" when NAME is unset or empty
+#   $( command )         the text that the command prints
+#   [[ ... ]]            a test: -f plain file, -d folder, -L symbolic link,
+#                        -e exists, -r readable, -x executable, -z empty text,
+#                        -n text with content, == equal, != different,
+#                        =~ matches a pattern
+#   (( ... ))            arithmetic: true when the result is not zero
+#   A && B               run B only when A succeeded
+#   A || B               run B only when A failed
+#   ! command            true when the command fails
+#   if / case / for / while   branches and loops; "case" compares one value
+#                        with several patterns
+#   >file >>file <file   write to a file (replace it / add to its end), read
+#                        from a file
+#   2>/dev/null  >&2     throw error messages away / write to the error channel
+#   command1 | command2  hand the output of command1 to command2
+#   return N / exit N    end the function / the script with status N; 0 means
+#                        success
+#   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+# Constructs beyond these are explained where they are first used.
+# -----------------------------------------------------------------------------
+
+# "set -e" stops the script at the first command that fails, "-u" stops it
+# when a variable is read that was never set, and "-o pipefail" makes a chain
+# of commands joined with "|" fail when any part of it fails.
+set -euo pipefail
+
+# Find this file's real place (the name in /usr/local/bin is a link) and load
+# the shared functions that lie next to it in ../lib.
+IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# The comment lines that start with "shellcheck" tell the checking tool
+# where the loaded files are.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-common.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-sharing.sh
+source "$IMPACT_LIB_DIR/impact-sharing.sh"
+impact_init "$IMPACT_SELF"
+
+# -----------------------------------------------------------------------------
+# 1. Options and arguments
+# -----------------------------------------------------------------------------
+impact_parse_args 'dry-run' '' '' "$@"
+impact_require_arg_count 0 0
+
+# -----------------------------------------------------------------------------
+# 2. Who runs it, settings, log
+# -----------------------------------------------------------------------------
+impact_require_root
+impact_require_conf
+impact_log_enable "$@"
+impact_require_tools tar gzip sha256sum find getent cp stat sync
+impact_lock export-state
+
+STAMP="$(date -u '+%Y%m%dT%H%M%SZ')"
+NAME="impact-state-$STAMP"
+ARCHIVE="$IMPACT_STATE_DIR/$NAME.tar.gz"
+ARCHIVE_INFO="$IMPACT_STATE_DIR/$NAME.info"
+MODEL_FOLDER="${IMPACT_CONF[MODEL_DIR]}"
+GROUP="${IMPACT_CONF[SHARED_GROUP]}"
+
+# The content of the archive, as two lists of the same length: the path
+# inside the archive, and where the file comes from (a file of the system,
+# or a file that this command writes into its private temporary folder).
+ITEM_PATHS=()
+ITEM_SOURCES=()
+SKIPPED=()        # files that were left out, with the reason
+
+# add_item ARCHIVE_PATH SOURCE_FILE
+#   Adds one plain file to the content. A symbolic link or anything else
+#   that is no plain file is left out and named.
+add_item() {
+    if [[ -L "$2" || ! -f "$2" ]]; then
+        SKIPPED+=("$2: no plain file (left out)")
+        return 0
+    fi
+    ITEM_PATHS+=("$1")
+    ITEM_SOURCES+=("$2")
+}
+
+# add_tree ARCHIVE_FOLDER SOURCE_FOLDER
+#   Adds every plain file below SOURCE_FOLDER, keeping the folder structure.
+add_tree() {
+    local file
+    [[ -d "$2" && ! -L "$2" ]] || return 0
+    # -print0 and "read -d ''" pass every name exactly, also with blanks.
+    while IFS= read -r -d '' file; do
+        add_item "$1/${file#"$2"/}" "$file"
+    done < <(find "$2" -mindepth 1 \( -type f -o -type l \) -print0 | LC_ALL=C sort -z)
+}
+
+# -----------------------------------------------------------------------------
+# 3. Checks that only read. They run in a dry run too.
+# -----------------------------------------------------------------------------
+impact_step "Checks"
+if [[ -L "$IMPACT_STATE_DIR" || (-e "$IMPACT_STATE_DIR" && ! -d "$IMPACT_STATE_DIR") ]]; then
+    impact_die "$IMPACT_EXIT_FAILED" "$IMPACT_STATE_DIR is no real folder." "Look at it: ls -ld $IMPACT_STATE_DIR"
+fi
+if [[ -d "$IMPACT_STATE_DIR" ]]; then
+    if ! impact_dir_is "$IMPACT_STATE_DIR" 700 root root; then
+        impact_die "$IMPACT_EXIT_FAILED" "$IMPACT_STATE_DIR is not a folder of root with mode 700 ($(stat -c '%a %U:%G' -- "$IMPACT_STATE_DIR"))." \
+            "Correct it: sudo chown root:root $IMPACT_STATE_DIR && sudo chmod 700 $IMPACT_STATE_DIR"
+    fi
+    impact_ok "The archives go to $IMPACT_STATE_DIR (root only)."
+else
+    impact_info "The folder $IMPACT_STATE_DIR does not exist yet and will be created (mode 700)."
+fi
+
+# A private temporary folder for the files this command writes itself.
+impact_mktemp_dir
+WORK="$IMPACT_TMP"
+
+# -----------------------------------------------------------------------------
+# 4. Collect the content
+# -----------------------------------------------------------------------------
+impact_step "Content of the archive"
+
+# Settings and SSH rules.
+add_item "etc-impact/impact.conf" "$IMPACT_CONF_FILE"
+if [[ -e "$IMPACT_KNOWN_HOSTS_FILE" ]]; then
+    add_item "etc-impact/github_known_hosts" "$IMPACT_KNOWN_HOSTS_FILE"
+fi
+if [[ -e "$IMPACT_SSH_RULES_FILE" ]]; then
+    add_item "ssh-rules/$(basename -- "$IMPACT_SSH_RULES_FILE")" "$IMPACT_SSH_RULES_FILE"
+fi
+
+# The host keys of the SSH server: private keys and their public halves.
+# "nullglob": a pattern without a match gives an empty list.
+shopt -s nullglob
+HOST_KEYS=(/etc/ssh/ssh_host_*_key)
+for key in "${HOST_KEYS[@]}"; do
+    add_item "ssh-host-keys/$(basename -- "$key")" "$key"
+    if [[ -e "$key.pub" ]]; then
+        add_item "ssh-host-keys/$(basename -- "$key").pub" "$key.pub"
+    fi
+done
+shopt -u nullglob
+if ((${#HOST_KEYS[@]} == 0)); then
+    impact_warn "No SSH host keys were found in /etc/ssh. A rebuilt workstation will show every PC a new identity."
+fi
+
+# Accounts: who belongs to the shared group or has a record.
+mapfile -t MEMBERS < <(impact_group_members "$GROUP")
+mapfile -t RECORDED < <(impact_account_records)
+ACCOUNTS=()
+for account in "${MEMBERS[@]}" "${RECORDED[@]}"; do
+    if [[ -n "$account" ]] && ! impact_in_list "$account" "${ACCOUNTS[@]}"; then
+        ACCOUNTS+=("$account")
+    fi
+done
+
+# write_accounts_list FILE
+#   Writes the list of the group and the accounts with all numbers.
+write_accounts_list() {
+    local account record_state github expired groups
+    {
+        printf '# Accounts of the IMPACT setup, written by impact-export-state.\n'
+        printf '# Recreate the group with the same number:  sudo impact-workstation-setup --gid <number> ...\n'
+        printf '# Recreate an account with the same number: sudo impact-add-user <github name> --account <account> --uid <number> ...\n'
+        printf 'group %s number %s\n' "$GROUP" "$(impact_group_gid "$GROUP" || printf 'missing')"
+        for account in "${ACCOUNTS[@]}"; do
+            if ! impact_account_exists "$account"; then
+                printf 'account %s: no longer exists on this machine (only its record is kept)\n' "$account"
+                continue
+            fi
+            record_state="$(impact_account_record_load "$account" >/dev/null 2>&1 && printf '%s' "${IMPACT_ACCOUNT_RECORD[STATE]}" || printf 'no record')"
+            github="$(impact_account_github_name "$account" 2>/dev/null || printf 'unknown')"
+            if impact_account_is_expired "$account"; then expired='yes'; else expired='no'; fi
+            groups="$(impact_account_groups "$account" | paste -sd, -)"
+            printf 'account %s user-number %s group-number %s home %s shell %s groups %s github %s record %s expired %s\n' \
+                "$account" "$(impact_account_uid "$account")" "$(impact_account_gid "$account")" \
+                "$(impact_account_home "$account")" "$(impact_account_shell "$account")" \
+                "${groups:-none}" "$github" "$record_state" "$expired"
+        done
+    } >"$1"
+}
+write_accounts_list "$WORK/accounts.txt"
+add_item "accounts.txt" "$WORK/accounts.txt"
+add_tree "admin/accounts" "$IMPACT_ACCOUNTS_DIR"
+add_tree "admin/keys" "$IMPACT_KEYS_DIR"
+
+# The current login keys, read with the rights of each person, so that a
+# symbolic link in a home folder can never make root read another file.
+mkdir -m 700 -- "$WORK/authorized_keys"
+for account in "${ACCOUNTS[@]}"; do
+    impact_account_exists "$account" || continue
+    home="$(impact_account_home "$account")" || continue
+    status=0
+    impact_user_read_file "$account" "$home/.ssh/authorized_keys" >"$WORK/authorized_keys/$account" 2>"$WORK/read-error" || status=$?
+    case "$status" in
+        0) add_item "people/$account/authorized_keys" "$WORK/authorized_keys/$account" ;;
+        4) ;;   # no login keys: nothing to save
+        *) SKIPPED+=("$home/.ssh/authorized_keys of $account: $(head -n 1 -- "$WORK/read-error" | cut -c1-200) (left out)") ;;
+    esac
+done
+
+# The model folders with model.conf and the extras.
+if [[ -d "$MODEL_FOLDER" && ! -L "$MODEL_FOLDER" ]]; then
+    add_tree "models" "$MODEL_FOLDER"
+else
+    impact_info "No model folder ($MODEL_FOLDER) exists yet."
+fi
+
+# The version of the commands.
+if [[ -f "$IMPACT_BASE_DIR/VERSION" ]]; then
+    add_item "commands-VERSION" "$IMPACT_BASE_DIR/VERSION"
+fi
+
+# write_contents_file FILE
+#   Writes CONTENTS.txt: what each part is and how to use it on a new
+#   machine. The text holds no time, so the same state gives the same text.
+write_contents_file() {
+    local index
+    {
+        cat <<'END'
+IMPACT workstation state
+========================
+
+SECRET: this archive holds the private SSH host keys of the workstation.
+Keep it where only the administrator can read it.
+
+Parts
+  etc-impact/        the site settings (/etc/impact)
+  ssh-rules/         the SSH rules for the shared group (/etc/ssh/sshd_config.d)
+  ssh-host-keys/     the workstation's own SSH keys (/etc/ssh/ssh_host_*)
+  accounts.txt       the shared group and every account with user and group
+                     numbers, groups, GitHub name, record state
+  admin/accounts/    the account records (/opt/impact/admin/accounts)
+  admin/keys/        the received and removed public keys (/opt/impact/admin/keys)
+  people/<account>/authorized_keys   the current login keys of each person
+  models/            the model folders: model.conf and extras (MODEL_DIR)
+  commands-VERSION   the version of the commands that wrote this archive
+
+Order of the steps on a new machine
+  1. Install the commands (install.sh of the same version).
+  2. impact-workstation-setup with the values of etc-impact/impact.conf and
+     --gid <the group number from accounts.txt>.
+  3. Copy the host keys to /etc/ssh/ (owner root; mode 600 for the private
+     keys, 644 for the .pub files), then reload the SSH service. PCs then
+     see the same workstation identity as before.
+  4. For each account in accounts.txt: impact-add-user with --account and
+     --uid <the user number>, and the key from people/<account>/ or
+     admin/keys/.
+  5. Copy models/ to MODEL_DIR (owner root, group = the shared group,
+     folders 2750, files 640), and check each with impact-check-model.
+
+Files
+END
+        for index in "${!ITEM_PATHS[@]}"; do
+            printf '  %s\n' "${ITEM_PATHS[index]}"
+        done
+    } >"$1"
+}
+write_contents_file "$WORK/CONTENTS.txt"
+add_item "CONTENTS.txt" "$WORK/CONTENTS.txt"
+
+# Print the content list: archive path, size and source.
+TOTAL=0
+for index in "${!ITEM_PATHS[@]}"; do
+    size="$(stat -c '%s' -- "${ITEM_SOURCES[index]}")"
+    TOTAL=$((TOTAL + size))
+    source_text="${ITEM_SOURCES[index]}"
+    if [[ "$source_text" == "$WORK"/* ]]; then
+        source_text='written by this command'
+    fi
+    impact_info "$(printf '%-48s %10s  (%s)' "${ITEM_PATHS[index]}" "$(impact_sharing_bytes "$size")" "$(impact_display "$source_text")")"
+done
+impact_ok "${#ITEM_PATHS[@]} files, $(impact_sharing_bytes "$TOTAL") before compression."
+for item in "${SKIPPED[@]}"; do
+    impact_warn "Left out: $(impact_display "$item")"
+done
+
+# The content code: one checksum over every path, mode, owner and content.
+# Two runs with the same state give the same code.
+CODE="$(impact_sharing_manifest_code ITEM_PATHS ITEM_SOURCES)"
+
+# -----------------------------------------------------------------------------
+# 5. The archive
+# -----------------------------------------------------------------------------
+impact_step "Archive"
+
+# The newest earlier archive, and whether it holds the same content.
+NEWEST=''
+if [[ -d "$IMPACT_STATE_DIR" ]]; then
+    NEWEST="$(find "$IMPACT_STATE_DIR" -maxdepth 1 -type f -name 'impact-state-*.tar.gz' -printf '%f\n' | LC_ALL=C sort | tail -n 1)"
+fi
+SAME=0
+if [[ -n "$NEWEST" ]]; then
+    newest_info="$IMPACT_STATE_DIR/${NEWEST%.tar.gz}.info"
+    declare -A OLD_INFO=()
+    # shellcheck disable=SC2034
+    # Reason for SC2034 (variables appear unused): impact_kv_parse fills
+    # them through their names; this command needs only OLD_INFO.
+    OLD_ORDER=()
+    # shellcheck disable=SC2034
+    OLD_ERRORS=()
+    if impact_file_is_trusted "$newest_info" && impact_kv_parse "$newest_info" OLD_INFO OLD_ORDER OLD_ERRORS &&
+        [[ "${OLD_INFO[CONTENT_CODE]:-}" == "$CODE" ]] &&
+        [[ "$(sha256sum -- "$IMPACT_STATE_DIR/$NEWEST" | cut -d' ' -f1)" == "${OLD_INFO[ARCHIVE_SHA256]:-}" ]]; then
+        SAME=1
+    fi
+fi
+
+# write_archive
+#   Copies the content into a private folder inside the state folder, packs
+#   it with tar and gzip into a temporary file, writes it to disk, gives it
+#   mode 600 and its final name, then writes the .info file.
+write_archive() {
+    local staging index target temporary checksum
+    impact_mktemp_dir_in "$IMPACT_STATE_DIR" || return 1
+    staging="$IMPACT_TMP"
+    mkdir -m 700 -- "$staging/$NAME" || return 1
+    for index in "${!ITEM_PATHS[@]}"; do
+        target="$staging/$NAME/${ITEM_PATHS[index]}"
+        # install -d creates missing folders with the given mode.
+        install -d -m 700 -- "$(dirname -- "$target")" || return 1
+        # --preserve keeps mode and owner of the original.
+        cp --preserve=mode,ownership -- "${ITEM_SOURCES[index]}" "$target" || return 1
+    done
+    impact_mktemp_file_in "$IMPACT_STATE_DIR" || return 1
+    temporary="$IMPACT_TMP"
+    # --numeric-owner stores user and group numbers, which a rebuilt
+    # machine with the same numbers understands.
+    tar --create --gzip --numeric-owner --file="$temporary" --directory="$staging" -- "$NAME" || return 1
+    chmod 600 -- "$temporary" || return 1
+    sync -- "$temporary" || return 1
+    mv -f -T -- "$temporary" "$ARCHIVE" || return 1
+    checksum="$(sha256sum -- "$ARCHIVE" | cut -d' ' -f1)" || return 1
+    printf 'STATE_ARCHIVE_VERSION=1\nARCHIVE=%s\nCREATED=%s\nFILES=%s\nCONTENT_CODE=%s\nARCHIVE_SHA256=%s\n' \
+        "$NAME.tar.gz" "$(impact_now_utc)" "${#ITEM_PATHS[@]}" "$CODE" "$checksum" |
+        impact_write_file_atomic "$ARCHIVE_INFO" 600 root root
+}
+
+if ((SAME == 1)); then
+    impact_ok "The newest archive $IMPACT_STATE_DIR/$NEWEST already holds exactly this content. No new archive is needed."
+    SHOWN="$IMPACT_STATE_DIR/$NEWEST"
+else
+    if [[ ! -d "$IMPACT_STATE_DIR" ]]; then
+        impact_do "Create the folder $IMPACT_STATE_DIR (owner root, mode 700)" impact_make_dir "$IMPACT_STATE_DIR" 700 root root
+    fi
+    impact_do "Write the archive $ARCHIVE (mode 600, root only) and its checksum file $ARCHIVE_INFO" write_archive ||
+        impact_die "$IMPACT_EXIT_FAILED" "The archive could not be written." "Check the free space in $IMPACT_STATE_DIR, then run the command again."
+    impact_undo "Delete the archive: sudo rm $ARCHIVE $ARCHIVE_INFO"
+    impact_log_note "archive: $ARCHIVE"
+    SHOWN="$ARCHIVE"
+    if ! impact_is_dry_run; then
+        impact_ok "Written: $ARCHIVE ($(impact_sharing_bytes "$(stat -c '%s' -- "$ARCHIVE")"), mode $(stat -c '%a %U:%G' -- "$ARCHIVE"))."
+        impact_info "Content of the archive (from the archive itself):"
+        while IFS= read -r line; do
+            impact_info "  $line"
+        done < <(tar --list --gzip --file="$ARCHIVE")
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+# 6. Keep the archive safe
+# -----------------------------------------------------------------------------
+impact_step "Keep the archive safe"
+ADMIN="$(impact_invoking_account)"
+ADMIN_HOME="$(impact_account_home "$ADMIN" 2>/dev/null || printf '/home/%s' "$ADMIN")"
+CHECKSUM='(written by the real run)'
+if [[ -f "$SHOWN" ]]; then
+    CHECKSUM="$(sha256sum -- "$SHOWN" | cut -d' ' -f1)"
+fi
+impact_say "    IMPORTANT: the archive is secret. It contains the private SSH host keys of this"
+impact_say "    workstation. Anyone who has a copy can pretend to be this workstation to every PC."
+impact_say "    Copy it to another machine now: a backup that stays here is lost together with this machine."
+impact_say "      1. Make a copy that your own account can read:"
+impact_say "           sudo install -m 600 -o $ADMIN -g $(id -gn "$ADMIN" 2>/dev/null || printf '%s' "$ADMIN") $SHOWN $ADMIN_HOME/"
+impact_say "      2. On your PC, fetch it (from a terminal there):"
+impact_say "           scp $ADMIN@<workstation address>:$(basename -- "$SHOWN") ."
+impact_say "      3. Compare the checksum on the PC with this one:"
+impact_say "           $CHECKSUM"
+impact_say "      4. Delete the copy in your home folder here:  rm $ADMIN_HOME/$(basename -- "$SHOWN")"
+impact_say "    Keep the copy where only you can read it (for example an encrypted drive). Never put it"
+impact_say "    on the shared storage, in a GitHub repository or into an e-mail."
+
+# -----------------------------------------------------------------------------
+# 7. End: "What changed" and "How to undo", or "Nothing to do".
+# -----------------------------------------------------------------------------
+impact_summary

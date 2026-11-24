@@ -1,0 +1,582 @@
+#!/bin/bash
+# =============================================================================
+# impact-key: show, add, replace or remove the login keys of a person
+#
+# Purpose
+#   A person logs in to the workstation with an SSH key: the public key of
+#   each of the person's PCs is listed in ~/.ssh/authorized_keys. This
+#   command manages that list for one enrolled person and shows the
+#   fingerprint of every key (the short code SHA256:... that the GUI shows
+#   on the person's PC).
+#     list      show the login keys and the key copy for git
+#     add       add a further key, for example of a second PC
+#     replace   put a new key in the place of an old one ("Renew key" in the
+#               GUI). The old key copy for git is deleted, and the command
+#               reminds you that the person must delete the old key on GitHub
+#     remove    take one key away
+#   Every key that is taken away is kept in /opt/impact/admin/keys, so it
+#   can be put back.
+#
+# Who runs it
+#   The administrator, with sudo.
+#
+# Usage
+#   sudo impact-key list    <account>
+#   sudo impact-key add     <account> [key source] [--fingerprint <SHA256:...>]
+#   sudo impact-key replace <account> [key source] [--fingerprint <SHA256:...>]
+#                                     [--old-fingerprint <SHA256:...>]
+#   sudo impact-key remove  <account> --fingerprint <SHA256:...> [--yes]
+#
+#   Key source of the new key (add, replace), one of three:
+#     --key-file <file>   the public key the person sent (ends in .pub)
+#     --github            the keys that GitHub shows for the person's GitHub
+#                         name (the name noted at enrolment)
+#     neither             the key line on standard input, or pasted when asked
+#
+# Examples
+#   sudo impact-key list alice
+#   sudo impact-key add alice --key-file /tmp/alice-laptop.pub --dry-run
+#   sudo impact-key replace alice --key-file /tmp/alice-new.pub --fingerprint SHA256:<new>
+#   sudo impact-key remove alice --fingerprint SHA256:<old> --yes
+#
+# Options
+#   --fingerprint <SHA256:...>   add, replace: the fingerprint of the NEW key
+#                        as the person sent it; it chooses and confirms the
+#                        key without a question. remove: the key to remove
+#   --old-fingerprint <SHA256:...>   replace: the key that is replaced. Needed
+#                        when the person has more than one key
+#   --key-file <file>, --github      see "Key source"
+#   --yes                remove: answer the question with yes. The question
+#                        about the fingerprint of a new key is answered only
+#                        by --fingerprint or on the terminal
+#   --dry-run            print every step, change nothing
+#   --help               show this text
+#
+# What it changes on the system
+#   ~/.ssh/authorized_keys of the person (written with the person's rights);
+#   replace and remove: the key copy ~/.ssh/id_ed25519_<GitHub name> when it
+#   belongs to the key that is taken away;
+#   /opt/impact/admin/keys/<account>/ (copies of received and removed keys);
+#   one block in /opt/impact/admin/log/impact-admin.log. "list" changes
+#   nothing.
+#
+# How to undo
+#   add:      sudo impact-key remove <account> --fingerprint <the new key>
+#   remove:   sudo impact-key add <account> --key-file <saved key> --fingerprint <its fingerprint>
+#   replace:  the reverse replace with the saved old key
+#   The command prints the exact line at its end.
+#
+# Exit codes
+#   0 done, or nothing to do; 1 a check or a step failed, or the fingerprint
+#   was not confirmed; 2 wrong usage, or a key line that is not accepted;
+#   3 the workstation is not prepared; 4 the account is not enrolled, or the
+#   request conflicts with its keys; 5 GitHub has no account of that name;
+#   6 GitHub could not be reached.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Reading help: bash constructs that appear in this file
+#   NAME=text            store a text in the variable NAME; "$NAME" reads it
+#   local NAME           a variable that exists only inside one function
+#   "$1" "$2" "$@" "$#"  first parameter, second parameter, all parameters,
+#                        number of parameters
+#   "${NAME:-text}"      the value of NAME, or "text" when NAME is unset or empty
+#   $( command )         the text that the command prints
+#   [[ ... ]]            a test: -f plain file, -d folder, -L symbolic link,
+#                        -e exists, -r readable, -x executable, -z empty text,
+#                        -n text with content, == equal, != different,
+#                        =~ matches a pattern
+#   (( ... ))            arithmetic: true when the result is not zero
+#   A && B               run B only when A succeeded
+#   A || B               run B only when A failed
+#   ! command            true when the command fails
+#   if / case / for / while   branches and loops; "case" compares one value
+#                        with several patterns
+#   >file >>file <file   write to a file (replace it / add to its end), read
+#                        from a file
+#   2>/dev/null  >&2     throw error messages away / write to the error channel
+#   command1 | command2  hand the output of command1 to command2
+#   return N / exit N    end the function / the script with status N; 0 means
+#                        success
+#   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+# Constructs beyond these are explained where they are first used.
+# -----------------------------------------------------------------------------
+
+# "set -e" stops the script at the first command that fails, "-u" stops it
+# when a variable is read that was never set, and "-o pipefail" makes a chain
+# of commands joined with "|" fail when any part of it fails.
+set -euo pipefail
+
+# Find this file's real place (the name in /usr/local/bin is a link) and load
+# the shared functions that lie next to it in ../lib.
+IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# The comment lines below tell the checking tool "shellcheck" where the
+# loaded files are.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-common.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-users.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-users.sh"
+impact_init "$IMPACT_SELF"
+
+impact_parse_args 'dry-run yes github' 'key-file fingerprint old-fingerprint' '' "$@"
+impact_require_arg_count 2 2
+ACTION="${IMPACT_ARGS[0]}"
+ACCOUNT="${IMPACT_ARGS[1]}"
+
+# -----------------------------------------------------------------------------
+# Validate the request before any use
+# -----------------------------------------------------------------------------
+case "$ACTION" in
+    list | add | replace | remove) ;;
+    *) impact_die_usage "'$(impact_display "$ACTION")' is no action of $IMPACT_CMD. The actions are: list, add, replace, remove." ;;
+esac
+if ! impact_valid_account_name "$ACCOUNT"; then
+    impact_die_usage "'$(impact_display "$ACCOUNT")' is no valid account name (a lower-case letter first, then lower-case letters, digits, - or _; at most 32 characters)."
+fi
+
+# refuse_options ACTION OPTION...
+#   Stops with exit code 2 when one of the options was given, because it
+#   has no meaning for this action.
+refuse_options() {
+    local action="$1" option
+    shift
+    for option in "$@"; do
+        if impact_opt_given "$option"; then
+            impact_die_usage "The option --$option has no meaning for '$action'."
+        fi
+    done
+}
+
+case "$ACTION" in
+    list) refuse_options list github key-file fingerprint old-fingerprint yes ;;
+    add) refuse_options add old-fingerprint ;;
+    remove)
+        refuse_options remove github key-file old-fingerprint
+        if ! impact_opt_given fingerprint; then
+            impact_die_usage "'remove' needs --fingerprint <SHA256:...>: the fingerprint of the key to remove. 'sudo $IMPACT_CMD list $ACCOUNT' shows them."
+        fi
+        ;;
+    replace) ;;
+esac
+for option in fingerprint old-fingerprint; do
+    if impact_opt_given "$option" && ! impact_valid_fingerprint "$(impact_opt "$option")"; then
+        impact_die_usage "'$(impact_display "$(impact_opt "$option")")' given with --$option is no fingerprint. A fingerprint looks like SHA256: followed by 43 letters, digits, + and /."
+    fi
+done
+if impact_opt_given github && impact_opt_given key-file; then
+    impact_die_usage "Give the key in one way only: --github or --key-file (or on standard input)."
+fi
+
+impact_require_root
+impact_require_conf
+if [[ "$ACTION" != 'list' ]]; then
+    impact_log_enable "$@"
+    # Only one command that changes accounts may run at a time.
+    impact_lock accounts
+fi
+
+HOME_DIR=''
+GITHUB=''
+KEY_COPY=''
+
+# -----------------------------------------------------------------------------
+# Functions
+# -----------------------------------------------------------------------------
+
+# do_step TEXT COMMAND [ARGUMENTS...]
+#   Runs one changing step through impact_do. When the step fails, the
+#   command stops with exit code 1 (the error of the tool was printed), so
+#   the exit code of a tool is never mistaken for one of this command.
+do_step() {
+    local text="$1"
+    if [[ "$text" == '--transient' ]]; then
+        text="$2"
+    fi
+    impact_do "$@" || impact_die "$IMPACT_EXIT_FAILED" "This step failed: $text" \
+        "Fix the cause named above and run the command again; the finished steps are not repeated."
+}
+
+# check_account
+#   The account must exist and, for a change, be enrolled and changeable.
+#   Its login keys are read with the rights of the person.
+check_account() {
+    local status=0 state
+    impact_require_tools getent runuser ssh-keygen stat
+    if ! impact_account_exists "$ACCOUNT"; then
+        impact_die "$IMPACT_EXIT_FAILED" "The account '$ACCOUNT' does not exist." \
+            "Check the name: sudo impact-list-users"
+    fi
+    impact_account_record_load "$ACCOUNT" || status=$?
+    if ((status == 2)); then
+        for state in "${IMPACT_ACCOUNT_RECORD_ERRORS[@]}"; do
+            impact_error "$state"
+        done
+        impact_die "$IMPACT_EXIT_FAILED" "The record $(impact_account_record_file "$ACCOUNT") cannot be used." ""
+    fi
+    if ((status == 0)); then
+        GITHUB="${IMPACT_ACCOUNT_RECORD[GITHUB_NAME]}"
+        state="${IMPACT_ACCOUNT_RECORD[STATE]}"
+    else
+        state='none'
+    fi
+    if [[ "$ACTION" != 'list' ]]; then
+        if [[ "$state" == 'none' ]]; then
+            impact_die "$IMPACT_EXIT_CONFLICT" "The account '$ACCOUNT' was not enrolled with impact-add-user." \
+                "Enrol it first: sudo impact-add-user <GitHub name> --account $ACCOUNT --existing --key-file <file>"
+        fi
+        if [[ "$state" == 'removed' ]]; then
+            impact_die "$IMPACT_EXIT_CONFLICT" "The account '$ACCOUNT' was removed with impact-remove-user." \
+                "Bring the person back with the line that impact-remove-user printed (sudo impact-add-user ... --existing)."
+        fi
+        if ! impact_users_check_changeable "$ACCOUNT"; then
+            impact_die "$IMPACT_EXIT_CONFLICT" "$IMPACT_USERS_REASON" "Choose the account of the colleague."
+        fi
+        impact_ok "The account '$ACCOUNT' is enrolled (GitHub name '$GITHUB')."
+    elif [[ "$state" == 'none' ]]; then
+        impact_info "The account '$ACCOUNT' was not enrolled with impact-add-user."
+    else
+        impact_ok "The account '$ACCOUNT' has the state '$state' (GitHub name '$GITHUB')."
+    fi
+    HOME_DIR="$(impact_account_home "$ACCOUNT")"
+    status=0
+    impact_users_read_authorized_keys "$ACCOUNT" || status=$?
+    if ((status != 0)); then
+        impact_die "$IMPACT_EXIT_FAILED" "The login keys of '$ACCOUNT' cannot be read safely: $HOME_DIR/.ssh or the file authorized_keys in it is a symbolic link or belongs to another account (see the line above)." \
+            "Look at it (sudo ls -la $HOME_DIR/.ssh) and correct the entry; it must be a real folder and a plain file of $ACCOUNT. Then run the command again."
+    fi
+    if [[ -n "$GITHUB" ]]; then
+        KEY_COPY="$(impact_key_copy_path "$HOME_DIR" "$GITHUB")"
+    fi
+}
+
+# print_keys
+#   Prints the login keys of the person, one per line.
+print_keys() {
+    local number print kind description count=0
+    while IFS='|' read -r number print kind description; do
+        [[ -n "$number" ]] || continue
+        count=$((count + 1))
+        if [[ "$kind" == 'plain' ]]; then
+            impact_info "key $number: $print  ($description)"
+        else
+            impact_info "key $number: $print  ($description; not written by the IMPACT commands)"
+        fi
+    done < <(impact_users_key_entries "$IMPACT_USERS_AK_TEXT")
+    if ((count == 0)); then
+        impact_info "No login key: '$ACCOUNT' cannot log in."
+    fi
+}
+
+# key_copy_state
+#   Prints what the key copy for git is: "missing", "of key SHA256:...",
+#   "unreadable" or "no plain file". Read-only.
+key_copy_state() {
+    local status=0 blob
+    [[ -n "$KEY_COPY" ]] || {
+        printf 'unknown (no GitHub name noted)\n'
+        return 0
+    }
+    impact_user_file_exists "$ACCOUNT" "$KEY_COPY" 2>/dev/null || status=$?
+    case "$status" in
+        0)
+            if blob="$(impact_users_key_copy_blob "$ACCOUNT" "$KEY_COPY")"; then
+                printf 'present, of the key %s\n' "$(impact_key_fingerprint "ssh-ed25519 $blob" 2>/dev/null || printf '?')"
+            else
+                printf 'present, unreadable (not a key without passphrase)\n'
+            fi
+            ;;
+        4) printf 'missing\n' ;;
+        *) printf 'present, no plain file (a symbolic link or another kind of entry)\n' ;;
+    esac
+}
+
+# copy_stays REMAINING_TEXT
+#   Result: success when the key copy is the private half of a key that
+#   stays a login key (a key of REMAINING_TEXT, the login keys after this
+#   run), so it must stay. Failure when it belongs to the key that is taken
+#   away or to no login key at all, cannot be read, or is no plain file:
+#   then it is deleted.
+copy_stays() {
+    local blob
+    impact_user_file_exists "$ACCOUNT" "$KEY_COPY" 2>/dev/null || return 1
+    blob="$(impact_users_key_copy_blob "$ACCOUNT" "$KEY_COPY")" || return 1
+    impact_users_text_has_blob "$1" "$blob"
+}
+
+# key_copy_present
+#   Result: success when something exists at the place of the key copy or
+#   of its .pub file.
+key_copy_present() {
+    local status path
+    for path in "$KEY_COPY" "$KEY_COPY.pub"; do
+        status=0
+        impact_user_file_exists "$ACCOUNT" "$path" 2>/dev/null || status=$?
+        if ((status != 4)); then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# remove_key_copy
+#   Deletes the key copy and its .pub file, with the rights of the person.
+remove_key_copy() {
+    impact_user_remove_file "$ACCOUNT" "$KEY_COPY" && impact_user_remove_file "$ACCOUNT" "$KEY_COPY.pub"
+}
+
+# handle_key_copy REMAINING_TEXT
+#   Deletes the key copy for git unless it belongs to a key that stays a
+#   login key. A copy of the key that is taken away, a copy that cannot be
+#   read, and a copy of no enrolled key are deleted. The GUI places the copy
+#   of the key in use again at the next start.
+handle_key_copy() {
+    if [[ -z "$KEY_COPY" ]] || ! key_copy_present; then
+        impact_ok "There is no key copy for git ($HOME_DIR/.ssh/id_ed25519_$GITHUB) to delete."
+        return 0
+    fi
+    if copy_stays "$1"; then
+        impact_ok "The key copy $KEY_COPY belongs to a key that stays a login key of '$ACCOUNT'; it stays."
+        return 0
+    fi
+    impact_do "Delete the key copy for git $KEY_COPY (and its .pub file), with the rights of '$ACCOUNT'; the GUI places the copy of the key in use again at the next start" \
+        remove_key_copy || impact_die "$IMPACT_EXIT_FAILED" "The key copy could not be deleted (see the line above)." "Look at it: sudo ls -la $HOME_DIR/.ssh"
+}
+
+# write_keys TEXT_FILE
+#   Installs the new content of authorized_keys, with the rights of the
+#   person.
+write_keys() {
+    impact_users_write_authorized_keys "$ACCOUNT" "$1"
+}
+
+# install_text TEXT STEP_TEXT
+#   Writes TEXT as the new authorized_keys (one impact_do step).
+install_text() {
+    local file
+    impact_mktemp_file
+    file="$IMPACT_TMP"
+    # The file ends with a line end; an empty text gives an empty file.
+    if [[ -n "$1" ]]; then
+        printf '%s\n' "$1" >"$file"
+    fi
+    impact_do "$2" write_keys "$file" ||
+        impact_die "$IMPACT_EXIT_FAILED" "The login keys could not be written safely (see the line above)." \
+            "Look at $HOME_DIR/.ssh (sudo ls -la $HOME_DIR/.ssh); it must be a real folder of '$ACCOUNT'."
+}
+
+# archive_lines FINGERPRINT
+#   Saves the key lines with this fingerprint in a new folder of the key
+#   archive and prints nothing. ARCHIVE_DIR holds the folder afterwards.
+archive_lines() {
+    local lines
+    lines="$(impact_users_lines_with_fingerprint "$IMPACT_USERS_AK_TEXT" "$1")"
+    ARCHIVE_DIR="$(impact_users_new_archive_name "$ACCOUNT" key)"
+    do_step "Keep a copy of the key $1 in $ARCHIVE_DIR (root only)" \
+        impact_users_save_key_lines "$ARCHIVE_DIR" "$lines"
+}
+
+# blob_of_fingerprint FINGERPRINT
+#   Prints the key data of the line with this fingerprint (for a plain
+#   ssh-ed25519 line; empty for other lines).
+blob_of_fingerprint() {
+    local line
+    line="$(impact_users_lines_with_fingerprint "$IMPACT_USERS_AK_TEXT" "$1" | head -n 1)"
+    if impact_parse_ed25519_key "$line"; then
+        printf '%s\n' "$IMPACT_KEY_BLOB"
+    fi
+}
+
+# get_new_key
+#   Reads, chooses and checks the new key (add, replace). Sets NEW_LINE,
+#   NEW_PRINT and NEW_PRESENT (1 when the key is a login key already).
+get_new_key() {
+    if impact_opt_given github && [[ -z "$GITHUB" ]]; then
+        impact_die_usage "--github needs the GitHub name of '$ACCOUNT', and none is noted."
+    fi
+    impact_users_collect_keys "$GITHUB"
+    impact_users_choose_key "$GITHUB"
+    NEW_LINE="$IMPACT_KEY_LINE ${IMPACT_KEY_COMMENT:-$GITHUB}"
+    NEW_PRINT="$IMPACT_KEY_FINGERPRINT"
+    NEW_BLOB="$IMPACT_KEY_BLOB"
+    NEW_PRESENT=0
+    if impact_users_text_has_blob "$IMPACT_USERS_AK_TEXT" "$NEW_BLOB"; then
+        NEW_PRESENT=1
+    fi
+    impact_log_note "new key fingerprint: $NEW_PRINT (from $IMPACT_USERS_KEY_SOURCE)"
+}
+
+# save_received
+#   Keeps a copy of the new key in the archive, unless one is there.
+save_received() {
+    if [[ -f "$(impact_users_received_path "$ACCOUNT" "$NEW_PRINT")" ]]; then
+        impact_ok "A copy of the key is kept in $(impact_users_keys_dir "$ACCOUNT")/received."
+    else
+        do_step "Keep a copy of the key in $(impact_users_received_path "$ACCOUNT" "$NEW_PRINT") (root only)" \
+            impact_users_save_received "$ACCOUNT" "$NEW_LINE" "$NEW_PRINT"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# The actions
+# -----------------------------------------------------------------------------
+
+impact_step "Checks (nothing is changed in this step)"
+check_account
+
+case "$ACTION" in
+    list)
+        impact_step "Login keys of '$ACCOUNT' ($HOME_DIR/.ssh/authorized_keys)"
+        print_keys
+        impact_step "Key copy for git"
+        impact_info "$HOME_DIR/.ssh/id_ed25519_${GITHUB:-<GitHub name>}: $(key_copy_state)"
+        exit "$IMPACT_EXIT_OK"
+        ;;
+
+    add)
+        get_new_key
+        impact_step "Confirmation"
+        if ((NEW_PRESENT == 1)); then
+            impact_ok "The key $NEW_PRINT is a login key of '$ACCOUNT' already; nothing to confirm."
+        else
+            impact_users_confirm_key "$GITHUB"
+        fi
+        impact_step "Add the key"
+        if ((NEW_PRESENT == 1)); then
+            impact_ok "The key $NEW_PRINT is a login key of '$ACCOUNT'."
+        else
+            install_text "$(impact_users_text_with_line "$IMPACT_USERS_AK_TEXT" "$NEW_LINE")" \
+                "Add the key $NEW_PRINT to the login keys of '$ACCOUNT' ($HOME_DIR/.ssh/authorized_keys, written with the rights of '$ACCOUNT')"
+            impact_undo "Remove the key again: sudo impact-key remove $ACCOUNT --fingerprint $NEW_PRINT"
+        fi
+        save_received
+        ;;
+
+    remove)
+        OLD_PRINT="$(impact_opt fingerprint)"
+        impact_log_note "key fingerprint: $OLD_PRINT"
+        if ! impact_users_text_has_fingerprint "$IMPACT_USERS_AK_TEXT" "$OLD_PRINT"; then
+            impact_step "Login keys of '$ACCOUNT'"
+            print_keys
+            impact_summary
+            impact_say "No login key of '$ACCOUNT' has the fingerprint $OLD_PRINT (see the list above)."
+            exit "$IMPACT_EXIT_OK"
+        fi
+        LEFT="$(impact_users_count_keys "$(impact_users_text_without_fingerprint "$IMPACT_USERS_AK_TEXT" "$OLD_PRINT")")"
+        impact_step "Confirmation"
+        QUESTION="Remove the login key $OLD_PRINT from '$ACCOUNT'? A PC with this key can then no longer log in."
+        if ((LEFT == 0)); then
+            QUESTION+=" It is the last login key: '$ACCOUNT' can then no longer log in at all, until a new key is added."
+            impact_warn "$OLD_PRINT is the last login key of '$ACCOUNT'."
+        fi
+        if ! impact_confirm "$QUESTION"; then
+            impact_die "$IMPACT_EXIT_FAILED" "Stopped: the removal was not confirmed. Nothing was changed." \
+                "Run the command again in a terminal, or add --yes after checking the request."
+        fi
+        OLD_BLOB="$(blob_of_fingerprint "$OLD_PRINT")"
+        NEW_TEXT="$(impact_users_text_without_fingerprint "$IMPACT_USERS_AK_TEXT" "$OLD_PRINT")"
+        impact_step "Remove the key"
+        archive_lines "$OLD_PRINT"
+        install_text "$NEW_TEXT" \
+            "Remove the key $OLD_PRINT from the login keys of '$ACCOUNT' ($HOME_DIR/.ssh/authorized_keys, written with the rights of '$ACCOUNT')"
+        if [[ -n "$OLD_BLOB" ]]; then
+            impact_undo "Put the key back: sudo impact-key add $ACCOUNT --key-file $ARCHIVE_DIR/key-1.pub --fingerprint $OLD_PRINT"
+        else
+            impact_undo "The removed line is kept in $ARCHIVE_DIR; put it back by hand if it is needed."
+        fi
+        impact_step "Key copy for git"
+        handle_key_copy "$NEW_TEXT"
+        ;;
+
+    replace)
+        # Which key is the old one?
+        COUNT="$(impact_users_count_keys "$IMPACT_USERS_AK_TEXT")"
+        get_new_key
+        OLD_PRINT=''
+        if impact_opt_given old-fingerprint; then
+            OLD_PRINT="$(impact_opt old-fingerprint)"
+            if [[ "$OLD_PRINT" == "$NEW_PRINT" ]]; then
+                impact_die_usage "--old-fingerprint and the new key are the same key."
+            fi
+            if ! impact_users_text_has_fingerprint "$IMPACT_USERS_AK_TEXT" "$OLD_PRINT"; then
+                if ((NEW_PRESENT == 1)); then
+                    impact_step "Login keys of '$ACCOUNT'"
+                    print_keys
+                    impact_summary
+                    impact_say "The key $OLD_PRINT is no login key of '$ACCOUNT' any more, and the new key $NEW_PRINT is one: the replacement was done earlier."
+                    exit "$IMPACT_EXIT_OK"
+                fi
+                impact_step "Login keys of '$ACCOUNT'"
+                print_keys
+                impact_die "$IMPACT_EXIT_CONFLICT" "No login key of '$ACCOUNT' has the fingerprint $OLD_PRINT (see the list above)." \
+                    "Give the fingerprint of the key to replace with --old-fingerprint, or add the new key with: sudo impact-key add $ACCOUNT ..."
+            fi
+        else
+            if ((COUNT == 0)); then
+                impact_die "$IMPACT_EXIT_CONFLICT" "'$ACCOUNT' has no login key that could be replaced." \
+                    "Add the new key with: sudo impact-key add $ACCOUNT ..."
+            fi
+            if ((COUNT > 1)); then
+                impact_step "Login keys of '$ACCOUNT'"
+                print_keys
+                impact_die_usage "'$ACCOUNT' has $COUNT login keys. Name the one to replace with --old-fingerprint <SHA256:...> (see the list above)."
+            fi
+            OLD_PRINT="$(impact_users_key_entries "$IMPACT_USERS_AK_TEXT" | cut -d'|' -f2)"
+            if [[ "$OLD_PRINT" == "$NEW_PRINT" ]]; then
+                impact_step "Login keys of '$ACCOUNT'"
+                print_keys
+                impact_summary
+                impact_say "The only login key of '$ACCOUNT' is the new key $NEW_PRINT already: the replacement was done earlier."
+                exit "$IMPACT_EXIT_OK"
+            fi
+            if [[ "$OLD_PRINT" == '?' ]]; then
+                impact_die "$IMPACT_EXIT_FAILED" "The only line of the login keys of '$ACCOUNT' holds no readable key." \
+                    "Look at it: sudo impact-key list $ACCOUNT"
+            fi
+        fi
+        impact_log_note "old key fingerprint: $OLD_PRINT"
+        OLD_BLOB="$(blob_of_fingerprint "$OLD_PRINT")"
+
+        impact_step "Confirmation"
+        impact_info "Old key: $OLD_PRINT"
+        if ((NEW_PRESENT == 1)); then
+            impact_ok "The new key $NEW_PRINT is a login key of '$ACCOUNT' already; nothing to confirm."
+        else
+            impact_users_confirm_key "$GITHUB"
+        fi
+
+        impact_step "Replace the key"
+        archive_lines "$OLD_PRINT"
+        NEW_TEXT="$(impact_users_text_without_fingerprint "$IMPACT_USERS_AK_TEXT" "$OLD_PRINT")"
+        if ((NEW_PRESENT == 0)); then
+            NEW_TEXT="$(impact_users_text_with_line "$NEW_TEXT" "$NEW_LINE")"
+        fi
+        install_text "$NEW_TEXT" \
+            "Replace the login key $OLD_PRINT of '$ACCOUNT' by $NEW_PRINT ($HOME_DIR/.ssh/authorized_keys, written with the rights of '$ACCOUNT')"
+        if [[ -n "$OLD_BLOB" ]]; then
+            impact_undo "Put the old key back: sudo impact-key replace $ACCOUNT --old-fingerprint $NEW_PRINT --key-file $ARCHIVE_DIR/key-1.pub --fingerprint $OLD_PRINT"
+        else
+            impact_undo "The old line is kept in $ARCHIVE_DIR; put it back by hand if it is needed."
+        fi
+        save_received
+        impact_step "Key copy for git"
+        handle_key_copy "$NEW_TEXT"
+        ;;
+esac
+
+impact_step "Login keys of '$ACCOUNT' after this run"
+if ! impact_is_dry_run; then
+    impact_users_read_authorized_keys "$ACCOUNT" || true
+    print_keys
+else
+    impact_info "A real run lists the keys here."
+fi
+
+impact_summary
+if [[ "$ACTION" == 'replace' ]]; then
+    impact_say ''
+    impact_say "Important: the old key $OLD_PRINT also opens the person's GitHub account until it is deleted there."
+    impact_say "Ask $GITHUB to delete it on GitHub: github.com, Settings, SSH and GPG keys, the key with the fingerprint $OLD_PRINT."
+    impact_say "Only the person can do this. The new key must be registered on GitHub too (the GUI guides through it)."
+fi

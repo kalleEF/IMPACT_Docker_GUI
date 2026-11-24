@@ -1,0 +1,237 @@
+#!/bin/bash
+# =============================================================================
+# impact-list-users: show the enrolled people, their keys and last logins
+#
+# Purpose
+#   Lists every account that impact-add-user enrolled, also removed and
+#   deleted ones, with: GitHub name, user number, state, groups, password
+#   state, login keys with their fingerprints, the key copy for git, the
+#   repository folder and the last login. Then it names other members of
+#   the shared group and of the group docker, which were not enrolled with
+#   impact-add-user. It changes nothing.
+#   "Last login" comes from the SSH server's log /var/log/auth.log (which
+#   also records the logins of the GUI) and, where that has no entry, from
+#   the login record of "lastlog" (terminal logins only).
+#
+# Who runs it
+#   The administrator, with sudo.
+#
+# Usage
+#   sudo impact-list-users
+#
+# Examples
+#   sudo impact-list-users
+#   sudo impact-list-users | less       read a long list page by page
+#   impact-list-users --help            show this text
+#
+# Options
+#   --help       show this text
+#
+# What it changes on the system
+#   Nothing. It only reads.
+#
+# How to undo
+#   Nothing to undo.
+#
+# Exit codes
+#   0 the list is complete; 1 a record could not be read; 2 wrong usage;
+#   3 the workstation is not prepared.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Reading help: bash constructs that appear in this file
+#   NAME=text            store a text in the variable NAME; "$NAME" reads it
+#   local NAME           a variable that exists only inside one function
+#   "$1" "$2" "$@" "$#"  first parameter, second parameter, all parameters,
+#                        number of parameters
+#   "${NAME:-text}"      the value of NAME, or "text" when NAME is unset or empty
+#   $( command )         the text that the command prints
+#   [[ ... ]]            a test: -f plain file, -d folder, -L symbolic link,
+#                        -e exists, -r readable, -x executable, -z empty text,
+#                        -n text with content, == equal, != different,
+#                        =~ matches a pattern
+#   (( ... ))            arithmetic: true when the result is not zero
+#   A && B               run B only when A succeeded
+#   A || B               run B only when A failed
+#   ! command            true when the command fails
+#   if / case / for / while   branches and loops; "case" compares one value
+#                        with several patterns
+#   >file >>file <file   write to a file (replace it / add to its end), read
+#                        from a file
+#   2>/dev/null  >&2     throw error messages away / write to the error channel
+#   command1 | command2  hand the output of command1 to command2
+#   return N / exit N    end the function / the script with status N; 0 means
+#                        success
+#   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+# Constructs beyond these are explained where they are first used.
+# -----------------------------------------------------------------------------
+
+# "set -e" stops the script at the first command that fails, "-u" stops it
+# when a variable is read that was never set, and "-o pipefail" makes a chain
+# of commands joined with "|" fail when any part of it fails.
+set -euo pipefail
+
+# Find this file's real place (the name in /usr/local/bin is a link) and load
+# the shared functions that lie next to it in ../lib.
+IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# The comment lines below tell the checking tool "shellcheck" where the
+# loaded files are.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-common.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-users.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-users.sh"
+impact_init "$IMPACT_SELF"
+
+impact_parse_args '' '' '' "$@"
+impact_require_arg_count 0 0
+impact_require_root
+impact_require_conf
+impact_require_tools getent runuser ssh-keygen
+
+GROUP="${IMPACT_CONF[SHARED_GROUP]}"
+EXIT_CODE="$IMPACT_EXIT_OK"
+COUNT_ENROLLED=0
+COUNT_REMOVED=0
+COUNT_DELETED=0
+
+# line LABEL VALUE
+#   Prints one detail line with the label in a column of fixed width.
+line() {
+    printf '    %-20s %s\n' "$1:" "$2"
+}
+
+# account_state ACCOUNT RECORD_STATE
+#   Prints the state in plain words, from the record and the account.
+account_state() {
+    local expired=0
+    if impact_account_is_expired "$1"; then
+        expired=1
+    fi
+    case "$2:$expired" in
+        enrolled:0) printf 'enrolled\n' ;;
+        enrolled:1) printf 'enrolled, but the account has expired: no login possible\n' ;;
+        removed:1) printf 'removed (account closed, user number kept)\n' ;;
+        removed:0) printf 'removed, but the account has not expired: run impact-remove-user again\n' ;;
+        *) printf '%s\n' "$2" ;;
+    esac
+}
+
+# show_keys ACCOUNT
+#   Prints the login keys of the account with their fingerprints.
+show_keys() {
+    local status=0 number print kind description
+    impact_users_read_authorized_keys "$1" 2>/dev/null || status=$?
+    if ((status != 0)); then
+        line 'login keys' 'cannot be read safely (a symbolic link or another owner in ~/.ssh)'
+        return 0
+    fi
+    line 'login keys' "$(impact_users_count_keys "$IMPACT_USERS_AK_TEXT")"
+    while IFS='|' read -r number print kind description; do
+        [[ -n "$number" ]] || continue
+        if [[ "$kind" == 'plain' ]]; then
+            printf '      %s. %s  (%s)\n' "$number" "$print" "$description"
+        else
+            printf '      %s. %s  (%s; not written by the IMPACT commands)\n' "$number" "$print" "$description"
+        fi
+    done < <(impact_users_key_entries "$IMPACT_USERS_AK_TEXT")
+}
+
+# show_key_copy ACCOUNT HOME GITHUB_NAME
+#   Prints whether the key copy for git exists.
+show_key_copy() {
+    local path status=0
+    path="$(impact_key_copy_path "$2" "$3")" || {
+        line 'key copy for git' 'unknown'
+        return 0
+    }
+    impact_user_file_exists "$1" "$path" 2>/dev/null || status=$?
+    case "$status" in
+        0) line 'key copy for git' "present ($path)" ;;
+        4) line 'key copy for git' 'missing (the GUI places it at the next start)' ;;
+        *) line 'key copy for git' "no plain file at $path (look at it)" ;;
+    esac
+}
+
+# show_account ACCOUNT
+#   Prints the block of one account that has a record.
+show_account() {
+    local account="$1" status=0 text home groups state repo
+    impact_say ''
+    impact_say "$account"
+    impact_account_record_load "$account" || status=$?
+    if ((status != 0)); then
+        for text in "${IMPACT_ACCOUNT_RECORD_ERRORS[@]}"; do
+            line 'record' "INVALID: $text"
+        done
+        EXIT_CODE="$IMPACT_EXIT_FAILED"
+        return 0
+    fi
+    line 'GitHub name' "${IMPACT_ACCOUNT_RECORD[GITHUB_NAME]}"
+    if ! impact_account_exists "$account"; then
+        COUNT_DELETED=$((COUNT_DELETED + 1))
+        line 'user number' "${IMPACT_ACCOUNT_RECORD[USER_NUMBER]} (free again)"
+        line 'state' "deleted (the record remains; last change ${IMPACT_ACCOUNT_RECORD[CHANGED]})"
+        return 0
+    fi
+    state="${IMPACT_ACCOUNT_RECORD[STATE]}"
+    if [[ "$state" == 'enrolled' ]]; then
+        COUNT_ENROLLED=$((COUNT_ENROLLED + 1))
+    else
+        COUNT_REMOVED=$((COUNT_REMOVED + 1))
+    fi
+    line 'user number' "$(impact_account_uid "$account")"
+    line 'state' "$(account_state "$account" "$state") (since ${IMPACT_ACCOUNT_RECORD[CHANGED]})"
+    # "tr" joins the lines of the group list with blanks.
+    groups="$(impact_account_groups "$account" | tr '\n' ' ')"
+    line 'groups' "${groups% }"
+    case "$(impact_account_password_state "$account" 2>/dev/null || printf '?')" in
+        L) line 'password' 'locked (key login only, no sudo)' ;;
+        P) line 'password' 'USABLE: run impact-add-user again to lock it' ;;
+        NP) line 'password' 'EMPTY: run impact-add-user again to lock it' ;;
+        *) line 'password' 'unknown' ;;
+    esac
+    home="$(impact_account_home "$account")"
+    show_keys "$account"
+    show_key_copy "$account" "$home" "${IMPACT_ACCOUNT_RECORD[GITHUB_NAME]}"
+    repo="$(impact_repo_base_for "$account")" || repo=''
+    if [[ -n "$repo" ]] && impact_repo_base_is_ready "$account"; then
+        line 'repository folder' "$repo"
+    else
+        line 'repository folder' "missing (${repo:-REPO_BASE cannot be applied})"
+    fi
+    line 'last login' "$(impact_users_last_login "$account")"
+}
+
+impact_step "People enrolled with impact-add-user"
+mapfile -t RECORDS < <(impact_account_records)
+if ((${#RECORDS[@]} == 0)); then
+    impact_info "Nobody is enrolled yet. Enrol a person with: sudo impact-add-user --help"
+fi
+for account in "${RECORDS[@]}"; do
+    show_account "$account"
+done
+
+impact_step "Other members of the groups '$GROUP' and 'docker'"
+OTHERS=0
+for group_name in "$GROUP" docker; do
+    impact_group_exists "$group_name" || continue
+    while IFS= read -r member; do
+        [[ -n "$member" ]] || continue
+        if impact_in_list "$member" "${RECORDS[@]}"; then
+            continue
+        fi
+        OTHERS=$((OTHERS + 1))
+        impact_info "$member: member of '$group_name', not enrolled with impact-add-user (user number $(impact_account_uid "$member" 2>/dev/null || printf '?'))."
+    done < <(impact_group_members "$group_name")
+done
+if ((OTHERS == 0)); then
+    impact_ok "None."
+elif impact_group_exists docker; then
+    impact_info "Remember: membership in docker gives the same power as root over this machine."
+fi
+
+impact_say ''
+impact_say "Summary: $COUNT_ENROLLED enrolled, $COUNT_REMOVED removed, $COUNT_DELETED deleted; $OTHERS other group memberships."
+exit "$EXIT_CODE"
