@@ -3178,3 +3178,755 @@ Describe 'Get-DockerfileBaseImage' -Tag Unit {
         Get-DockerfileBaseImage -Content @('RUN echo hi', 'FROM later/image:1') | Should -BeNullOrEmpty
     }
 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LOCAL start arguments: stored reference
+#
+#  WHAT THIS IS
+#  When the user clicks Start, IMPACT runs 'docker run' with a long list of
+#  arguments. Build-DockerRunCommand returns that list. The tests below call it with
+#  fixed inputs and compare the COMPLETE list, argument by argument and in order,
+#  with a list that is written out here ("stored reference").
+#
+#  WHY
+#  These references pin the LOCAL behaviour of commit 4a8b260 (the state before the
+#  redesign). If a later change alters one argument, changes the order, or adds or
+#  drops an argument, a test here fails and names the position. The references may
+#  only be changed deliberately: when a change of the LOCAL start command is really
+#  wanted, and after the new list was read and checked by a person.
+#
+#  HOW THE LISTS WERE MADE
+#  By running the unchanged function of commit 4a8b260 with these inputs, reading
+#  the result, and pasting it here as fixed text. Nothing in an expected list is
+#  computed by the test.
+#
+#  WINDOWS AND LINUX
+#  All inputs are fixed texts, also the Windows paths such as 'C:\repos\...'. The
+#  function only works on these texts (it never looks at the disk), so the result is
+#  the same on Windows (where CI runs) and on Linux.
+#
+#  THE INPUTS LOOK LIKE THE REAL ONES
+#  -ProjectRoot is the folder as the folder picker returns it (backslashes).
+#  -OutputDir and -SynthpopDir look the way Get-YamlPathValue returns them on Windows
+#  for the usual YAML lines 'output_dir: ./outputs' and 'synthpop_dir:
+#  ./inputs/synthpop': forward slashes, and the './' is kept.
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'LOCAL start arguments: stored reference' -Tag Unit {
+    BeforeAll {
+        # A session state with fixed values, filled in the same way the GUI fills it.
+        # New-TestSessionState is not used here on purpose: it puts a temp folder of
+        # this computer into the state, and these tests must not depend on the computer.
+        function New-ReferenceState {
+            param(
+                [string]$Location = 'LOCAL',
+                [string]$UserName = 'alice',
+                [string]$Repo     = 'IMPACTncd_Germany'
+            )
+            $state = New-SessionState
+            $state.UserName          = $UserName
+            $state.Password          = 'Secret-pw1'
+            $state.ContainerLocation = $Location
+            $state.SelectedRepo      = $Repo
+            # The GUI names the container "<repository>_<user>".
+            $state.ContainerName     = "${Repo}_$UserName"
+            return $state
+        }
+
+        # Compares the list the function returned with the stored reference, one
+        # argument at a time and in order. 'Should -BeExactly' is used on purpose: it
+        # also notices a difference between upper and lower case ('Should -Be' would
+        # accept '/C/repos' where '/c/repos' is expected). When something differs, the
+        # message names the position, so the changed argument is easy to find.
+        function Assert-MatchesStoredReference {
+            param(
+                [object[]]$Actual,     # what Build-DockerRunCommand returned
+                [string[]]$Expected    # the stored reference written out in the test
+            )
+            $shared = [Math]::Min($Actual.Count, $Expected.Count)
+            for ($i = 0; $i -lt $shared; $i++) {
+                $position = "argument number $($i + 1) of 'docker run'"
+                # Every argument must be a text. A number or a nested list would be
+                # handed to docker in another form.
+                $Actual[$i] | Should -BeOfType ([string]) -Because "$position must be a text"
+                $Actual[$i] | Should -BeExactly $Expected[$i] -Because "$position must stay exactly as in the stored reference"
+            }
+            # Checked last: when an argument was added or dropped in the middle, the loop
+            # above has already named the first position that differs.
+            $Actual.Count | Should -Be $Expected.Count -Because 'the list must have exactly as many arguments as the stored reference'
+        }
+
+        # The usual LOCAL inputs (user alice, repository in C:\repos).
+        $script:refLocalInputs = @{
+            ImageName   = 'impactncd_germany'
+            ProjectRoot = 'C:\repos\IMPACTncd_Germany'
+            OutputDir   = 'C:/repos/IMPACTncd_Germany/./outputs'
+            SynthpopDir = 'C:/repos/IMPACTncd_Germany/./inputs/synthpop'
+            SshKeyPath  = 'C:\Users\alice\.ssh\id_ed25519_alice'
+        }
+    }
+
+    It 'a) bind mounts and the default port 8787' {
+        $inputs = $script:refLocalInputs
+        $expected = @(
+            'run', '-d', '--rm',
+            '--name', 'IMPACTncd_Germany_alice',
+            '-e', 'PASSWORD=Secret-pw1',
+            '-e', 'DISABLE_AUTH=false',
+            '-e', 'USERID=1000',
+            '-e', 'GROUPID=1000',
+            '-e', 'CONTAINER_REPO_NAME=IMPACTncd_Germany',
+            '-e', 'SYNC_ENABLED=false',
+            '-e', 'GIT_SSH_COMMAND=ssh -i /home/rstudio/.ssh/id_ed25519_alice -o IdentitiesOnly=yes -o UserKnownHostsFile=/home/rstudio/.ssh/known_hosts -o StrictHostKeyChecking=accept-new',
+            '--mount', 'type=bind,source=/c/repos/IMPACTncd_Germany,target=/home/rstudio/IMPACTncd_Germany',
+            '-p', '127.0.0.1:8787:8787',
+            '--mount', 'type=bind,source=/c/repos/IMPACTncd_Germany/./outputs,target=/home/rstudio/IMPACTncd_Germany/outputs',
+            '--mount', 'type=bind,source=/c/repos/IMPACTncd_Germany/./inputs/synthpop,target=/home/rstudio/IMPACTncd_Germany/inputs/synthpop',
+            '--label', 'impact.use_volumes=false',
+            '--label', 'impact.repo_path=C:\repos\IMPACTncd_Germany',
+            '--label', 'impact.output_dir=C:/repos/IMPACTncd_Germany/./outputs',
+            '--label', 'impact.synthpop_dir=C:/repos/IMPACTncd_Germany/./inputs/synthpop',
+            '--mount', 'type=bind,source=C:\Users\alice\.ssh\id_ed25519_alice,target=/keys/id_ed25519_alice,readonly',
+            '--workdir', '/home/rstudio/IMPACTncd_Germany',
+            'impactncd_germany'
+        )
+
+        # 1. No option given at all: the defaults of the function apply.
+        $actual = Build-DockerRunCommand -State (New-ReferenceState) @inputs
+        Assert-MatchesStoredReference -Actual $actual -Expected $expected
+
+        # 2. The same default values, given explicitly, must give the same list.
+        $actual = Build-DockerRunCommand -State (New-ReferenceState) -Port '8787' -UseVolumes $false -HighCompute $false `
+            -CustomParams '' -ContainerUid '1000' -ContainerGid '1000' @inputs
+        Assert-MatchesStoredReference -Actual $actual -Expected $expected
+    }
+
+    It 'b) another port (8790): only the -p argument changes' {
+        $inputs = $script:refLocalInputs
+        $expected = @(
+            'run', '-d', '--rm',
+            '--name', 'IMPACTncd_Germany_alice',
+            '-e', 'PASSWORD=Secret-pw1',
+            '-e', 'DISABLE_AUTH=false',
+            '-e', 'USERID=1000',
+            '-e', 'GROUPID=1000',
+            '-e', 'CONTAINER_REPO_NAME=IMPACTncd_Germany',
+            '-e', 'SYNC_ENABLED=false',
+            '-e', 'GIT_SSH_COMMAND=ssh -i /home/rstudio/.ssh/id_ed25519_alice -o IdentitiesOnly=yes -o UserKnownHostsFile=/home/rstudio/.ssh/known_hosts -o StrictHostKeyChecking=accept-new',
+            '--mount', 'type=bind,source=/c/repos/IMPACTncd_Germany,target=/home/rstudio/IMPACTncd_Germany',
+            '-p', '127.0.0.1:8790:8787',
+            '--mount', 'type=bind,source=/c/repos/IMPACTncd_Germany/./outputs,target=/home/rstudio/IMPACTncd_Germany/outputs',
+            '--mount', 'type=bind,source=/c/repos/IMPACTncd_Germany/./inputs/synthpop,target=/home/rstudio/IMPACTncd_Germany/inputs/synthpop',
+            '--label', 'impact.use_volumes=false',
+            '--label', 'impact.repo_path=C:\repos\IMPACTncd_Germany',
+            '--label', 'impact.output_dir=C:/repos/IMPACTncd_Germany/./outputs',
+            '--label', 'impact.synthpop_dir=C:/repos/IMPACTncd_Germany/./inputs/synthpop',
+            '--mount', 'type=bind,source=C:\Users\alice\.ssh\id_ed25519_alice,target=/keys/id_ed25519_alice,readonly',
+            '--workdir', '/home/rstudio/IMPACTncd_Germany',
+            'impactncd_germany'
+        )
+
+        $actual = Build-DockerRunCommand -State (New-ReferenceState) -Port '8790' @inputs
+        Assert-MatchesStoredReference -Actual $actual -Expected $expected
+    }
+
+    It 'c) "Use Docker Volumes" ticked: two -v arguments and two more labels' {
+        $inputs = $script:refLocalInputs
+        $expected = @(
+            'run', '-d', '--rm',
+            '--name', 'IMPACTncd_Germany_alice',
+            '-e', 'PASSWORD=Secret-pw1',
+            '-e', 'DISABLE_AUTH=false',
+            '-e', 'USERID=1000',
+            '-e', 'GROUPID=1000',
+            '-e', 'CONTAINER_REPO_NAME=IMPACTncd_Germany',
+            '-e', 'SYNC_ENABLED=false',
+            '-e', 'GIT_SSH_COMMAND=ssh -i /home/rstudio/.ssh/id_ed25519_alice -o IdentitiesOnly=yes -o UserKnownHostsFile=/home/rstudio/.ssh/known_hosts -o StrictHostKeyChecking=accept-new',
+            '--mount', 'type=bind,source=/c/repos/IMPACTncd_Germany,target=/home/rstudio/IMPACTncd_Germany',
+            '-p', '127.0.0.1:8787:8787',
+            '-v', 'impactncd_output_IMPACTncd_Germany_alice:/home/rstudio/IMPACTncd_Germany/outputs',
+            '-v', 'impactncd_synthpop_IMPACTncd_Germany_alice:/home/rstudio/IMPACTncd_Germany/inputs/synthpop',
+            '--label', 'impact.use_volumes=true',
+            '--label', 'impact.repo_path=C:\repos\IMPACTncd_Germany',
+            '--label', 'impact.output_dir=C:/repos/IMPACTncd_Germany/./outputs',
+            '--label', 'impact.synthpop_dir=C:/repos/IMPACTncd_Germany/./inputs/synthpop',
+            '--label', 'impact.volume_output=impactncd_output_IMPACTncd_Germany_alice',
+            '--label', 'impact.volume_synthpop=impactncd_synthpop_IMPACTncd_Germany_alice',
+            '--mount', 'type=bind,source=C:\Users\alice\.ssh\id_ed25519_alice,target=/keys/id_ed25519_alice,readonly',
+            '--workdir', '/home/rstudio/IMPACTncd_Germany',
+            'impactncd_germany'
+        )
+
+        $actual = Build-DockerRunCommand -State (New-ReferenceState) -UseVolumes $true @inputs
+        Assert-MatchesStoredReference -Actual $actual -Expected $expected
+    }
+
+    It 'd) "High compute" ticked: nothing changes in LOCAL mode (same list as a)' {
+        # The limits '--cpus 32 -m 384g' are for the workstation only. In LOCAL mode
+        # the tick box must have no effect at all.
+        $inputs = $script:refLocalInputs
+        $expected = @(
+            'run', '-d', '--rm',
+            '--name', 'IMPACTncd_Germany_alice',
+            '-e', 'PASSWORD=Secret-pw1',
+            '-e', 'DISABLE_AUTH=false',
+            '-e', 'USERID=1000',
+            '-e', 'GROUPID=1000',
+            '-e', 'CONTAINER_REPO_NAME=IMPACTncd_Germany',
+            '-e', 'SYNC_ENABLED=false',
+            '-e', 'GIT_SSH_COMMAND=ssh -i /home/rstudio/.ssh/id_ed25519_alice -o IdentitiesOnly=yes -o UserKnownHostsFile=/home/rstudio/.ssh/known_hosts -o StrictHostKeyChecking=accept-new',
+            '--mount', 'type=bind,source=/c/repos/IMPACTncd_Germany,target=/home/rstudio/IMPACTncd_Germany',
+            '-p', '127.0.0.1:8787:8787',
+            '--mount', 'type=bind,source=/c/repos/IMPACTncd_Germany/./outputs,target=/home/rstudio/IMPACTncd_Germany/outputs',
+            '--mount', 'type=bind,source=/c/repos/IMPACTncd_Germany/./inputs/synthpop,target=/home/rstudio/IMPACTncd_Germany/inputs/synthpop',
+            '--label', 'impact.use_volumes=false',
+            '--label', 'impact.repo_path=C:\repos\IMPACTncd_Germany',
+            '--label', 'impact.output_dir=C:/repos/IMPACTncd_Germany/./outputs',
+            '--label', 'impact.synthpop_dir=C:/repos/IMPACTncd_Germany/./inputs/synthpop',
+            '--mount', 'type=bind,source=C:\Users\alice\.ssh\id_ed25519_alice,target=/keys/id_ed25519_alice,readonly',
+            '--workdir', '/home/rstudio/IMPACTncd_Germany',
+            'impactncd_germany'
+        )
+
+        $actual = Build-DockerRunCommand -State (New-ReferenceState) -HighCompute $true @inputs
+        Assert-MatchesStoredReference -Actual $actual -Expected $expected
+    }
+
+    It 'e) custom params: a quoted value with a space stays ONE argument, right after -p' {
+        # Text as typed into the 'Custom Params' box:
+        #   --shm-size 2g -e "R_NOTE=two words" --label 'team=public health'
+        # The quotes are removed, and each quoted value stays one argument.
+        $customParams = '--shm-size 2g -e "R_NOTE=two words" --label ' + "'team=public health'"
+        $inputs = $script:refLocalInputs
+        $expected = @(
+            'run', '-d', '--rm',
+            '--name', 'IMPACTncd_Germany_alice',
+            '-e', 'PASSWORD=Secret-pw1',
+            '-e', 'DISABLE_AUTH=false',
+            '-e', 'USERID=1000',
+            '-e', 'GROUPID=1000',
+            '-e', 'CONTAINER_REPO_NAME=IMPACTncd_Germany',
+            '-e', 'SYNC_ENABLED=false',
+            '-e', 'GIT_SSH_COMMAND=ssh -i /home/rstudio/.ssh/id_ed25519_alice -o IdentitiesOnly=yes -o UserKnownHostsFile=/home/rstudio/.ssh/known_hosts -o StrictHostKeyChecking=accept-new',
+            '--mount', 'type=bind,source=/c/repos/IMPACTncd_Germany,target=/home/rstudio/IMPACTncd_Germany',
+            '-p', '127.0.0.1:8787:8787',
+            '--shm-size', '2g',
+            '-e', 'R_NOTE=two words',
+            '--label', 'team=public health',
+            '--mount', 'type=bind,source=/c/repos/IMPACTncd_Germany/./outputs,target=/home/rstudio/IMPACTncd_Germany/outputs',
+            '--mount', 'type=bind,source=/c/repos/IMPACTncd_Germany/./inputs/synthpop,target=/home/rstudio/IMPACTncd_Germany/inputs/synthpop',
+            '--label', 'impact.use_volumes=false',
+            '--label', 'impact.repo_path=C:\repos\IMPACTncd_Germany',
+            '--label', 'impact.output_dir=C:/repos/IMPACTncd_Germany/./outputs',
+            '--label', 'impact.synthpop_dir=C:/repos/IMPACTncd_Germany/./inputs/synthpop',
+            '--mount', 'type=bind,source=C:\Users\alice\.ssh\id_ed25519_alice,target=/keys/id_ed25519_alice,readonly',
+            '--workdir', '/home/rstudio/IMPACTncd_Germany',
+            'impactncd_germany'
+        )
+
+        $actual = Build-DockerRunCommand -State (New-ReferenceState) -CustomParams $customParams @inputs
+        Assert-MatchesStoredReference -Actual $actual -Expected $expected
+    }
+
+    It 'f) folders with spaces on drives D: and E: (drive letter becomes /d and /e)' {
+        # A copy of the repository in a folder with spaces, results on another drive.
+        # What this pins:
+        #  - 'D:\...' becomes '/d/...' in the mount sources (lower-case drive letter,
+        #    forward slashes); the spaces stay as they are, inside ONE argument;
+        #  - the labels keep the paths exactly as they were given;
+        #  - the SSH key path is passed on unchanged (Windows form, with the space).
+        # The repository name inside the container has no space: the GUI makes a safe
+        # name from the folder name (ConvertTo-DockerSafeRepoName) before it gets here.
+        $state = New-ReferenceState -UserName 'maxm' -Repo 'IMPACTncd_Germany_Kopie'
+        $expected = @(
+            'run', '-d', '--rm',
+            '--name', 'IMPACTncd_Germany_Kopie_maxm',
+            '-e', 'PASSWORD=Secret-pw1',
+            '-e', 'DISABLE_AUTH=false',
+            '-e', 'USERID=1000',
+            '-e', 'GROUPID=1000',
+            '-e', 'CONTAINER_REPO_NAME=IMPACTncd_Germany_Kopie',
+            '-e', 'SYNC_ENABLED=false',
+            '-e', 'GIT_SSH_COMMAND=ssh -i /home/rstudio/.ssh/id_ed25519_maxm -o IdentitiesOnly=yes -o UserKnownHostsFile=/home/rstudio/.ssh/known_hosts -o StrictHostKeyChecking=accept-new',
+            '--mount', 'type=bind,source=/d/Max Mustermann/IMPACT Modelle/IMPACTncd_Germany - Kopie,target=/home/rstudio/IMPACTncd_Germany_Kopie',
+            '-p', '127.0.0.1:8787:8787',
+            '--mount', 'type=bind,source=/d/Max Mustermann/IMPACT Modelle/IMPACTncd_Germany - Kopie/./outputs,target=/home/rstudio/IMPACTncd_Germany_Kopie/outputs',
+            '--mount', 'type=bind,source=/e/IMPACT Daten/synthpop,target=/home/rstudio/IMPACTncd_Germany_Kopie/inputs/synthpop',
+            '--label', 'impact.use_volumes=false',
+            '--label', 'impact.repo_path=D:\Max Mustermann\IMPACT Modelle\IMPACTncd_Germany - Kopie',
+            '--label', 'impact.output_dir=D:/Max Mustermann/IMPACT Modelle/IMPACTncd_Germany - Kopie/./outputs',
+            '--label', 'impact.synthpop_dir=E:/IMPACT Daten/synthpop',
+            '--mount', 'type=bind,source=C:\Users\Max Mustermann\.ssh\id_ed25519_maxm,target=/keys/id_ed25519_maxm,readonly',
+            '--workdir', '/home/rstudio/IMPACTncd_Germany_Kopie',
+            'impactncd_germany_kopie'
+        )
+
+        $actual = Build-DockerRunCommand -State $state -ImageName 'impactncd_germany_kopie' `
+            -ProjectRoot 'D:\Max Mustermann\IMPACT Modelle\IMPACTncd_Germany - Kopie' `
+            -OutputDir   'D:/Max Mustermann/IMPACT Modelle/IMPACTncd_Germany - Kopie/./outputs' `
+            -SynthpopDir 'E:/IMPACT Daten/synthpop' `
+            -SshKeyPath  'C:\Users\Max Mustermann\.ssh\id_ed25519_maxm'
+        Assert-MatchesStoredReference -Actual $actual -Expected $expected
+    }
+
+    It 'REMOTE as it is today (bind mounts, port 8788, high compute, uid 1003 and gid 1004)' {
+        # This one reference is for the workstation (REMOTE) as it works TODAY. The
+        # redesign will change the REMOTE start command on purpose. When that happens,
+        # this reference is replaced deliberately, in the same change. Until then it
+        # shows that work on other parts did not alter REMOTE by accident.
+        # Differences to LOCAL that are pinned here: the port is published on all
+        # network interfaces (no '127.0.0.1:'), paths are used unchanged, the uid and
+        # gid of the workstation user are passed on, and '--cpus 32 -m 384g' is added
+        # for "High compute".
+        $state = New-ReferenceState -Location 'REMOTE@192.0.2.10'
+        $expected = @(
+            'run', '-d', '--rm',
+            '--name', 'IMPACTncd_Germany_alice',
+            '-e', 'PASSWORD=Secret-pw1',
+            '-e', 'DISABLE_AUTH=false',
+            '-e', 'USERID=1003',
+            '-e', 'GROUPID=1004',
+            '-e', 'CONTAINER_REPO_NAME=IMPACTncd_Germany',
+            '-e', 'SYNC_ENABLED=false',
+            '-e', 'GIT_SSH_COMMAND=ssh -i /home/rstudio/.ssh/id_ed25519_alice -o IdentitiesOnly=yes -o UserKnownHostsFile=/home/rstudio/.ssh/known_hosts -o StrictHostKeyChecking=accept-new',
+            '--mount', 'type=bind,source=/home/shared-account/Repositories/IMPACTncd_Germany,target=/home/rstudio/IMPACTncd_Germany',
+            '-p', '8788:8787',
+            '--mount', 'type=bind,source=/mnt/disk_a/shared/Base/outputs,target=/home/rstudio/IMPACTncd_Germany/outputs',
+            '--mount', 'type=bind,source=/mnt/disk_a/shared/Base/inputs/synthpop,target=/home/rstudio/IMPACTncd_Germany/inputs/synthpop',
+            '--cpus', '32',
+            '-m', '384g',
+            '--label', 'impact.use_volumes=false',
+            '--label', 'impact.repo_path=/home/shared-account/Repositories/IMPACTncd_Germany',
+            '--label', 'impact.output_dir=/mnt/disk_a/shared/Base/outputs',
+            '--label', 'impact.synthpop_dir=/mnt/disk_a/shared/Base/inputs/synthpop',
+            '--mount', 'type=bind,source=/home/shared-account/.ssh/id_ed25519_alice,target=/keys/id_ed25519_alice,readonly',
+            '--workdir', '/home/rstudio/IMPACTncd_Germany',
+            'impactncd_germany'
+        )
+
+        $actual = Build-DockerRunCommand -State $state -Port '8788' -HighCompute $true `
+            -ContainerUid '1003' -ContainerGid '1004' -ImageName 'impactncd_germany' `
+            -ProjectRoot '/home/shared-account/Repositories/IMPACTncd_Germany' `
+            -OutputDir   '/mnt/disk_a/shared/Base/outputs' `
+            -SynthpopDir '/mnt/disk_a/shared/Base/inputs/synthpop' `
+            -SshKeyPath  '/home/shared-account/.ssh/id_ed25519_alice'
+        Assert-MatchesStoredReference -Actual $actual -Expected $expected
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Guard: the Start button must take its 'docker run' arguments from
+#  Build-DockerRunCommand
+#
+#  WHY
+#  The stored references above test the function Build-DockerRunCommand. They only
+#  protect users if the Start button of the GUI really uses that function. For a
+#  long time the launcher (IMPACT_Docker_GUI_v2.ps1) built the same list a second
+#  time on its own, so a test of the function said nothing about what users ran.
+#  The tests below fail when such a second copy comes back, or when the Start button
+#  stops handing all its values to the function.
+#
+#  They also pin the WIRING between the Start button and the function: which value
+#  goes to which input (for example the result folder to -OutputDir and not the
+#  synthpop folder), where each of these values is set, and that the finished list
+#  reaches docker unchanged. Without this, a mix-up in the launcher would change
+#  what users run while every stored reference still passes.
+#
+#  HOW
+#  The launcher is only READ here, with the PowerShell parser (the same way as in
+#  'Module exports and manifest stay in sync' above). The parser turns the file into
+#  a tree of its parts (commands, lists, assignments), which can be searched. No line
+#  of the launcher is run, so these tests need no Windows, no window and no Docker.
+#
+#  WHEN ONE OF THESE TESTS FAILS AFTER A CHANGE THAT WAS WANTED
+#  Several tests compare lines of the launcher with texts stored here. When such a
+#  line is changed on purpose, read the message of the failed test, check that the
+#  new line does what you want, and then update the stored text in the same change.
+# ═══════════════════════════════════════════════════════════════════════════════
+Describe 'Start button uses Build-DockerRunCommand (guard for the stored references)' -Tag Unit {
+    BeforeAll {
+        $launcherPath = Join-Path $PSScriptRoot '..' 'current_version' 'IMPACT_Docker_GUI_v2.ps1'
+        $tokens = $null; $errors = $null
+        $script:guardLauncherAst = [System.Management.Automation.Language.Parser]::ParseFile($launcherPath, [ref]$tokens, [ref]$errors)
+        $script:guardParseErrors = if ($errors) { @($errors) } else { @() }
+
+        # The reason shown when one of the tests below fails.
+        $script:guardReason = "the 'docker run' arguments for the IMPACT container must come from Build-DockerRunCommand in the module. Only then do the tests 'LOCAL start arguments: stored reference' check what users really run"
+
+        # Every place in the launcher where Build-DockerRunCommand is called.
+        $script:guardCalls = @($script:guardLauncherAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Build-DockerRunCommand'
+        }, $true))
+
+        # ---- Small helpers for the tests below ------------------------------------
+        # In all of them, $Scope is a part of the tree the parser made: the whole
+        # launcher, or one script block { ... } of it.
+
+        # Returns a piece of code as text without any white space (blanks, tabs, line
+        # breaks). Two pieces of code that differ only in their layout then count as
+        # equal, so re-indenting the launcher does not fail a test.
+        function Get-GuardCompactText {
+            param([string]$Text)
+            return ($Text -replace '\s', '')
+        }
+
+        # Returns every place inside $Scope where the variable $Name occurs, whether
+        # it is set there or only read.
+        function Get-GuardVariableUses {
+            param($Scope, [string]$Name)
+            return @($Scope.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                    $node.VariablePath.UserPath -eq $Name
+            }, $true))
+        }
+
+        # Returns every assignment inside $Scope whose left side names the variable
+        # $Name. All forms count:  $x = 1   $x += 1   $x[3] = 1   $x.Name = 1
+        function Get-GuardAssignments {
+            param($Scope, [string]$Name)
+            return @($Scope.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    @(Get-GuardVariableUses -Scope $node.Left -Name $Name).Count -gt 0
+            }, $true))
+        }
+
+        # Returns the assignment ($x = ...) that a part of the code belongs to, or
+        # nothing when it does not sit inside an assignment. The walk goes upwards and
+        # stops at the end of the surrounding script block, so an assignment further
+        # out (one that only CONTAINS a whole block of code) is not taken.
+        function Get-GuardEnclosingAssignment {
+            param($Node)
+            $current = $Node.Parent
+            while ($current -and $current -isnot [System.Management.Automation.Language.ScriptBlockAst]) {
+                if ($current -is [System.Management.Automation.Language.AssignmentStatementAst]) { return $current }
+                $current = $current.Parent
+            }
+            return $null
+        }
+
+        # Returns the script block { ... } that directly surrounds a part of the code.
+        # For the call of Build-DockerRunCommand this is the code of the Start button.
+        function Get-GuardEnclosingScriptBlock {
+            param($Node)
+            $current = $Node.Parent
+            while ($current -and $current -isnot [System.Management.Automation.Language.ScriptBlockAst]) {
+                $current = $current.Parent
+            }
+            return $current
+        }
+    }
+
+    It 'The launcher can be read by the PowerShell parser (no syntax error)' {
+        # If this fails, the other tests in this block cannot say anything useful.
+        $script:guardParseErrors.Count | Should -Be 0
+    }
+
+    It 'The launcher has no argument list of its own for starting the container' {
+        # The words that mark "this starts the IMPACT container": the container runs in
+        # the background ('-d', long form '--detach') and gets a name ('--name'). The
+        # short helper containers the launcher starts for the volumes ('run --rm ...
+        # alpine ...') have none of these, so they are not reported.
+        $startWords = @('-d', '--detach', '--name')
+
+        # 1. A written-out list whose first entry is 'run', for example
+        #    @('run','-d','--rm','--name',$State.ContainerName, ...)
+        $lists = @($script:guardLauncherAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.ArrayLiteralAst]
+        }, $true))
+        $ownLists = @($lists | Where-Object {
+            $first = $_.Elements[0]
+            $texts = @($_.Elements |
+                Where-Object { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] } |
+                ForEach-Object { $_.Value })
+            ($first -is [System.Management.Automation.Language.StringConstantExpressionAst]) -and
+                ($first.Value -eq 'run') -and
+                (@($texts | Where-Object { $startWords -contains $_ }).Count -gt 0)
+        })
+
+        # 2. The same written directly behind the docker command, for example
+        #    & docker run -d --rm --name ...
+        $dockerCommands = @($script:guardLauncherAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -in @('docker', 'docker.exe')
+        }, $true))
+        $ownCommands = @($dockerCommands | Where-Object {
+            $words = @($_.CommandElements | ForEach-Object { $_.Extent.Text })
+            ($words -contains 'run') -and (@($words | Where-Object { $startWords -contains $_ }).Count -gt 0)
+        })
+
+        $found = @($ownLists) + @($ownCommands)
+        $where = ($found | ForEach-Object { "line $($_.Extent.StartLineNumber)" }) -join ', '
+        $found.Count | Should -Be 0 -Because "the launcher has its own 'docker run' list in: $where. Background: $($script:guardReason)"
+    }
+
+    It 'The Start button calls Build-DockerRunCommand' {
+        $script:guardCalls.Count | Should -BeGreaterThan 0 -Because $script:guardReason
+    }
+
+    It 'Nothing is added to the list after Build-DockerRunCommand has built it' {
+        # The launcher stores the result in a variable (today: $dockerArgs) and hands it
+        # to docker a few lines further down. Anything that changed the list on this
+        # way would again create arguments that the stored references never see, for
+        # example a line such as  $dockerArgs += @('--cpus','32') . So this test follows
+        # the list from the call to docker, in four steps.
+        $script:guardCalls.Count | Should -BeGreaterThan 0 -Because $script:guardReason
+        foreach ($call in $script:guardCalls) {
+            $line = $call.Extent.StartLineNumber
+
+            # Step 1: the result is stored in a plain variable, and the right side of
+            # the '=' is the call alone. Allowed are
+            #     $x = Build-DockerRunCommand ...     and     $x = @(Build-DockerRunCommand ...)
+            # Not allowed is anything around the call, such as
+            #     @(Build-DockerRunCommand ...) + @('--privileged')
+            #     @(Build-DockerRunCommand ... | ForEach-Object { ... })
+            $assignment = Get-GuardEnclosingAssignment -Node $call
+            $assignment | Should -BeOfType ([System.Management.Automation.Language.AssignmentStatementAst]) -Because "the result of Build-DockerRunCommand (line $line of the launcher) must be stored in a variable"
+            $assignment.Left | Should -BeOfType ([System.Management.Automation.Language.VariableExpressionAst]) -Because "the result of Build-DockerRunCommand (line $line of the launcher) must be stored in a plain variable"
+            $assignment.Operator | Should -Be ([System.Management.Automation.Language.TokenKind]::Equals) -Because "the result of Build-DockerRunCommand (line $line of the launcher) must be stored with a plain '=', not added to an existing list. Background: $($script:guardReason)"
+            $variableName = $assignment.Left.VariablePath.UserPath
+            $callText  = Get-GuardCompactText $call.Extent.Text
+            $rightText = Get-GuardCompactText $assignment.Right.Extent.Text
+            $rightText | Should -BeIn @($callText, "@($callText)") -Because "in line $line of the launcher the right side of '`$$variableName =' must be the call of Build-DockerRunCommand alone (also allowed: inside @( )). Anything added around the call changes the list after the function has built it. Background: $($script:guardReason)"
+
+            # Step 2: no other line of the launcher sets or changes the variable. This
+            # also finds a change of one single argument, such as  $dockerArgs[18] = ...
+            $otherAssignments = @(Get-GuardAssignments -Scope $script:guardLauncherAst -Name $variableName | Where-Object { $_ -ne $assignment })
+            $where = ($otherAssignments | ForEach-Object { "line $($_.Extent.StartLineNumber)" }) -join ', '
+            $otherAssignments.Count | Should -Be 0 -Because "`$$variableName may only be set by the call of Build-DockerRunCommand, but the launcher also sets or changes it in: $where. Background: $($script:guardReason)"
+
+            # Step 3: apart from the line that stores it, the list is used in exactly ONE
+            # place. That place is the line that puts the Docker context in front of it
+            # (the context tells docker which Docker to talk to: the one on this PC or the
+            # one on the workstation). The line is compared with the stored text below.
+            $otherUses = @(Get-GuardVariableUses -Scope $script:guardLauncherAst -Name $variableName | Where-Object { $_ -ne $assignment.Left })
+            $where = if ($otherUses.Count -gt 0) { ($otherUses | ForEach-Object { "line $($_.Extent.StartLineNumber)" }) -join ', ' } else { 'no place at all' }
+            $otherUses.Count | Should -Be 1 -Because "`$$variableName must be used in exactly one place after the call (the line that hands it to docker), but it is used in: $where. Background: $($script:guardReason)"
+            $handOver = Get-GuardEnclosingAssignment -Node $otherUses[0]
+            $handOver | Should -Not -BeNullOrEmpty -Because "the line that uses `$$variableName (line $($otherUses[0].Extent.StartLineNumber) of the launcher) must be the assignment that builds `$runCmd"
+            $handOver.Extent.StartOffset | Should -BeGreaterThan $assignment.Extent.EndOffset -Because "`$$variableName must be handed on AFTER Build-DockerRunCommand has built it"
+            $expectedHandOver = '$runCmd = (Get-DockerContextArgs -State $State) + $' + $variableName
+            (Get-GuardCompactText $handOver.Extent.Text) | Should -BeExactly (Get-GuardCompactText $expectedHandOver) -Because "line $($handOver.Extent.StartLineNumber) of the launcher must stay  $expectedHandOver  (the Docker context first, then the unchanged list). Background: $($script:guardReason)"
+
+            # Step 4: the combined list ($runCmd) reaches docker unchanged. Inside the code
+            # of the Start button $runCmd is set only by the line of step 3, and the next
+            # docker command after that line is exactly  & docker $runCmd  (an addition
+            # such as  & docker $runCmd --privileged  would fail here).
+            $startCode = Get-GuardEnclosingScriptBlock -Node $call
+            [object]::ReferenceEquals((Get-GuardEnclosingScriptBlock -Node $handOver), $startCode) | Should -BeTrue -Because "the call of Build-DockerRunCommand and the line that builds `$runCmd must both be in the code of the Start button"
+            $runCmdAssignments = @(Get-GuardAssignments -Scope $startCode -Name 'runCmd')
+            $where = ($runCmdAssignments | ForEach-Object { "line $($_.Extent.StartLineNumber)" }) -join ', '
+            $runCmdAssignments.Count | Should -Be 1 -Because "inside the code of the Start button `$runCmd may only be set once, by the line of step 3, but it is set or changed in: $where. Background: $($script:guardReason)"
+            $dockerCallsAfter = @($startCode.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -in @('docker', 'docker.exe') -and
+                    $node.Extent.StartOffset -gt $handOver.Extent.EndOffset
+            }, $true) | Sort-Object { $_.Extent.StartOffset })
+            $dockerCallsAfter.Count | Should -BeGreaterThan 0 -Because "the Start button must hand `$runCmd to docker after line $($handOver.Extent.StartLineNumber) of the launcher"
+            # The words of that docker command, without the '&' in front and without a
+            # redirection such as '2>&1' behind it (the parser keeps those apart).
+            $words = @($dockerCallsAfter[0].CommandElements | ForEach-Object { $_.Extent.Text }) -join ' '
+            $words | Should -BeExactly 'docker $runCmd' -Because "the first docker command after line $($handOver.Extent.StartLineNumber) of the launcher (it is in line $($dockerCallsAfter[0].Extent.StartLineNumber)) must be  & docker `$runCmd  with nothing added. Background: $($script:guardReason)"
+        }
+    }
+
+    It 'The Start button hands every input of Build-DockerRunCommand to it, by name' {
+        # Why: an input that is left out silently takes its default value. For example
+        # without ContainerUid the container on the workstation would run with user id
+        # 1000, whatever the real id is. And a name with a typing mistake is silently
+        # ignored by PowerShell for this kind of function, with the same effect.
+        #
+        # If a new input is added to the function on purpose, and the Start button
+        # should use its default, add its name here (with a comment why).
+        $mayBeLeftOut = @()
+
+        # The inputs the function has (its parameters), read from the loaded module.
+        # (PowerShell adds some inputs of its own to certain functions, such as -Verbose.
+        # They are left out here.)
+        $common = @([System.Management.Automation.Cmdlet]::CommonParameters) + @([System.Management.Automation.Cmdlet]::OptionalCommonParameters)
+        $wanted = @((Get-Command Build-DockerRunCommand).Parameters.Keys | Where-Object { $common -notcontains $_ })
+        $wanted.Count | Should -BeGreaterThan 0
+
+        $script:guardCalls.Count | Should -BeGreaterThan 0 -Because $script:guardReason
+        foreach ($call in $script:guardCalls) {
+            # Names written directly at the call, such as  -Port $hostPort
+            $given = @($call.CommandElements |
+                Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } |
+                ForEach-Object { $_.ParameterName })
+
+            # Names handed over as a table ("splatting"), such as  @startInputs  where
+            # $startInputs = @{ Port = $hostPort; ... }  was filled before the call.
+            $splatted = @($call.CommandElements | Where-Object {
+                $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted
+            })
+            foreach ($splat in $splatted) {
+                $tableName = $splat.VariablePath.UserPath
+                $tableAssignments = @($script:guardLauncherAst.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                        $node.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                        $node.Left.VariablePath.UserPath -eq $tableName
+                }, $true))
+                $tableAssignments.Count | Should -Be 1 -Because "the table `$$tableName must be filled in exactly one place, so this test can read which inputs it contains"
+                $table = $tableAssignments[0].Right.Find({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.HashtableAst]
+                }, $true)
+                $table | Should -Not -BeNullOrEmpty -Because "`$$tableName must be written as a table @{ Name = value; ... }"
+                $given += @($table.KeyValuePairs | ForEach-Object { $_.Item1.Extent.Text.Trim("'", '"') })
+            }
+
+            $line = $call.Extent.StartLineNumber
+            $missing = @($wanted | Where-Object { $given -notcontains $_ -and $mayBeLeftOut -notcontains $_ })
+            $unknown = @($given | Where-Object { $wanted -notcontains $_ })
+            ($missing -join ', ') | Should -BeNullOrEmpty -Because "the call in line $line of the launcher must hand over every input of Build-DockerRunCommand (an input that is left out silently takes its default value)"
+            ($unknown -join ', ') | Should -BeNullOrEmpty -Because "the call in line $line of the launcher uses a name that is not an input of Build-DockerRunCommand (such a value would be ignored)"
+        }
+    }
+
+    It 'The Start button hands the RIGHT value to each input of Build-DockerRunCommand' {
+        # Why: the test above only checks the NAMES of the inputs. A mix-up of the
+        # values would pass it, and it would pass the stored references too, because
+        # they call the function directly. Examples of such a mix-up:
+        #     OutputDir = $synthDir        the synthpop folder is mounted as the result folder
+        #     ImageName = $State.SelectedRepo    the image name is no longer in lower case
+        # So the value of every input is compared here with a stored text.
+        #
+        # Left: the input of the function. Right: the variable of the Start button that
+        # must be handed to it, written exactly as in the launcher.
+        $expectedValues = [ordered]@{
+            State        = '$State'
+            Port         = '$hostPort'
+            UseVolumes   = '$useVolumes'
+            HighCompute  = '$highComp'
+            CustomParams = '$customParams'
+            ImageName    = '$imageName'
+            ProjectRoot  = '$projectRoot'
+            OutputDir    = '$outputDir'
+            SynthpopDir  = '$synthDir'
+            SshKeyPath   = '$sshKeyPath'
+            ContainerUid = '$containerUid'
+            ContainerGid = '$containerGid'
+        }
+
+        $script:guardCalls.Count | Should -BeGreaterThan 0 -Because $script:guardReason
+        foreach ($call in $script:guardCalls) {
+            $line = $call.Extent.StartLineNumber
+
+            # The call must have the form  Build-DockerRunCommand @table : the name of
+            # the function and ONE table with all inputs ("splatting"). This test reads
+            # the values from that table.
+            $callWords = @($call.CommandElements)
+            $isOneTable = ($callWords.Count -eq 2) -and
+                ($callWords[1] -is [System.Management.Automation.Language.VariableExpressionAst]) -and
+                $callWords[1].Splatted
+            $isOneTable | Should -BeTrue -Because "the call in line $line of the launcher must be written as  Build-DockerRunCommand @table  (one table with all inputs), so that this test can read which value goes to which input. It is written as: $($call.Extent.Text)"
+            $tableName = $callWords[1].VariablePath.UserPath
+
+            # The table occurs in exactly two places: where it is filled and where it is
+            # handed to the function. A third place could change an entry after the table
+            # was filled, for example  $startInputs.HighCompute = $true .
+            $tableUses = @(Get-GuardVariableUses -Scope $script:guardLauncherAst -Name $tableName)
+            $where = ($tableUses | ForEach-Object { "line $($_.Extent.StartLineNumber)" }) -join ', '
+            $tableUses.Count | Should -Be 2 -Because "the table `$$tableName may occur in exactly two places of the launcher (where it is filled, and at the call of Build-DockerRunCommand), but it occurs in: $where"
+
+            # The place where the table is filled:  $table = @{ Name = value ... }
+            $tableAssignments = @(Get-GuardAssignments -Scope $script:guardLauncherAst -Name $tableName)
+            $tableAssignments.Count | Should -Be 1 -Because "the table `$$tableName must be filled in exactly one place"
+            $tableAssignment = $tableAssignments[0]
+            $tableAssignment.Extent.EndOffset | Should -BeLessThan $call.Extent.StartOffset -Because "the table `$$tableName must be filled BEFORE it is handed to Build-DockerRunCommand in line $line of the launcher"
+            $tableAssignment.Operator | Should -Be ([System.Management.Automation.Language.TokenKind]::Equals) -Because "the table `$$tableName must be filled with a plain '='"
+            $right = $tableAssignment.Right
+            $isPlainTable = ($right -is [System.Management.Automation.Language.CommandExpressionAst]) -and
+                ($right.Expression -is [System.Management.Automation.Language.HashtableAst])
+            $isPlainTable | Should -BeTrue -Because "`$$tableName must be written as one table @{ Name = value ... } and nothing else (line $($tableAssignment.Extent.StartLineNumber) of the launcher)"
+
+            # Read the table: name of the input -> text of the value, as written.
+            $actualValues = [ordered]@{}
+            foreach ($pair in $right.Expression.KeyValuePairs) {
+                $name = $pair.Item1.Extent.Text.Trim("'", '"')
+                $actualValues[$name] = $pair.Item2.Extent.Text.Trim()
+            }
+
+            # Compare, input by input. 'Should -BeExactly' also notices a difference
+            # between upper and lower case.
+            foreach ($name in $expectedValues.Keys) {
+                $actualValues[$name] | Should -BeExactly $expectedValues[$name] -Because "in the table `$$tableName of the launcher (line $($tableAssignment.Extent.StartLineNumber) and following) the input '$name' must get the value $($expectedValues[$name]). Another value changes what users run, and the stored references cannot see it"
+            }
+            # An input that is in the table but has no stored text yet (a new input of
+            # the function): add it to $expectedValues above.
+            $notStored = @($actualValues.Keys | Where-Object { $expectedValues.Keys -notcontains $_ })
+            ($notStored -join ', ') | Should -BeNullOrEmpty -Because "these inputs are in the table `$$tableName of the launcher but have no stored value in this test yet"
+        }
+    }
+
+    It 'The values handed to Build-DockerRunCommand are set in the expected places of the Start button' {
+        # Why: the test above pins WHICH variable goes to which input. This test pins
+        # where these variables get their content, one step back. Examples of what it
+        # notices:
+        #     $imageName = $State.SelectedRepo          (lower case lost)
+        #     $customParams += ' --privileged'          (an extra line that changes a value)
+        #     $sshKeyPath = ...                         (another key file in LOCAL mode)
+        #
+        # Left: the variable. Right: EVERY line in the code of the Start button that
+        # sets it, in the order of the file. White space is ignored in the comparison.
+        # ('' inside a text in single quotes stands for one single quote.)
+        $expectedSources = [ordered]@{
+            # The four boxes of the window that end up in the 'docker run' list.
+            useVolumes   = @('$useVolumes = $chkVolumes.Checked')
+            highComp     = @('$highComp = $chkHigh.Checked')
+            customParams = @('$customParams = $txtParams.Text.Trim()')
+            portOverride = @('$portOverride = $txtPort.Text.Trim()')
+            # The port: the text of the Port box (the '8787' is only a safety net, see
+            # the comment at this line in the launcher).
+            hostPort     = @('$hostPort = if ($portOverride) { $portOverride } else { ''8787'' }')
+            # The image name is the repository name in lower case.
+            imageName    = @('$imageName = $State.SelectedRepo.ToLowerInvariant()')
+            # The repository folder, and the two folders named in the YAML file.
+            projectRoot  = @('$projectRoot = if ($State.ContainerLocation -eq ''LOCAL'') { $State.Paths.LocalRepo } else { $State.Paths.RemoteRepo }')
+            outputDir    = @('$outputDir = Get-YamlPathValue -State $State -YamlPath $simDesign -Key ''output_dir'' -BaseDir $baseDirForYaml')
+            synthDir     = @('$synthDir = Get-YamlPathValue -State $State -YamlPath $simDesign -Key ''synthpop_dir'' -BaseDir $baseDirForYaml')
+            # The key file: first line LOCAL, second line REMOTE (see the next check).
+            sshKeyPath   = @('$sshKeyPath = $State.Paths.SshPrivate',
+                             '$sshKeyPath = "/home/$($State.RemoteUser)/.ssh/id_ed25519_$($State.UserName)"')
+            # User id and group id: 1000 to begin with; on the workstation they are
+            # replaced by the ids of the workstation user.
+            containerUid = @('$containerUid = ''1000''', '$containerUid = $uidOut.Trim()')
+            containerGid = @('$containerGid = ''1000''', '$containerGid = $gidOut.Trim()')
+        }
+
+        # One complete statement that must be in the code of the Start button exactly
+        # once: it decides WHICH of the two key files is used. LOCAL must take the key
+        # file on this PC.
+        $expectedKeyChoice = 'if ($State.ContainerLocation -eq ''LOCAL'') { $sshKeyPath = $State.Paths.SshPrivate } else { $sshKeyPath = "/home/$($State.RemoteUser)/.ssh/id_ed25519_$($State.UserName)" }'
+
+        $script:guardCalls.Count | Should -BeGreaterThan 0 -Because $script:guardReason
+        foreach ($call in $script:guardCalls) {
+            # The code of the Start button: the script block around the call.
+            $startCode = Get-GuardEnclosingScriptBlock -Node $call
+            $startCode | Should -Not -BeNullOrEmpty
+
+            foreach ($name in $expectedSources.Keys) {
+                $expected = @($expectedSources[$name] | ForEach-Object { Get-GuardCompactText $_ })
+                $found = @(Get-GuardAssignments -Scope $startCode -Name $name | Sort-Object { $_.Extent.StartOffset })
+                $actual = @($found | ForEach-Object { Get-GuardCompactText $_.Extent.Text })
+                $where = ($found | ForEach-Object { "line $($_.Extent.StartLineNumber): $($_.Extent.Text)" }) -join '  |  '
+                $hint = "the code of the Start button must set `$$name exactly in these lines: $($expectedSources[$name] -join '  |  '). It sets it in: $where. If this change is wanted, check what it means for the 'docker run' list and then update the stored lines in this test"
+                $actual.Count | Should -Be $expected.Count -Because $hint
+                for ($i = 0; $i -lt $expected.Count; $i++) {
+                    $actual[$i] | Should -BeExactly $expected[$i] -Because $hint
+                }
+            }
+
+            $ifStatements = @($startCode.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.IfStatementAst]
+            }, $true))
+            $keyChoice = @($ifStatements | Where-Object { (Get-GuardCompactText $_.Extent.Text) -ceq (Get-GuardCompactText $expectedKeyChoice) })
+            $keyChoice.Count | Should -Be 1 -Because "the code of the Start button must contain this statement exactly once, unchanged: $expectedKeyChoice  (it makes LOCAL use the key file on this PC)"
+        }
+    }
+}

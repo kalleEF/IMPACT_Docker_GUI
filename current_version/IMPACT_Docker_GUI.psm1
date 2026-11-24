@@ -3752,9 +3752,34 @@ function ConvertTo-DockerSafeRepoName {
 }
 
 <#
-.SYNOPSIS Build the docker run command-line arguments (pure logic, no execution).
-.DESCRIPTION Given the session state and options, returns the string array to pass
-             to 'docker run'. This makes the command testable without touching Docker.
+.SYNOPSIS Build the argument list for 'docker run' (pure logic, nothing is started).
+.DESCRIPTION Returns the arguments that start the IMPACT container, in the order in
+             which docker receives them. The Start button of the GUI calls this
+             function and hands the result to docker, so this is the ONLY place where
+             that list is written.
+             The function only puts texts together: it does not run docker, does not
+             look at the disk and does not change $State. That is why it can be tested
+             without Docker.
+             The tests 'LOCAL start arguments: stored reference' in tests/Unit.Tests.ps1
+             compare the complete list with stored lists. When something is changed
+             here on purpose, those stored lists must be updated in the same change.
+.PARAMETER State        The session state. Used here: ContainerLocation ('LOCAL' or
+                        'REMOTE@<ip>'), ContainerName, Password, SelectedRepo, UserName.
+.PARAMETER Port         Port under which RStudio is reachable. It must not be empty.
+                        The Start button checks the Port box (Test-PortValue) before
+                        it calls this function, so an empty box never gets this far.
+.PARAMETER UseVolumes   $true: results and synthpop are kept in two Docker volumes (the
+                        caller creates them first). $false: the two folders are mounted.
+.PARAMETER HighCompute  $true adds '--cpus 32 -m 384g', on the workstation only.
+.PARAMETER CustomParams Text of the 'Custom Params' box; added right after the port.
+.PARAMETER ImageName    Name of the Docker image; always the last argument.
+.PARAMETER ProjectRoot  The repository folder (LOCAL: Windows path, REMOTE: Linux path).
+.PARAMETER OutputDir    Result folder from the YAML file.
+.PARAMETER SynthpopDir  Synthpop folder from the YAML file.
+.PARAMETER SshKeyPath   The private key file that is mounted for git; used unchanged.
+.PARAMETER ContainerUid User id of the rstudio user inside the container.
+.PARAMETER ContainerGid Group id of the rstudio user inside the container.
+.OUTPUTS   The arguments as a list of texts: 'run' first, the image name last.
 #>
 function Build-DockerRunCommand {
     param(
@@ -3772,10 +3797,14 @@ function Build-DockerRunCommand {
         [string]$ContainerGid  = '1000'
     )
 
+    # The repository folder in the form Docker uses. LOCAL: 'C:\repos\x' becomes
+    # '/c/repos/x'. REMOTE: the Linux path on the workstation is used as it is.
     $repoMountSource = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $ProjectRoot } else { $ProjectRoot }
-    # Same port rule as the GUI's Start handler (F13): LOCAL containers are only
-    # reachable from this computer (127.0.0.1); on the workstation RStudio must stay
-    # reachable from the colleague's PC, so it is published on all interfaces.
+    # F13: in LOCAL mode RStudio is published on 127.0.0.1 only, so nobody else on the
+    # same Wi-Fi or network can reach the login page (and, after a login, the GitHub
+    # key). The GUI shows http://localhost:<port>, which keeps working. On the
+    # workstation the colleague's PC must reach the port, so REMOTE is published on all
+    # interfaces.
     $publishSpec = if ($State.ContainerLocation -eq 'LOCAL') { "127.0.0.1:${Port}:8787" } else { "${Port}:8787" }
 
     $dockerArgs = @('run','-d','--rm','--name',$State.ContainerName,
@@ -3804,6 +3833,8 @@ function Build-DockerRunCommand {
         $dockerArgs += @('-v',"$($volOut):/home/rstudio/$($State.SelectedRepo)/outputs",
                          '-v',"$($volSyn):/home/rstudio/$($State.SelectedRepo)/inputs/synthpop")
     } else {
+        # Bind mode: the two folders from the YAML file are mounted directly. The
+        # repository itself is already mounted above, so only these two are added here.
         $outDocker = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $OutputDir } else { $OutputDir }
         $synDocker = if ($State.ContainerLocation -eq 'LOCAL') { Convert-PathToDockerFormat -Path $SynthpopDir } else { $SynthpopDir }
         $dockerArgs += @('--mount',"type=bind,source=$outDocker,target=/home/rstudio/$($State.SelectedRepo)/outputs",
@@ -3814,8 +3845,12 @@ function Build-DockerRunCommand {
         $dockerArgs += @('--cpus','32','-m','384g')
     }
 
-    # Labels that let a reopened GUI find out how this container was started (F01/F04).
-    # RepoPath records which repository folder is mounted (F84), same as the GUI does.
+    # F01/F04: record how this container is started (volume mode, result folders, volume
+    # names) as Docker labels. A GUI that is closed and reopened reads them back
+    # (Get-ContainerRuntimeInfo), for LOCAL and REMOTE alike, so Stop can still copy
+    # the results to the right folders.
+    # F84: -RepoPath also records WHICH repository folder is mounted, so a reopened GUI
+    # can notice when the user selected a different clone with the same folder name.
     $dockerArgs += @(Get-ImpactContainerLabelArgs -UseVolumes $UseVolumes -OutputDir $OutputDir -SynthpopDir $SynthpopDir -VolumeOutput $volOut -VolumeSynthpop $volSyn -RepoPath $ProjectRoot)
 
     # Only the private key is mounted from the host. The github.com host key is
