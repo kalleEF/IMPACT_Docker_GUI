@@ -48,13 +48,30 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
-# ── Ensure Pester 5+ ─────────────────────────────────────────────────────────
-$mod = Get-Module Pester -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
-if (-not $mod -or $mod.Version.Major -lt 5) {
-    Write-Host 'Installing Pester 5...' -ForegroundColor Yellow
-    Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+# ── Use Pester 5 (the test tool) ─────────────────────────────────────────────
+# The tests are written for Pester 5. Pester 6 changed how "mocks" behave (a
+# mock is a stand-in for a command during a test), and several tests fail with
+# it. So this script uses the newest Pester 5 that is installed, and installs
+# the version below when none is there. A Pester 6 on the same PC is left alone:
+# several versions can be installed side by side.
+# The GitHub workflow uses the same version (PESTER_VERSION in
+# .github/workflows/test.yml). Change both together.
+$requiredPesterVersion = '5.7.1'
+$mod = Get-Module Pester -ListAvailable |
+    Where-Object { $_.Version.Major -eq 5 } |
+    Sort-Object Version -Descending |
+    Select-Object -First 1
+if (-not $mod) {
+    Write-Host "Installing Pester $requiredPesterVersion..." -ForegroundColor Yellow
+    Install-Module Pester -Force -Scope CurrentUser -RequiredVersion $requiredPesterVersion -SkipPublisherCheck
+    $mod = Get-Module Pester -ListAvailable |
+        Where-Object { $_.Version.Major -eq 5 } |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
 }
-Import-Module Pester -MinimumVersion 5.0.0
+# -RequiredVersion loads exactly the version found above, also when a newer
+# Pester is installed next to it.
+Import-Module Pester -RequiredVersion $mod.Version
 
 # Source test helpers
 . (Join-Path $PSScriptRoot 'Helpers' 'TestSessionState.ps1')

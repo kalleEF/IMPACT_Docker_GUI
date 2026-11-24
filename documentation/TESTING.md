@@ -28,11 +28,15 @@ In NonInteractive mode the dialog functions (`Show-CredentialDialog`, `Select-Lo
 
 ## Test framework
 
-[Pester 5](https://pester.dev/). The runner installs it if needed:
+[Pester 5](https://pester.dev/), version 5.7.1. The tests are written for Pester 5 and
+several of them fail with Pester 6. The runner uses the newest Pester 5 on the PC and
+installs it if needed:
 
 ```powershell
-Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+Install-Module Pester -Force -Scope CurrentUser -RequiredVersion 5.7.1 -SkipPublisherCheck
 ```
+
+A Pester 6 on the same PC can stay: several versions can be installed side by side.
 
 ---
 
@@ -125,7 +129,7 @@ The runner:
 ### Direct Pester invocation
 
 ```powershell
-Import-Module Pester -MinimumVersion 5.0.0
+Import-Module Pester -RequiredVersion 5.7.1
 Invoke-Pester ./tests/Unit.Tests.ps1 -Output Detailed
 Invoke-Pester ./tests/Integration.Tests.ps1 -Output Detailed
 ```

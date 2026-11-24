@@ -37,6 +37,17 @@ on:
     # E2E tests weekly on Sunday at 03:00 UTC
     - cron: '0 3 * * 0'
 
+# The version of Pester (the test tool for PowerShell) that every job installs.
+# It is fixed on purpose. The tests are written and checked with this version.
+# Pester 6 changed how "mocks" behave (a mock is a stand-in for a command
+# during a test): a mock that only handles some calls no longer passes the
+# other calls on to the real command, and several tests rely on that. With a
+# fixed version, a new Pester release cannot turn the tests red overnight.
+# To move to a newer version: change this one line and
+# $requiredPesterVersion in tests/Invoke-Tests.ps1, and run all tests.
+env:
+  PESTER_VERSION: '5.7.1'
+
 permissions:
   contents: read
 
@@ -83,12 +94,12 @@ jobs:
       - name: Install Pester
         shell: pwsh
         run: |
-          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+          Install-Module Pester -Force -Scope CurrentUser -RequiredVersion $env:PESTER_VERSION -SkipPublisherCheck
 
       - name: Run Unit Tests
         shell: pwsh
         run: |
-          Import-Module Pester -MinimumVersion 5.0.0
+          Import-Module Pester -RequiredVersion $env:PESTER_VERSION
           $config = New-PesterConfiguration
           $config.Run.Path = './tests/Unit.Tests.ps1'
           $config.Filter.Tag = @('Unit')
@@ -119,7 +130,7 @@ jobs:
       - name: Install Pester
         shell: pwsh
         run: |
-          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+          Install-Module Pester -Force -Scope CurrentUser -RequiredVersion $env:PESTER_VERSION -SkipPublisherCheck
 
       - name: Verify Docker CLI is available
         shell: pwsh
@@ -130,7 +141,7 @@ jobs:
       - name: Run Integration Tests
         shell: pwsh
         run: |
-          Import-Module Pester -MinimumVersion 5.0.0
+          Import-Module Pester -RequiredVersion $env:PESTER_VERSION
           $config = New-PesterConfiguration
           $config.Run.Path = './tests/Integration.Tests.ps1'
           $config.Filter.Tag = @('Integration')
@@ -167,7 +178,7 @@ jobs:
       - name: Install Pester
         shell: pwsh
         run: |
-          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+          Install-Module Pester -Force -Scope CurrentUser -RequiredVersion $env:PESTER_VERSION -SkipPublisherCheck
 
       - name: Build SSHD Test Container
         run: |
@@ -195,7 +206,7 @@ jobs:
       - name: Run SSH Target Tests
         shell: pwsh
         run: |
-          Import-Module Pester -MinimumVersion 5.0.0
+          Import-Module Pester -RequiredVersion $env:PESTER_VERSION
 
           $env:IMPACT_TEST_SSH_HOST = 'localhost'
           $env:IMPACT_TEST_SSH_PORT = '2222'
@@ -244,7 +255,7 @@ jobs:
       - name: Install Pester
         shell: pwsh
         run: |
-          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+          Install-Module Pester -Force -Scope CurrentUser -RequiredVersion $env:PESTER_VERSION -SkipPublisherCheck
 
       - name: Verify Docker
         run: |
@@ -254,7 +265,7 @@ jobs:
       - name: Run Preflight Tests (ImageValidation)
         shell: pwsh
         run: |
-          Import-Module Pester -MinimumVersion 5.0.0
+          Import-Module Pester -RequiredVersion $env:PESTER_VERSION
           $config = New-PesterConfiguration
           $config.Run.Path = './tests/Preflight.Tests.ps1'
           $config.Filter.Tag = @('Preflight')
@@ -270,7 +281,7 @@ jobs:
         env:
           IMPACT_E2E_GITHUB_TOKEN: ${{ secrets.IMPACT_E2E_GITHUB_TOKEN }}
         run: |
-          Import-Module Pester -MinimumVersion 5.0.0
+          Import-Module Pester -RequiredVersion $env:PESTER_VERSION
           $config = New-PesterConfiguration
           $config.Run.Path = './tests/ImageValidation.Tests.ps1'
           $config.Filter.Tag = @('ImageValidation')
@@ -343,7 +354,7 @@ jobs:
       - name: Install Pester
         shell: pwsh
         run: |
-          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+          Install-Module Pester -Force -Scope CurrentUser -RequiredVersion $env:PESTER_VERSION -SkipPublisherCheck
 
       - name: Build Workstation Container
         run: |
@@ -384,7 +395,7 @@ jobs:
       - name: Run Preflight Tests (RemoteE2E)
         shell: pwsh
         run: |
-          Import-Module Pester -MinimumVersion 5.0.0
+          Import-Module Pester -RequiredVersion $env:PESTER_VERSION
           $config = New-PesterConfiguration
           $config.Run.Path = './tests/Preflight.Tests.ps1'
           $config.Filter.Tag = @('Preflight')
@@ -400,7 +411,7 @@ jobs:
         env:
           IMPACT_E2E_GITHUB_TOKEN: ${{ secrets.IMPACT_E2E_GITHUB_TOKEN }}
         run: |
-          Import-Module Pester -MinimumVersion 5.0.0
+          Import-Module Pester -RequiredVersion $env:PESTER_VERSION
 
           # IMPACT_REMOTE_E2E_SSH_* come from the job-level 'env:' above.
           $config = New-PesterConfiguration
