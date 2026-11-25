@@ -238,6 +238,15 @@ test_flags_to_chmod() {
     assert_eq 'u-s,g-s,-t' "$(impact_sharing_flags_chmod '')"
 }
 
+test_flags_of_a_mode() {
+    assert_eq '---' "$(impact_sharing_flags_of_mode 644)"
+    assert_eq '-s-' "$(impact_sharing_flags_of_mode 2775)"
+    assert_eq 's--' "$(impact_sharing_flags_of_mode 4755)"
+    assert_eq '--t' "$(impact_sharing_flags_of_mode 1777)"
+    assert_eq 'sst' "$(impact_sharing_flags_of_mode 7777)"
+    assert_eq '---' "$(impact_sharing_flags_of_mode 0)"
+}
+
 test_number_and_size_texts() {
     assert_eq '0' "$(impact_sharing_number 0)"
     assert_eq '999' "$(impact_sharing_number 999)"
@@ -296,6 +305,8 @@ test_manifest_code_follows_content_mode_and_names_only() {
     mkdir -p -- "$folder/sub"
     printf 'a\n' >"$folder/sub/one"
     printf 'b\n' >"$folder/two"
+    # shellcheck disable=SC2034
+    # Reason for SC2034: as above, the function reads the list by its name.
     sources=("$folder/sub/one" "$folder/two")
     first="$(impact_sharing_manifest_code paths sources)"
     assert_matches "$first" '^[0-9a-f]{64}$'

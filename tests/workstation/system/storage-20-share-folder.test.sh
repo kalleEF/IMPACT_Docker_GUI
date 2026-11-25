@@ -22,7 +22,10 @@
 #     - files moved in with their old rights (and a later "chmod g-w") are
 #       found and fixed by --repair;
 #     - --transition-user gives an old account access, also to new
-#       entries, and --remove-transition-user takes it away again.
+#       entries, and --remove-transition-user takes it away again;
+#     - a restore names files whose special bits (setuid, setgid, sticky)
+#       it leaves to the administrator, puts back those of folders, and
+#       works on a folder only when it is still the saved one.
 #
 # Who runs it
 #   tests/workstation/run-tests.sh system   (root, disposable system only;
@@ -388,7 +391,10 @@ test_repair_finds_entries_moved_in_with_old_rights() {
     chmod 700 -- "$PRIVATE"
     as_person alice "printf 'm\n' >'$PRIVATE/moved.txt' && mkdir '$PRIVATE/moved-dir' && printf 'n\n' >'$PRIVATE/moved-dir/inner.txt'" ||
         fail "alice cannot write her private folder"
-    as_person alice "printf 'h\n' >\$HOME/home-file.txt && cp -p \$HOME/home-file.txt '$out/copied-with-rights.txt'" ||
+    # A copy with "cp -p" keeps the rights of the source; a plain "cp" gives
+    # the new file at most the group rights of the source as well (here
+    # none: the source has mode 600), whatever the default ACL says.
+    as_person alice "printf 'h\n' >\$HOME/home-file.txt && cp -p \$HOME/home-file.txt '$out/copied-with-rights.txt' && cp \$HOME/home-file.txt '$out/copied-plain.txt'" ||
         fail "alice cannot copy from home"
     # "mv" on the same disk keeps the old owner, group and mode.
     as_person alice "mv '$PRIVATE/moved.txt' '$out/' && mv '$PRIVATE/moved-dir' '$out/' && chmod g-w '$out/alice.txt'" ||
@@ -396,14 +402,17 @@ test_repair_finds_entries_moved_in_with_old_rights() {
     if as_person bob "printf 'x\n' >>'$out/moved.txt'" 2>/dev/null; then
         fail "bob can write the moved file before the repair; the test proves nothing"
     fi
+    if as_person bob "printf 'x\n' >>'$out/copied-plain.txt'" 2>/dev/null; then
+        fail "bob can write the plain copy before the repair; the test proves nothing"
+    fi
     snapshot_unchanged_by --content /mnt/disk_a /opt/impact -- sys_as_admin "$SHARE" "$T" --repair --dry-run
     assert_status 0
     assert_output_contains 'Folders that deviate from the rules: 1 (other group: 1; setgid missing: 1; group may not read, write or enter: 1; default ACL missing or different: 1).'
-    assert_output_contains 'Files that deviate from the rules: 4'
+    assert_output_contains 'Files that deviate from the rules: 5'
     run_cmd sys_as_admin "$SHARE" "$T" --repair
     assert_status 0
-    assert_output_contains 'Changed: 1 folder and 4 files.'
-    as_person bob "printf 'x\n' >>'$out/moved.txt' && printf 'x\n' >>'$out/moved-dir/inner.txt' && printf 'x\n' >'$out/moved-dir/new.txt' && printf 'x\n' >>'$out/alice.txt' && printf 'x\n' >>'$out/copied-with-rights.txt'" ||
+    assert_output_contains 'Changed: 1 folder and 5 files.'
+    as_person bob "printf 'x\n' >>'$out/moved.txt' && printf 'x\n' >>'$out/moved-dir/inner.txt' && printf 'x\n' >'$out/moved-dir/new.txt' && printf 'x\n' >>'$out/alice.txt' && printf 'x\n' >>'$out/copied-with-rights.txt' && printf 'x\n' >>'$out/copied-plain.txt'" ||
         fail "bob cannot change the repaired entries"
     load_settings
     assert_eq "$(printf '%q' "$T/hard-outside")" "$(deviating_entries "$T")" "entries that still deviate"
@@ -459,4 +468,79 @@ test_transition_account_gets_access_and_loses_it_again() {
     assert_status 0
     assert_output_contains 'Nothing to do'
     setfacl -x u:oldshared -- "$SYS_ROOT_A"
+}
+
+test_restore_names_files_whose_special_bits_it_leaves() {
+    local base="$SYS_ROOT_A/Special" before folder
+    mkdir -p -- "$base/d-sticky"
+    printf '#!/bin/sh\n' >"$base/setuid-tool"
+    # The owner first: a change of owner clears the setuid bit of an
+    # executable file.
+    chown -R oldshared:oldshared -- "$base"
+    # 4755: an executable file with setuid; 1777: a folder with the sticky
+    # bit (only the owner of an entry may delete it).
+    chmod 4755 -- "$base/setuid-tool"
+    chmod 1777 -- "$base/d-sticky"
+    chmod 755 -- "$base"
+    # New folders inherit setgid from the storage root, and a mode written
+    # as a number keeps it on folders; "g-s" takes it away explicitly.
+    chmod g-s -- "$base/d-sticky" "$base"
+    before="$TEST_TMP/special-before.snapshot"
+    snapshot_take "$before" --no-accounts "$base"
+    run_cmd sys_as_admin "$SHARE" "$base"
+    assert_status 0
+    # Changing the group of an executable file clears its setuid bit (a
+    # rule of Linux); the folder keeps its sticky bit and gets setgid.
+    assert_file_facts "$base/setuid-tool" 775 oldshared "$SYS_GROUP"
+    assert_file_facts "$base/d-sticky" 3777 oldshared "$SYS_GROUP"
+    folder="$(backup_folders | tail -n 1)"
+    run_cmd sys_as_admin "$SHARE" --restore "$folder" --dry-run
+    assert_status 0
+    assert_output_contains "setuid-tool: special bits now '---', saved 's--'"
+    run_cmd sys_as_admin "$SHARE" --restore "$folder"
+    assert_status 0
+    assert_output_contains 'Files whose special bits (setuid, setgid, sticky) differ from the saved ones: 1.'
+    assert_output_contains "After a look at the file: sudo chmod u+s,g-s,-t -- $base/setuid-tool"
+    # The folder is back exactly, the file has its owner, group and rights
+    # back, without the setuid bit.
+    assert_file_facts "$base/d-sticky" 1777 oldshared oldshared
+    assert_file_facts "$base/setuid-tool" 755 oldshared oldshared
+    # The line the command printed completes the restore.
+    chmod u+s,g-s,-t -- "$base/setuid-tool"
+    snapshot_take "$TEST_TMP/special-after.snapshot" --no-accounts "$base"
+    snapshot_assert_same "$before" "$TEST_TMP/special-after.snapshot" "the state after the restore and the printed chmod"
+    rm -rf -- "$base"
+}
+
+test_restore_of_a_folder_works_only_on_the_saved_folder() {
+    load_settings
+    local base="$SYS_ROOT_A/Swap" ident key status
+    mkdir -p -- "$base/real" "$base/other"
+    chown oldshared:oldshared -- "$base/real" "$base/other"
+    chmod 755 -- "$base/real" "$base/other"
+    chmod g-s -- "$base/real" "$base/other"
+    ident="$(stat -c '%d:%i' -- "$base/real")"
+    key="d|0|0|-s-|user::rwx,group::rwx,other::---"
+    # The saved folder was replaced by a link to another folder: refused,
+    # and neither folder changes.
+    mv -- "$base/real" "$base/real-moved"
+    ln -s -- "$base/other" "$base/real"
+    status=0
+    impact__sharing_restore_dir "$key" "$base/real" "$ident" || status=$?
+    assert_eq 3 "$status" "status for a folder that became a link"
+    assert_file_facts "$base/other" 755 oldshared oldshared
+    assert_file_facts "$base/real-moved" 755 oldshared oldshared
+    # Another folder under the saved name (other inode): refused as well.
+    rm -f -- "$base/real"
+    mv -- "$base/other" "$base/real"
+    status=0
+    impact__sharing_restore_dir "$key" "$base/real" "$ident" || status=$?
+    assert_eq 3 "$status" "status for another folder under the saved name"
+    assert_file_facts "$base/real" 755 oldshared oldshared
+    # The saved folder itself gets the saved state.
+    rm -rf -- "$base/real"
+    mv -- "$base/real-moved" "$base/real"
+    impact__sharing_restore_dir "$key" "$base/real" "$ident" || fail "the saved folder could not be restored"
+    assert_file_facts "$base/real" 2770 root root
+    rm -rf -- "$base"
 }

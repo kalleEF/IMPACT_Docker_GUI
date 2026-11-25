@@ -125,6 +125,15 @@ impact_require_tools tar gzip sha256sum find getent cp stat sync
 impact_lock export-state
 
 STAMP="$(date -u '+%Y%m%dT%H%M%SZ')"
+# The name holds the time in seconds. A second run within the same second
+# waits for the next second, so an archive is never replaced.
+for _ in 1 2 3; do
+    if [[ ! -e "$IMPACT_STATE_DIR/impact-state-$STAMP.tar.gz" && ! -e "$IMPACT_STATE_DIR/impact-state-$STAMP.info" ]]; then
+        break
+    fi
+    sleep 1
+    STAMP="$(date -u '+%Y%m%dT%H%M%SZ')"
+done
 NAME="impact-state-$STAMP"
 ARCHIVE="$IMPACT_STATE_DIR/$NAME.tar.gz"
 ARCHIVE_INFO="$IMPACT_STATE_DIR/$NAME.info"
@@ -396,6 +405,11 @@ write_archive() {
     tar --create --gzip --numeric-owner --file="$temporary" --directory="$staging" -- "$NAME" || return 1
     chmod 600 -- "$temporary" || return 1
     sync -- "$temporary" || return 1
+    # An archive of the same name is never replaced.
+    if [[ -e "$ARCHIVE" || -L "$ARCHIVE" ]]; then
+        impact_error "$ARCHIVE exists already."
+        return 1
+    fi
     mv -f -T -- "$temporary" "$ARCHIVE" || return 1
     checksum="$(sha256sum -- "$ARCHIVE" | cut -d' ' -f1)" || return 1
     printf 'STATE_ARCHIVE_VERSION=1\nARCHIVE=%s\nCREATED=%s\nFILES=%s\nCONTENT_CODE=%s\nARCHIVE_SHA256=%s\n' \
@@ -441,7 +455,9 @@ impact_say "      1. Make a copy that your own account can read:"
 impact_say "           sudo install -m 600 -o $ADMIN -g $(id -gn "$ADMIN" 2>/dev/null || printf '%s' "$ADMIN") $SHOWN $ADMIN_HOME/"
 impact_say "      2. On your PC, fetch it (from a terminal there):"
 impact_say "           scp $ADMIN@<workstation address>:$(basename -- "$SHOWN") ."
-impact_say "      3. Compare the checksum on the PC with this one:"
+impact_say "      3. Compare the checksum on the PC with this one. In PowerShell: Get-FileHash .\\$(basename -- "$SHOWN")"
+impact_say "         (on Linux or macOS: sha256sum $(basename -- "$SHOWN")). It must show this value"
+impact_say "         (Get-FileHash writes it in capital letters; that is the same value):"
 impact_say "           $CHECKSUM"
 impact_say "      4. Delete the copy in your home folder here:  rm $ADMIN_HOME/$(basename -- "$SHOWN")"
 impact_say "    Keep the copy where only you can read it (for example an encrypted drive). Never put it"

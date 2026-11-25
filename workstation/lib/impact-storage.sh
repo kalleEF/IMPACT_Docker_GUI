@@ -406,7 +406,11 @@ impact__shared_open_dir() {
     # the new handle in the variable NAME. The braces with "2>/dev/null" hide
     # the error text of a failed open without touching the script's own
     # error channel.
-    if ! { exec {IMPACT__SHARED_FD}<"$folder"; } 2>/dev/null; then
+    # The path ends in "/.": the system resolves that only when the entry is
+    # a folder. Should the folder be swapped for a link to a device after the
+    # test above, the open fails and the device is never opened (opening
+    # some devices has effects of its own).
+    if ! { exec {IMPACT__SHARED_FD}<"$folder/."; } 2>/dev/null; then
         IMPACT__SHARED_FD=''
         IMPACT_STORAGE_ERROR="$(impact_display "$folder") cannot be opened."
         return 1
@@ -692,7 +696,11 @@ impact_shared_apply_files() {
         entries+=",u:$uid:rwX"
     fi
     # -R -P: setfacl skips symbolic links given as arguments. For a plain
-    # file, -R has no further effect.
+    # file, -R has no further effect. The manual of acl 2.3.1 (Ubuntu 22.04)
+    # says that -P acts only together with -R, so -R stays: without it, a
+    # file swapped for a link at the last moment could be followed. The
+    # opposite case, a file swapped for a real folder, makes setfacl give
+    # that folder's content the group rules; it stays on the shared storage.
     setfacl -R -P -m "$entries" -- "$@" || return 1
     if [[ "$state" == 'absent' ]]; then
         setfacl -R -P -x "u:$uid" -- "$@" || return 1

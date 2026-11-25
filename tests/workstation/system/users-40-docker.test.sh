@@ -42,21 +42,17 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/../lib/testlib.sh"
 REMOVE=/usr/local/bin/impact-remove-user
 ACC='alice-example'
 OTHER='olga-example'
-# Written by suite_setup when the tests cannot run here, with the reason.
-NO_DOCKER_NOTE='no-docker'
 
 suite_setup() {
     local image
     # A stand-in docker of another test file must not be mistaken for the
     # real one.
     if [[ -f /usr/local/sbin/docker ]] || ! timeout 20 docker version >/dev/null 2>&1; then
-        printf 'no Docker daemon answers on this machine\n' >"$TEST_SUITE_TMP/$NO_DOCKER_NOTE"
-        return 0
+        skip 'no Docker daemon answers on this machine'
     fi
     image="$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>' | head -n 1)" || image=''
     if [[ -z "$image" ]]; then
-        printf 'the Docker daemon has no image to start a test container from\n' >"$TEST_SUITE_TMP/$NO_DOCKER_NOTE"
-        return 0
+        skip 'the Docker daemon has no image to start a test container from'
     fi
     printf '%s\n' "$image" >"$TEST_SUITE_TMP/image"
     remove_test_containers
@@ -83,9 +79,6 @@ suite_setup() {
 }
 
 suite_teardown() {
-    if [[ -e "$TEST_SUITE_TMP/$NO_DOCKER_NOTE" ]]; then
-        return 0
-    fi
     remove_test_containers
     sys_clean_slate
 }
@@ -99,14 +92,6 @@ remove_test_containers() {
     done
 }
 
-# need_docker
-#   Skips the test when suite_setup found no usable Docker daemon.
-need_docker() {
-    if [[ -e "$TEST_SUITE_TMP/$NO_DOCKER_NOTE" ]]; then
-        skip "$(cat -- "$TEST_SUITE_TMP/$NO_DOCKER_NOTE")"
-    fi
-}
-
 # state_of NAME
 #   Prints the state of a container: running, exited, created, ...
 state_of() {
@@ -114,7 +99,6 @@ state_of() {
 }
 
 test_dry_run_stops_nothing() {
-    need_docker
     run_cmd sys_as_admin "$REMOVE" "$ACC" --dry-run
     assert_status 0
     assert_output_contains '[dry run] Stop the container impact-test-alice'
@@ -125,7 +109,6 @@ test_dry_run_stops_nothing() {
 }
 
 test_the_removal_stops_exactly_the_containers_of_the_person() {
-    need_docker
     run_cmd sys_as_admin "$REMOVE" "$ACC" --yes
     assert_status 0
     assert_output_contains '+ Stop the container impact-test-alice'
@@ -136,7 +119,6 @@ test_the_removal_stops_exactly_the_containers_of_the_person() {
 }
 
 test_second_run_changes_nothing() {
-    need_docker
     run_cmd sys_as_admin "$REMOVE" "$ACC" --yes
     assert_status 0
     assert_output_contains 'Nothing to do'

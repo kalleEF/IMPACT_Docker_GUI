@@ -246,6 +246,8 @@ if ! impact_is_dry_run; then
     impact_undo "Remove the copy while $ACCOUNT has not worked in it: sudo rm -rf $TARGET"
 fi
 
-impact_say ''
-impact_say "Tell $ACCOUNT: the copy of $MODEL is in $TARGET."
 impact_summary
+if ! impact_is_dry_run; then
+    impact_say ''
+    impact_say "Tell $ACCOUNT: the copy of $MODEL is in $TARGET."
+fi

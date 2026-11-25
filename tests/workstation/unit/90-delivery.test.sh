@@ -105,7 +105,8 @@ test_commands_are_executable_and_have_no_extension() {
         assert_file_contains "$file" 'impact_init'
         assert_file_contains "$file" 'impact_parse_args'
     done
-    for file in "$WORKSTATION_DIR/install.sh" "$WORKSTATION_DIR/uninstall.sh" "$TESTS_DIR/run-tests.sh"; do
+    for file in "$WORKSTATION_DIR/install.sh" "$WORKSTATION_DIR/uninstall.sh" "$WORKSTATION_DIR/build-archive.sh" \
+        "$TESTS_DIR/run-tests.sh" "$TESTS_DIR/scenario.sh"; do
         if [[ ! -x "$file" ]]; then
             fail "$file is not executable"
         fi

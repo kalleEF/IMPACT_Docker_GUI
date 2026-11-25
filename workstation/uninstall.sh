@@ -166,8 +166,10 @@ fi
 impact_info "    sudo rm -r $IMPACT_CONF_DIR"
 if [[ -e "$IMPACT_SSH_RULES_FILE" ]]; then
     impact_info "SSH rules: $IMPACT_SSH_RULES_FILE (exists; members of the group stay restricted to key login)."
-    impact_info "    Keep one session open, then:  sudo rm $IMPACT_SSH_RULES_FILE && sudo sshd -t && sudo systemctl reload ssh"
-    impact_info "    and test a new login from a second window before you close the first one."
+    impact_info "    The safe way, while the commands are still installed:  sudo impact-workstation-setup --remove-ssh-rules"
+    impact_info "    By hand: keep one session open, then:  sudo rm $IMPACT_SSH_RULES_FILE && sudo sshd -t && sudo systemctl reload ssh"
+    impact_info "    (On Ubuntu 24.04 the reload can answer that ssh.service is not active; new logins then read the change by themselves.)"
+    impact_info "    Test a new login from a second window before you close the first one."
 else
     impact_info "SSH rules: $IMPACT_SSH_RULES_FILE (not present)."
 fi

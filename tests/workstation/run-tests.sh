@@ -56,6 +56,12 @@
 #   FAIL  <file> :: <test>      followed by the output of the test
 #   SKIP  <file> :: <test>      with the reason
 #   SUMMARY <level>: <n> tests, <n> passed, <n> failed, <n> skipped
+#   A file may prepare its tests once in a function suite_setup and clean up
+#   in suite_teardown. When suite_setup calls "skip" (for example because no
+#   Docker daemon answers), every test of the file is reported as SKIP and
+#   suite_teardown does not run; such a suite_setup decides before it
+#   changes anything. A file whose tests the filter leaves out is not
+#   prepared at all.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -189,9 +195,19 @@ show_output() {
 #   Runs all tests of one file and counts the results.
 run_file() {
     local level="$1" file="$2" short test_name status output_file suite_tmp
-    local -a names=()
+    local -a names=() selected=()
     short="$level/$(basename -- "$file")"
     mapfile -t names < <(list_tests "$file")
+    # The tests that the filter lets through. A file without any of them is
+    # left out completely, so its preparation does not run for nothing.
+    for test_name in "${names[@]}"; do
+        if [[ -z "$FILTER" || "$short" == *"$FILTER"* || "$test_name" == *"$FILTER"* ]]; then
+            selected+=("$test_name")
+        fi
+    done
+    if ((${#selected[@]} == 0)); then
+        return 0
+    fi
 
     # One temporary folder per test file. Tests of the file can pass files to
     # each other through it (TEST_SUITE_TMP).
@@ -201,9 +217,17 @@ run_file() {
     export TEST_SUITE_TMP="$suite_tmp"
     output_file="$suite_tmp/.output"
 
-    local suite_ok=1
+    # suite_ok: 1 ready; 0 the preparation failed; 2 the preparation asked
+    # to skip the whole file (it called "skip", exit code 77), for example
+    # because no Docker daemon answers. A preparation that skips must do so
+    # before it changes anything: the clean-up of the file then does not run.
+    local suite_ok=1 suite_status=0 skip_reason=''
     if has_function "$file" suite_setup; then
-        if ! run_function "$file" suite_setup "$output_file" suite; then
+        run_function "$file" suite_setup "$output_file" suite || suite_status=$?
+        if ((suite_status == 77)); then
+            suite_ok=2
+            skip_reason="$(grep -m 1 '^SKIP: ' "$output_file" | cut -c7-)"
+        elif ((suite_status != 0)); then
             suite_ok=0
             printf 'FAIL  %s :: suite_setup\n' "$short"
             show_output "$output_file"
@@ -212,15 +236,17 @@ run_file() {
         fi
     fi
 
-    for test_name in "${names[@]}"; do
-        if [[ -n "$FILTER" && "$short" != *"$FILTER"* && "$test_name" != *"$FILTER"* ]]; then
-            continue
-        fi
+    for test_name in "${selected[@]}"; do
         TOTAL=$((TOTAL + 1))
         if ((suite_ok == 0)); then
             FAILED=$((FAILED + 1))
             FAILED_NAMES+=("$short :: $test_name")
             printf 'FAIL  %s :: %s (the preparation of this file failed)\n' "$short" "$test_name"
+            continue
+        fi
+        if ((suite_ok == 2)); then
+            SKIPPED=$((SKIPPED + 1))
+            printf 'SKIP  %s :: %s (%s)\n' "$short" "$test_name" "$skip_reason"
             continue
         fi
         status=0
@@ -250,7 +276,7 @@ run_file() {
         esac
     done
 
-    if has_function "$file" suite_teardown; then
+    if ((suite_ok != 2)) && has_function "$file" suite_teardown; then
         if ! run_function "$file" suite_teardown "$output_file" suite; then
             printf 'FAIL  %s :: suite_teardown (the clean-up of this file failed)\n' "$short"
             show_output "$output_file"

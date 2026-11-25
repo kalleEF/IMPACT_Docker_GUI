@@ -47,8 +47,6 @@
 source "$(dirname -- "${BASH_SOURCE[0]}")/../lib/testlib.sh"
 
 CLEAN=/usr/local/bin/impact-clean-images
-# Written by suite_setup when the tests cannot run here, with the reason.
-NO_DOCKER_NOTE='no-docker'
 TEST_IMAGES=(example-model:alice other-model:alice used-model:alice example-model:bob
     example-model:ghost impact-test-weird:tag impact-test-plain:latest)
 
@@ -56,8 +54,7 @@ suite_setup() {
     # A stand-in docker of another test file must not be mistaken for the
     # real one.
     if [[ -f /usr/local/sbin/docker ]] || ! timeout 20 docker version >/dev/null 2>&1; then
-        printf 'no Docker daemon answers on this machine\n' >"$TEST_SUITE_TMP/$NO_DOCKER_NOTE"
-        return 0
+        skip 'no Docker daemon answers on this machine'
     fi
     remove_test_docker_objects
     sys_clean_slate
@@ -88,9 +85,6 @@ suite_setup() {
 }
 
 suite_teardown() {
-    if [[ -e "$TEST_SUITE_TMP/$NO_DOCKER_NOTE" ]]; then
-        return 0
-    fi
     remove_test_docker_objects
     sys_clean_slate
 }
@@ -110,14 +104,6 @@ remove_test_docker_objects() {
     for id in $(docker image ls --all --no-trunc --quiet --filter label=impact.account 2>/dev/null); do
         docker image rm "$id" >/dev/null 2>&1 || true
     done
-}
-
-# need_docker
-#   Skips the test when suite_setup found no usable Docker daemon.
-need_docker() {
-    if [[ -e "$TEST_SUITE_TMP/$NO_DOCKER_NOTE" ]]; then
-        skip "$(cat -- "$TEST_SUITE_TMP/$NO_DOCKER_NOTE")"
-    fi
 }
 
 # docker_state FILE
@@ -140,7 +126,6 @@ docker_unchanged_by() {
 }
 
 test_wrong_input_is_refused() {
-    need_docker
     docker_unchanged_by sys_as_admin "$CLEAN" extra
     assert_status 2
     assert_output_contains 'Too many arguments'
@@ -154,7 +139,6 @@ test_wrong_input_is_refused() {
 }
 
 test_the_list_changes_nothing_and_shows_each_decision() {
-    need_docker
     # The list writes nothing: no log block, no file in a home folder.
     snapshot_take "$TEST_TMP/files-before" --content /opt/impact /home
     docker_unchanged_by sys_as_admin "$CLEAN"
@@ -182,7 +166,6 @@ test_the_list_changes_nothing_and_shows_each_decision() {
 }
 
 test_remove_with_dry_run_removes_nothing() {
-    need_docker
     docker_unchanged_by sys_as_admin "$CLEAN" --remove --dry-run
     assert_status 0
     assert_output_contains '[dry run] Remove the image other-model:alice (account alice)'
@@ -190,7 +173,6 @@ test_remove_with_dry_run_removes_nothing() {
 }
 
 test_remove_without_terminal_and_without_yes_removes_nothing() {
-    need_docker
     # setsid starts the command without a terminal, so nobody can answer.
     docker_unchanged_by timeout 60 setsid --wait runuser -u "$SYS_ADMIN" -- sudo -n -- "$CLEAN" --remove
     assert_status 1
@@ -199,7 +181,6 @@ test_remove_without_terminal_and_without_yes_removes_nothing() {
 }
 
 test_remove_with_yes_removes_exactly_the_marked_images() {
-    need_docker
     run_cmd sys_as_admin "$CLEAN" --remove --yes
     assert_status 0
     assert_output_contains 'What changed:'
@@ -213,7 +194,6 @@ test_remove_with_yes_removes_exactly_the_marked_images() {
 }
 
 test_second_run_removes_nothing() {
-    need_docker
     docker_unchanged_by sys_as_admin "$CLEAN" --remove --yes
     assert_status 0
     assert_output_contains 'To remove: 0'

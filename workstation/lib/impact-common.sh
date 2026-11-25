@@ -140,6 +140,20 @@ readonly IMPACT_SSH_RULES_DIR='/etc/ssh/sshd_config.d'
 readonly IMPACT_SSH_RULES_FILE='/etc/ssh/sshd_config.d/60-impact.conf'
 readonly IMPACT_LOCK_DIR='/run/impact'
 
+# The tools that the IMPACT commands use, in one list. install.sh refuses to
+# install while one of them is missing (it prints the apt-get line), and
+# impact-check names missing ones. All of them come with a default Ubuntu
+# server installation plus the packages acl, git and curl. Docker is checked
+# separately, because it does not come from Ubuntu's own package source.
+# "readonly -a" makes a list that cannot be changed later.
+readonly -a IMPACT_NEEDED_TOOLS=(
+    sshd ssh-keygen ssh getfacl setfacl git curl runuser findmnt flock mountpoint
+    getent iconv useradd usermod userdel groupadd gpasswd chage passwd realpath
+    stat install mktemp sha256sum timeout tar gzip awk sed grep diff cmp find
+    xargs ps pkill hostname dpkg-query ss df du sync chgrp chown chmod head
+    tail cut sort uniq tr date id uname nproc uptime
+)
+
 # Exit codes. A command ends with one of these numbers; 0 means success.
 readonly IMPACT_EXIT_OK=0            # success, also "nothing to do"
 readonly IMPACT_EXIT_FAILED=1        # a check failed or the operation failed
@@ -182,6 +196,7 @@ IMPACT_RESULT_REASON=''            # the one-word reason reported in that line
 IMPACT_EXITING=0                   # 1 while the end-of-command work runs
 IMPACT_MASK_NAMES=()               # extra host names for impact_mask_text
 IMPACT__LOCK_FD=''                 # open handle of the lock file (impact_lock)
+IMPACT__MASK_PID=''                # process number of the masking filter (impact_mask_output_start)
 
 # "declare -A" creates an associative array: a list whose entries are found
 # by a name. "-g" makes it global even though the line may be read inside a
@@ -285,6 +300,7 @@ impact__on_exit() {
     if ((IMPACT_RESULT_ENABLED)); then
         impact__print_result_line "$code"
     fi
+    impact__mask_output_end
     exit "$code"
 }
 
@@ -292,20 +308,21 @@ impact__on_exit() {
 # Messages
 # =============================================================================
 
-# impact_display TEXT
+# impact_display TEXT [MAXIMUM]
 #   Prints TEXT in a form that is safe to show on a terminal and in the log:
 #   control characters (for example escape sequences or line breaks) become
-#   "?", and a very long text is cut. Use it for every value that comes from
-#   input before it appears in a message.
+#   "?", and a very long text is cut after MAXIMUM characters (default 200).
+#   Use it for every value that comes from input before it appears in a
+#   message.
 #   Result: the cleaned text on standard output.
 impact_display() {
-    local text="${1:-}"
+    local text="${1:-}" maximum="${2:-200}"
     # "${text//pattern/replacement}" replaces every match. [[:cntrl:]] is the
     # class of control characters.
     text="${text//[[:cntrl:]]/?}"
-    # "${#text}" is the length; "${text:0:200}" the first 200 characters.
-    if ((${#text} > 200)); then
-        text="${text:0:200}..."
+    # "${#text}" is the length; "${text:0:N}" the first N characters.
+    if ((${#text} > maximum)); then
+        text="${text:0:maximum}..."
     fi
     printf '%s' "$text"
 }
@@ -361,17 +378,20 @@ impact_error() {
 }
 
 # impact_die EXIT_CODE CAUSE [NEXT_STEP]
-#   Stops the command. Prints the cause and, when given, what to do next.
+#   Stops the command. Prints the cause and what to do next.
 #   Parameters: one of the IMPACT_EXIT_ numbers, the cause in plain words, and
-#   optionally the next step for the reader.
+#   the next step for the reader. Without a next step a general one is
+#   printed: read the messages above (a tool usually names the details there)
+#   and run the command again after the cause is fixed.
 #   Result: never returns. Inside "$( ... )" it ends only that inner shell, so
 #   call it from the main flow of a command.
 impact_die() {
     local code="$1" cause="$2" next="${3:-}"
-    printf '\nERROR: %s\n' "$cause" >&2
-    if [[ -n "$next" ]]; then
-        printf 'What to do: %s\n' "$next" >&2
+    if [[ -z "$next" ]]; then
+        next="Read the messages above for the details. Fix the cause, then run $IMPACT_CMD again; steps that are done already are not repeated."
     fi
+    printf '\nERROR: %s\n' "$cause" >&2
+    printf 'What to do: %s\n' "$next" >&2
     exit "$code"
 }
 
@@ -595,16 +615,22 @@ impact_require_root() {
     fi
 }
 
-# impact_require_not_root
+# impact_require_not_root [NEXT_STEP]
 #   Stops the command (exit code 2) when it runs as root. The two user
-#   commands call it: a working copy must belong to the person. The
-#   administrator starts them for a person with impact-give-repo.
+#   commands call it: a working copy must belong to the person.
+#   Parameter: optionally the text "What to do" for this command. Without it
+#   the text names the person's own account and impact-give-repo, the way
+#   the administrator makes a working copy for a person.
 impact_require_not_root() {
+    local next="${1:-}"
+    if [[ -z "$next" ]]; then
+        next="Run it without sudo from the person's own account, or use: sudo impact-give-repo <account> <model>"
+    fi
     if ((EUID == 0)); then
         IMPACT_RESULT_REASON='run_as_root'
         impact_die "$IMPACT_EXIT_USAGE" \
             "$IMPACT_CMD must run as the person who will own the files, and it was started as root." \
-            "Run it without sudo from the person's own account, or use: sudo impact-give-repo <account> <model>"
+            "$next"
     fi
 }
 
@@ -1029,7 +1055,7 @@ impact_package_for_tool() {
         lastlog | faillog | newgrp | login) printf 'login' ;;
         realpath | stat | install | mktemp | sha256sum | timeout | readlink | date | id | chown | chmod | chgrp | du | df | \
             sort | tr | cut | head | tail | wc | mv | cp | rm | mkdir | rmdir | ln | cat | tee | touch | nohup | numfmt | nproc | \
-            basename | dirname | comm | uniq | seq | env | tac | paste | join | split | truncate | sync | who | logname | ls)
+            basename | dirname | comm | uniq | seq | env | tac | paste | join | split | truncate | sync | who | logname | ls | uname)
             printf 'coreutils'
             ;;
         tar) printf 'tar' ;;
@@ -1363,8 +1389,10 @@ impact__write_log() {
         printf 'result:  %s\n' "$result"
         if ((${#IMPACT_CHANGES[@]} > 0)); then
             printf 'changes:\n'
+            # The step texts are the command's own words: they may be
+            # longer than a value from input (up to 2000 characters).
             for word in "${IMPACT_CHANGES[@]}"; do
-                printf '  + %s\n' "$(impact_display "$word")"
+                printf '  + %s\n' "$(impact_display "$word" 2000)"
             done
         fi
         if ((${#IMPACT_LOG_NOTES[@]} > 0)); then
@@ -1504,8 +1532,8 @@ impact_own_host_names() {
 #   is a version number: hiding too much is the safe direction.
 #   Example: docker ps | impact_mask_text
 #   Example: IMPACT_MASK_NAMES+=("fileserver.example.org")
-#   Example: mask everything a command prints from here on:
-#            exec > >(impact_mask_text) 2>&1
+#   To mask everything a command prints from a certain point on, use
+#   impact_mask_output_start (it also waits for the last lines at the end).
 impact_mask_text() {
     local -a program=()
     local name escaped
@@ -1544,6 +1572,40 @@ impact_mask_text() {
     done
     program+=(-e 's/\x02/./g' -e 's/\x03/::1/g')
     sed -E "${program[@]}"
+}
+
+# impact_mask_output_start
+#   From now on, everything the command prints (normal output and error
+#   messages) passes through impact_mask_text. Set IMPACT_MASK_NAMES before
+#   the call. At the end of the command the library gives the original
+#   channels back and waits until the filter has printed its last line, so
+#   no line is lost or comes after the command has ended.
+#   Result: none. Call it once, from the main flow of the command.
+#   Example: impact_mask_output_start
+impact_mask_output_start() {
+    if [[ -n "$IMPACT__MASK_PID" ]]; then
+        return 0
+    fi
+    # Keep the original channels as the handles 3 (output) and 4 (errors).
+    exec 3>&1 4>&2
+    # "> >(command)" is process substitution: the output goes into a
+    # command that runs next to the script. "$!" is the process number of
+    # that command.
+    exec > >(impact_mask_text) 2>&1
+    IMPACT__MASK_PID=$!
+}
+
+# impact__mask_output_end
+#   Internal: the end of impact_mask_output_start. Closes the way into the
+#   filter (so it sees the end of its input), gives the original channels
+#   back and waits for the filter. Called from the end-of-command handler.
+impact__mask_output_end() {
+    if [[ -z "$IMPACT__MASK_PID" ]]; then
+        return 0
+    fi
+    exec 1>&3 2>&4 3>&- 4>&-
+    wait "$IMPACT__MASK_PID" 2>/dev/null || true
+    IMPACT__MASK_PID=''
 }
 
 # =============================================================================

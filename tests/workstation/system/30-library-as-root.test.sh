@@ -621,6 +621,11 @@ test_model_file_written_and_loaded() {
     run_cmd impact_run_as alice bash -c "source /opt/impact/lib/impact-common.sh && impact_conf_load && impact_model_load Example-Model && echo \"\${IMPACT_MODEL[REPO_URL]}\""
     assert_status 0
     assert_output_contains 'git@github.com:example-org/Example-Model.git'
+    # A colleague outside the group learns the real cause: no access
+    # (exit code 5), and not a model that seems to be missing.
+    run_cmd impact_run_as carol bash -c "source /opt/impact/lib/impact-common.sh && impact_conf_load && impact_require_model Example-Model"
+    assert_status 5
+    assert_output_contains "no member of the group '$SYS_GROUP'"
 }
 
 test_model_file_that_others_can_change_is_refused() {

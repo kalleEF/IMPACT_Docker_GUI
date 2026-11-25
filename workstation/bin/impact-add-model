@@ -411,14 +411,15 @@ for root in "${ROOTS[@]}"; do
 done
 
 # -----------------------------------------------------------------------------
-# 6. Next steps, then the summary
+# 6. The summary, then the next steps (as impact-workstation-setup prints
+#    them)
 # -----------------------------------------------------------------------------
-impact_step "Next steps"
-for base in "${EXISTING_BASES[@]}"; do
-    impact_info "$base existed before this run. Its content was not examined. If it holds files from before the shared rules, run: sudo impact-share-folder $base --dry-run"
-done
-impact_info "Extra files that are not on GitHub go into $EXTRAS_FOLDER, at their path inside the repository."
-impact_info "Then check them with: sudo impact-check-model $MODEL"
-impact_info "Give a person a working copy with: sudo impact-give-repo <account> $MODEL"
-
 impact_summary
+impact_say ''
+impact_say 'Next steps:'
+for base in "${EXISTING_BASES[@]}"; do
+    impact_say "  $base existed before this run. Its content was not examined. If it holds files from before the shared rules, run: sudo impact-share-folder $base --dry-run"
+done
+impact_say "  Extra files that are not on GitHub go into $EXTRAS_FOLDER, at their path inside the repository."
+impact_say "  Then check them with: sudo impact-check-model $MODEL"
+impact_say "  Give a person a working copy with: sudo impact-give-repo <account> $MODEL"

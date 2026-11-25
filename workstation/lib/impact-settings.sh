@@ -395,7 +395,7 @@ impact__kv_render() {
     local -n impact__render_values="$2" impact__render_keys="$3"
     local help_function="$4" header_function="$5"
     local -A done_keys=()
-    local line trimmed key value number=0
+    local line trimmed key value help_text number=0
     if [[ -f "$file" && -r "$file" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
             number=$((number + 1))
@@ -430,8 +430,12 @@ impact__kv_render() {
         if [[ -v done_keys[$key] || ! -v impact__render_values[$key] ]]; then
             continue
         fi
-        printf '\n'
-        "$help_function" "$key"
+        # A key with an explanation gets an empty line and the explanation
+        # above it; a key without one (account records) follows directly.
+        help_text="$("$help_function" "$key")"
+        if [[ -n "$help_text" ]]; then
+            printf '\n%s\n' "$help_text"
+        fi
         printf '%s=%s\n' "$key" "${impact__render_values[$key]}"
     done
 }
@@ -925,11 +929,30 @@ impact_model_parse_file() {
     return 0
 }
 
+# impact__process_in_group GROUP
+#   Internal: success when the running process has GROUP among its groups.
+#   That is the membership that counts for access rights; a person who was
+#   added to a group gets it with the next login.
+impact__process_in_group() {
+    local wanted number
+    wanted="$(getent group -- "$1" 2>/dev/null | cut -d: -f3)" || return 1
+    [[ -n "$wanted" ]] || return 1
+    # "id -G" prints the numbers of all groups of the running process.
+    for number in $(id -G); do
+        if [[ "$number" == "$wanted" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # impact_model_load MODEL
 #   Reads the model file of MODEL into IMPACT_MODEL. The site settings must
 #   be loaded first.
 #   Result: 0 on success; 1 when the name is invalid or the model does not
-#   exist; 2 when the model file exists and is invalid or not safe to use.
+#   exist; 2 when the model file exists and is invalid or not safe to use;
+#   3 when the command runs as a person who is no member of SHARED_GROUP
+#   (the model files are readable for members only).
 #   The causes are in IMPACT_MODEL_ERRORS.
 #   Example: impact_model_load Example-Model && echo "${IMPACT_MODEL[REPO_URL]}"
 impact_model_load() {
@@ -945,6 +968,12 @@ impact_model_load() {
         IMPACT_MODEL_ERRORS=("The site settings are not loaded.")
         return 2
     }
+    # A person outside the shared group cannot enter MODEL_DIR at all, so
+    # every model would look missing. Say the real cause instead.
+    if ((EUID != 0)) && ! impact__process_in_group "${IMPACT_CONF[SHARED_GROUP]}"; then
+        IMPACT_MODEL_ERRORS=("The account '$(id -un)' is no member of the group '${IMPACT_CONF[SHARED_GROUP]}' in this login, so it cannot read the model files.")
+        return 3
+    fi
     file="$folder/model.conf"
     if [[ ! -e "$file" && ! -L "$file" ]]; then
         IMPACT_MODEL_ERRORS=("The model '$model' is not set up on this workstation ($file does not exist).")
@@ -958,9 +987,10 @@ impact_model_load() {
 }
 
 # impact_require_model MODEL
-#   Loads the model file or stops the command with exit code 1 after printing
-#   every problem. The reason word for the IMPACT_RESULT line is
-#   "unknown_model" or "model_invalid".
+#   Loads the model file or stops the command after printing every problem:
+#   exit code 1 with the reason word "unknown_model" or "model_invalid" for
+#   the IMPACT_RESULT line, or exit code 5 (no access) with the reason word
+#   "not_member" for a person outside the shared group.
 #   Example: impact_require_model "${IMPACT_ARGS[0]}"
 impact_require_model() {
     local status=0 text
@@ -971,6 +1001,11 @@ impact_require_model() {
     for text in "${IMPACT_MODEL_ERRORS[@]}"; do
         impact_error "$text"
     done
+    if ((status == 3)); then
+        IMPACT_RESULT_REASON='not_member'
+        impact_die "$IMPACT_EXIT_NO_ACCESS" "Your account has no access to the models of this workstation: it is no member of the group '${IMPACT_CONF[SHARED_GROUP]}' in this login." \
+            "If you were enrolled just now, log out and log in again. Otherwise ask $(impact_contact_text) to enrol you (impact-add-user)."
+    fi
     if ((status == 1)); then
         IMPACT_RESULT_REASON='unknown_model'
         impact_die "$IMPACT_EXIT_FAILED" "The model '$(impact_display "$1")' is not available on this workstation." \

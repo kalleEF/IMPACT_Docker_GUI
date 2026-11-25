@@ -122,6 +122,7 @@ declare -gA IMPACT_SHARING_DIR_WHY=()   # folders that deviate, per reason
 declare -gA IMPACT_SHARING_FILE_WHY=()  # files that deviate, per reason
 IMPACT_SHARING_PROBLEMS=()   # "path: reason" of entries that failed
 IMPACT_SHARING_HARDLINKS=()  # files left alone because of outside names
+IMPACT_SHARING_SPECIAL=()    # restore: files whose special bits differ
 
 # Internal state of one walk.
 IMPACT__SHARING_PATHS=()     # the current group: paths
@@ -571,6 +572,7 @@ impact__sharing_reset() {
     IMPACT_SHARING_FILE_WHY=()
     IMPACT_SHARING_PROBLEMS=()
     IMPACT_SHARING_HARDLINKS=()
+    IMPACT_SHARING_SPECIAL=()
     IMPACT__SHARING_PATHS=()
     IMPACT__SHARING_KINDS=()
     IMPACT__SHARING_IDS=()
@@ -1093,7 +1095,7 @@ impact__sharing_why_text() {
 #   words for a dry run and a real run.
 impact_sharing_report() {
     local text item
-        if ((IMPACT_SHARING_QUICK == 1)); then
+    if ((IMPACT_SHARING_QUICK == 1)); then
         impact_info "Examined: $(impact_sharing_count "${IMPACT_SHARING_COUNT[folders]}" folder folders), and $(impact_sharing_count "${IMPACT_SHARING_COUNT[files]}" file files) that the quick test of --repair picked out."
     else
         impact_info "Examined: $(impact_sharing_count "${IMPACT_SHARING_COUNT[folders]}" folder folders) and $(impact_sharing_count "${IMPACT_SHARING_COUNT[files]}" file files)."
@@ -1175,14 +1177,33 @@ impact_sharing_read_run_info() {
     return 0
 }
 
-# impact__sharing_restore_apply KEY PATH...
-#   Internal: gives all PATHs the saved state KEY ("type|owner|group|flags|
-#   entries"). Order: owner and group first (this clears setuid and setgid
-#   of executable files), then the ACL with the rights, then the three
-#   special bits. Symbolic links are never followed: chown -h changes a
-#   link itself, setfacl -P skips links, and the caller checked just before
-#   that no PATH is a link.
-impact__sharing_restore_apply() {
+# impact_sharing_flags_of_mode OCTAL_MODE
+#   Turns a mode as "stat -c %a" prints it (for example 2775 or 644) into
+#   the three-character flags of getfacl (setuid, setgid, sticky): 2775
+#   gives "-s-", 644 gives "---", 4755 gives "s--".
+impact_sharing_flags_of_mode() {
+    local mode="$1" special=0 flags=''
+    # A mode with four digits carries the special bits in its first digit.
+    if ((${#mode} == 4)); then
+        special="${mode:0:1}"
+    fi
+    # "8#..." reads a number in base 8; "&" keeps only the given bit.
+    (((8#$special & 4) != 0)) && flags+='s' || flags+='-'
+    (((8#$special & 2) != 0)) && flags+='s' || flags+='-'
+    (((8#$special & 1) != 0)) && flags+='t' || flags+='-'
+    printf '%s' "$flags"
+}
+
+# impact__sharing_restore_files KEY PATH...
+#   Internal: gives the plain files PATH... the saved owner, group and ACL of
+#   KEY ("type|owner|group|flags|entries"), all in two tool calls. Symbolic
+#   links are never followed: chown -h changes a link itself, setfacl -P
+#   skips a link, and the caller checked just before that no PATH is a link.
+#   The special bits (setuid, setgid, sticky) of files are never set here:
+#   "chmod" would follow a symbolic link that somebody put in place of a
+#   file at the last moment. The caller compares them afterwards and names
+#   every file whose special bits differ from the saved ones.
+impact__sharing_restore_files() {
     local key="$1" kind owner group flags entries
     shift
     IFS='|' read -r kind owner group flags entries <<<"$key"
@@ -1190,12 +1211,35 @@ impact__sharing_restore_apply() {
     chown -h -- "+$owner:+$group" "$@" || return 1
     # The entries are separated by ","; tr turns them into lines for
     # setfacl, which reads them from standard input ("-").
-    printf '%s\n' "$entries" | tr ',' '\n' | setfacl -P --set-file=- -- "$@" || return 1
-    if [[ "$kind" == 'd' && "$entries" != *default:* ]]; then
-        # --set-file keeps an existing default ACL; -k removes it.
-        setfacl -P -k -- "$@" || return 1
-    fi
-    chmod "$(impact_sharing_flags_chmod "$flags")" -- "$@"
+    printf '%s\n' "$entries" | tr ',' '\n' | setfacl -P --set-file=- -- "$@"
+}
+
+# impact__sharing_restore_dir KEY PATH IDENT
+#   Internal: gives one folder the saved state KEY: owner and group first,
+#   then the ACL with the rights, then the three special bits. All steps
+#   run inside the folder itself: a copy of the shell ("( ... )") changes
+#   into it with "cd -P", checks that it is exactly PATH with the saved
+#   device and inode number IDENT, and then works on "." (the folder it
+#   stands in). A folder that somebody replaces by a symbolic link in the
+#   meantime can therefore never redirect a step to another place.
+#   Result: 0 done; 3 the folder is not the saved one any more (nothing was
+#   changed); 1 a step failed.
+impact__sharing_restore_dir() {
+    local key="$1" path="$2" ident="$3" kind owner group flags entries
+    IFS='|' read -r kind owner group flags entries <<<"$key"
+    (
+        cd -P -- "$path" 2>/dev/null || exit 3
+        # "pwd -P" prints the real place of the folder the shell stands in.
+        [[ "$(pwd -P)" == "$path" ]] || exit 3
+        [[ "$(stat -c '%d:%i' -- .)" == "$ident" ]] || exit 3
+        chown -h -- "+$owner:+$group" . || exit 1
+        printf '%s\n' "$entries" | tr ',' '\n' | setfacl -P --set-file=- -- . || exit 1
+        if [[ "$entries" != *default:* ]]; then
+            # --set-file keeps an existing default ACL; -k removes it.
+            setfacl -P -k -- . || exit 1
+        fi
+        chmod "$(impact_sharing_flags_chmod "$flags")" -- . || exit 1
+    )
 }
 
 # impact__sharing_restore_flush
@@ -1245,27 +1289,37 @@ impact__sharing_restore_flush() {
         IMPACT_SHARING_COUNT[failed]=$((IMPACT_SHARING_COUNT[failed] + ${#check_paths[@]}))
         return 0
     fi
+    local -A now_flags=()
     for number in "${!keep[@]}"; do
         index="${keep[number]}"
         IFS=$'\t' read -r _ _ _ owner group flags entries _ <<<"${current[number]}"
+        now_flags[$index]="$flags"
         # saved[index] holds "type|owner|group|flags|entries".
         if [[ "${saved[index]#*|}" == "$owner|$group|$flags|$entries" ]]; then
             IMPACT_SHARING_COUNT[already]=$((IMPACT_SHARING_COUNT[already] + 1))
             continue
         fi
         IMPACT_SHARING_COUNT[to_restore]=$((IMPACT_SHARING_COUNT[to_restore] + 1))
-        if ((IMPACT_SHARING_APPLY == 1)); then
-            # Group the entries by their saved state, so one tool call
-            # handles all entries with the same state. The list holds the
-            # numbers of the entries, separated by spaces.
-            key="${saved[index]}"
-            groups[$key]+="$index "
+        if ((IMPACT_SHARING_APPLY == 0)); then
+            # A dry run names the files whose special bits a real run would
+            # leave for the administrator.
+            if [[ "${saved[index]%%|*}" == 'f' ]]; then
+                impact__sharing_special_check "${paths[index]}" "${saved[index]}" "$flags"
+            fi
+            continue
         fi
+        # Group the entries by their saved state, so one tool call handles
+        # all files with the same state. The list holds the numbers of the
+        # entries, separated by spaces.
+        key="${saved[index]}"
+        groups[$key]+="$index "
     done
     ((IMPACT_SHARING_APPLY == 1)) || return 0
-    local -a members=() numbers=()
+    local -a members=() numbers=() member_index=()
+    local result
     for key in "${!groups[@]}"; do
         members=()
+        member_index=()
         read -r -a numbers <<<"${groups[$key]}"
         for index in "${numbers[@]}"; do
             # Last look just before the change: still no symbolic link.
@@ -1274,16 +1328,66 @@ impact__sharing_restore_flush() {
                 IMPACT_SHARING_COUNT[skipped]=$((IMPACT_SHARING_COUNT[skipped] + 1))
                 continue
             fi
+            if [[ "${key%%|*}" == 'd' ]]; then
+                # Folders one at a time, from inside the folder.
+                result=0
+                impact__sharing_restore_dir "$key" "${paths[index]}" "${ids[index]}" || result=$?
+                case "$result" in
+                    0) IMPACT_SHARING_COUNT[restored]=$((IMPACT_SHARING_COUNT[restored] + 1)) ;;
+                    3)
+                        IMPACT_SHARING_COUNT[skipped]=$((IMPACT_SHARING_COUNT[skipped] + 1))
+                        IMPACT_SHARING_PROBLEMS+=("$(impact_display "${paths[index]}"): is another folder now (left alone)")
+                        ;;
+                    *)
+                        IMPACT_SHARING_COUNT[failed]=$((IMPACT_SHARING_COUNT[failed] + 1))
+                        IMPACT_SHARING_PROBLEMS+=("$(impact_display "${paths[index]}"): the saved rights could not be put back")
+                        ;;
+                esac
+                continue
+            fi
             members+=("${paths[index]}")
+            member_index+=("$index")
         done
         ((${#members[@]} > 0)) || continue
-        if impact__sharing_restore_apply "$key" "${members[@]}"; then
+        if impact__sharing_restore_files "$key" "${members[@]}"; then
             IMPACT_SHARING_COUNT[restored]=$((IMPACT_SHARING_COUNT[restored] + ${#members[@]}))
         else
             IMPACT_SHARING_COUNT[failed]=$((IMPACT_SHARING_COUNT[failed] + ${#members[@]}))
             IMPACT_SHARING_PROBLEMS+=("$(impact_display "${members[0]}") and $((${#members[@]} - 1)) more: the saved rights could not be put back")
+            continue
         fi
+        # The special bits of files: compared after the change (changing the
+        # owner or group clears setuid and setgid of executable files), only
+        # for files where they play a part at all. The fourth part of the
+        # saved state is its flags.
+        IFS='|' read -r _ _ _ flags _ <<<"$key"
+        for index in "${member_index[@]}"; do
+            if [[ "$flags" != '---' || "${now_flags[$index]}" != '---' ]]; then
+                impact__sharing_special_check "${paths[index]}" "$key" ''
+            fi
+        done
     done
+}
+
+# impact__sharing_special_check PATH KEY [FLAGS_NOW]
+#   Internal: compares the special bits (setuid, setgid, sticky) of the
+#   file PATH with the saved state KEY. FLAGS_NOW gives the present flags;
+#   when it is empty they are read with stat (which never follows a link).
+#   A difference is counted and named with the exact command that sets the
+#   saved bits, for the administrator to run after a look at the file.
+impact__sharing_special_check() {
+    local path="$1" saved now="${3:-}" mode quoted
+    IFS='|' read -r _ _ _ saved _ <<<"$2"
+    if [[ -z "$now" ]]; then
+        mode="$(stat -c '%a' -- "$path" 2>/dev/null)" || return 0
+        now="$(impact_sharing_flags_of_mode "$mode")"
+    fi
+    [[ "$now" != "$saved" ]] || return 0
+    IMPACT_SHARING_COUNT[special]=$((${IMPACT_SHARING_COUNT[special]:-0} + 1))
+    # printf %q writes the path so that bash reads it back unchanged, also
+    # with blanks or quotes in the name.
+    printf -v quoted '%q' "$path"
+    IMPACT_SHARING_SPECIAL+=("$(impact_display "$path"): special bits now '$now', saved '$saved'. After a look at the file: sudo chmod $(impact_sharing_flags_chmod "$saved") -- $(impact_display "$quoted")")
 }
 
 # impact__sharing_restore_entry_ok PATH TYPE TARGET
@@ -1315,7 +1419,9 @@ impact__sharing_restore_entry_ok() {
         return 1
     fi
     # Every folder between TARGET and the entry must be a real folder.
-    current="$(dirname -- "$path")"
+    # "${path%/*}" is the path without its last part (no program start, which
+    # counts for a backup of millions of entries).
+    current="${path%/*}"
     while [[ "$current" == "$target"/* ]]; do
         if [[ -L "$current" ]]; then
             IMPACT__SHARING_REASON="a folder on the way is a symbolic link now"
@@ -1331,7 +1437,10 @@ impact__sharing_restore_entry_ok() {
 #   impact-share-folder). Only entries whose present state differs from the
 #   saved one are changed; entries that were replaced, removed, turned into
 #   a link, or moved outside are left alone and counted. The target folder
-#   must still pass impact_sharing_check_target.
+#   must still pass impact_sharing_check_target. Folders get owner, group,
+#   ACL and special bits back; files get owner, group and ACL back, and a
+#   file whose special bits still differ is named in IMPACT_SHARING_SPECIAL
+#   (see impact__sharing_restore_files for the reason).
 #   With IMPACT_SHARING_APPLY=0 it only counts.
 #   Result: 0 done; 1 single entries failed; 2 the backup cannot be used.
 impact_sharing_restore() {
@@ -1339,7 +1448,7 @@ impact_sharing_restore() {
     local -a parts=()
     impact__sharing_reset
     local key
-    for key in already to_restore restored skipped saved; do
+    for key in already to_restore restored skipped saved special; do
         IMPACT_SHARING_COUNT[$key]=0
     done
     target="${IMPACT_SHARING_RUN[TARGET]}"
@@ -1397,7 +1506,7 @@ impact_sharing_restore() {
 #   Prints the counts of the last restore.
 impact_sharing_restore_report() {
     local item
-        impact_info "Entries saved in the backup: $(impact_sharing_number "${IMPACT_SHARING_COUNT[saved]}")."
+    impact_info "Entries saved in the backup: $(impact_sharing_number "${IMPACT_SHARING_COUNT[saved]}")."
     impact_info "Already in the saved state: $(impact_sharing_number "${IMPACT_SHARING_COUNT[already]}")."
     impact_info "To put back: $(impact_sharing_number "${IMPACT_SHARING_COUNT[to_restore]}")."
     if ((IMPACT_SHARING_APPLY == 1)); then
@@ -1410,6 +1519,16 @@ impact_sharing_restore_report() {
         done
     elif ((${#IMPACT_SHARING_PROBLEMS[@]} > 0)); then
         for item in "${IMPACT_SHARING_PROBLEMS[@]:0:IMPACT_SHARING_SHOW_MAX}"; do
+            impact_info "  $item"
+        done
+    fi
+    if ((IMPACT_SHARING_COUNT[special] > 0)); then
+        if ((IMPACT_SHARING_APPLY == 1)); then
+            impact_warn "Files whose special bits (setuid, setgid, sticky) differ from the saved ones: $(impact_sharing_number "${IMPACT_SHARING_COUNT[special]}"). The command never sets these bits on files, because a file swapped for a symbolic link at the last moment would pass them to another file. Set them by hand after a look at each file:"
+        else
+            impact_warn "Files whose special bits (setuid, setgid, sticky) differ from the saved ones: $(impact_sharing_number "${IMPACT_SHARING_COUNT[special]}"). A real run puts back their owner, group and ACL, and leaves these bits to you:"
+        fi
+        for item in "${IMPACT_SHARING_SPECIAL[@]:0:IMPACT_SHARING_SHOW_MAX}"; do
             impact_info "  $item"
         done
     fi

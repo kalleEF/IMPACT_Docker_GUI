@@ -605,8 +605,35 @@ test_model_dir_and_load_refuse_bad_names() {
     assert_contains "${IMPACT_MODEL_ERRORS[*]}" 'no valid model name'
     status=0
     impact_model_load 'No-Such-Model' || status=$?
+    if ((EUID == 0)); then
+        assert_eq 1 "$status"
+        assert_contains "${IMPACT_MODEL_ERRORS[*]}" 'is not set up'
+    else
+        # A person outside the shared group learns the real cause.
+        assert_eq 3 "$status"
+        assert_contains "${IMPACT_MODEL_ERRORS[*]}" 'is no member of the group'
+    fi
+}
+
+test_model_load_names_a_missing_group_membership() {
+    load_site_for_models
+    if ((EUID == 0)); then
+        skip 'root is never refused for missing group membership'
+    fi
+    # The group of the running process counts: a group that this process
+    # has passes the check, so the next question (does the model exist?)
+    # is answered.
+    IMPACT_CONF[SHARED_GROUP]="$(id -gn)"
+    local status=0
+    impact_model_load 'No-Such-Model' || status=$?
     assert_eq 1 "$status"
     assert_contains "${IMPACT_MODEL_ERRORS[*]}" 'is not set up'
+    # A group the process does not have is named as the cause.
+    IMPACT_CONF[SHARED_GROUP]='impact-no-such-group'
+    status=0
+    impact_model_load 'No-Such-Model' || status=$?
+    assert_eq 3 "$status"
+    assert_contains "${IMPACT_MODEL_ERRORS[*]}" "no member of the group 'impact-no-such-group'"
 }
 
 test_model_file_write_and_update() {

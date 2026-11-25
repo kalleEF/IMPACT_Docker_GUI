@@ -106,13 +106,18 @@ EXTRAS_FOLDER="$MODEL_FOLDER/extras"
 # block_begin TITLE / block_end
 #   Print the heading of a numbered block, and at its end the result of the
 #   block: FAIL when a check of the block failed, WARN when it printed a
-#   warning, else OK.
+#   warning, else OK. The form is the same as in impact-check:
+#   "Block N: title" ... "Result of block N: OK".
+BLOCK_NO=0
 BLOCK_WARN=0
 BLOCK_FAIL=0
+TITLES=()
 RESULTS=()
 block_begin() {
-    impact_step "$1"
-    BLOCK_TITLE="$1"
+    BLOCK_NO=$((BLOCK_NO + 1))
+    impact_say ''
+    impact_say "Block $BLOCK_NO: $1"
+    TITLES+=("$1")
     BLOCK_WARN="$IMPACT_WARN_COUNT"
     BLOCK_FAIL="$IMPACT_FAIL_COUNT"
 }
@@ -123,18 +128,21 @@ block_end() {
     elif ((IMPACT_WARN_COUNT > BLOCK_WARN)); then
         block_result='WARN'
     fi
-    impact_say "    Result: $block_result"
-    RESULTS+=("$block_result  $IMPACT_STEP_NO. $BLOCK_TITLE")
+    impact_say "  Result of block $BLOCK_NO: $block_result"
+    RESULTS+=("$block_result")
 }
 
 # print_summary
-#   Prints the result of every block and the totals.
+#   Prints the result of every block and the totals, in the form of the
+#   summary of impact-check.
 print_summary() {
+    local index
     impact_say ''
-    impact_say "Summary for the model $MODEL:"
-    local line
-    for line in "${RESULTS[@]}"; do
-        impact_say "  $line"
+    impact_say "Summary for the model $MODEL"
+    for index in "${!RESULTS[@]}"; do
+        # printf "%-44s" pads the title with blanks to 44 characters, so the
+        # result words of short titles stand in one column.
+        printf '  %2d  %-44s %s\n' $((index + 1)) "${TITLES[index]}" "${RESULTS[index]}"
     done
     impact_say "Failed checks: $IMPACT_FAIL_COUNT. Warnings: $IMPACT_WARN_COUNT."
 }
@@ -142,7 +150,8 @@ print_summary() {
 # -----------------------------------------------------------------------------
 # 1. The model file
 # -----------------------------------------------------------------------------
-block_begin "Model file $MODEL_FILE"
+block_begin "Model file"
+impact_info "$MODEL_FILE"
 load_status=0
 impact_model_load "$MODEL" || load_status=$?
 if ((load_status != 0)); then
@@ -213,7 +222,8 @@ member_can_read() {
     [[ "$group_name" == "$GROUP" ]] && (((8#$mode >> 3 & need) == need))
 }
 
-block_begin "Extra files in $EXTRAS_FOLDER"
+block_begin "Extra files"
+impact_info "$EXTRAS_FOLDER"
 EXTRA_FILES=()
 FIX_RIGHTS=0
 if [[ -d "$EXTRAS_FOLDER" && ! -L "$EXTRAS_FOLDER" ]]; then
@@ -289,7 +299,8 @@ block_end
 # -----------------------------------------------------------------------------
 # 5. Working copies of the members
 # -----------------------------------------------------------------------------
-block_begin "Working copies of the members of '$GROUP'"
+block_begin "Working copies of the members"
+impact_info "The copies of $MODEL in the repository folders of the members of '$GROUP'"
 MEMBERS=()
 mapfile -t MEMBERS < <(impact_group_members "$GROUP")
 copies=0

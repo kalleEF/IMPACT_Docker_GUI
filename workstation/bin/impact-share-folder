@@ -63,6 +63,11 @@
 #                one name). It finds files that were moved in with their
 #                old rights. A file whose only deviation lies inside its
 #                ACL is found by the full run (without --repair).
+#                Copies count as well: "cp" and "rsync" give the new file
+#                at most the group rights of the source (a file with mode
+#                644 arrives with "group may read"), whatever the default
+#                ACL says. Files that programs create in place (R, a
+#                shell redirection) get group write.
 #   --transition-user <account>
 #                also give this account (for example the old shared account
 #                of version 2.0) read and write access to every entry and,
@@ -98,6 +103,9 @@
 #   It puts back owner, group, mode and ACL of every saved entry that has
 #   not changed in another way since. With several runs on the same folder,
 #   restore the newest backup first. The command prints the exact line.
+#   The special bits setuid, setgid and sticky of files (rare in data) are
+#   never set by the command: it names each such file with the exact chmod
+#   line to run by hand. Folders get their special bits back.
 #   Look at a backup with: sudo zless <backup folder>/part-000001.facl.gz
 #
 # Cost
@@ -107,6 +115,12 @@
 #   of up to 500 files, plus the backup (about 20 bytes per entry after
 #   compression). Each group is saved and written to disk before it is
 #   changed, so an interruption loses at most one group of work.
+#   Measured on a small test machine with the whole tree in memory, for a
+#   tree of 50,000 files that all deviate: dry run about 7 seconds, real
+#   run about 17 seconds, second run about 4 seconds, --repair of the
+#   converted tree under 1 second, restore about 11 seconds, backup 0.4 MB.
+#   On the real disks the reading of the file system itself comes on top:
+#   plan hours for tens of millions of files, and start with --dry-run.
 #
 # Exit codes
 #   0 done or nothing to do; 1 single entries could not be changed, or the

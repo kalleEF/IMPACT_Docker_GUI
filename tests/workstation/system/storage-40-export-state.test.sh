@@ -190,5 +190,21 @@ test_a_change_gives_a_new_archive() {
     assert_status 0
     assert_output_contains 'Written:'
     assert_eq 2 "$(archives | wc -l)" "number of archives"
-    tar -tzf "$(archives | tail -n 1)" | grep -q 'extras/data/more.csv$' || fail "the new archive lacks the new extra"
+    # The list goes into a variable first: "tar | grep -q" can fail under
+    # "pipefail" when grep stops reading before tar has written everything.
+    local listing
+    listing="$(tar -tzf "$(archives | tail -n 1)")"
+    assert_matches "$listing" 'extras/data/more\.csv' "the new archive holds the new extra"
+    # Two changes in quick succession: each gives its own archive, none is
+    # replaced (a run in the same second as an archive waits for the next).
+    local first_checksum
+    first_checksum="$(sha256sum -- "$(archives | tail -n 1)" | cut -d' ' -f1)"
+    install -m 640 -o root -g "$SYS_GROUP" -- "$TEST_TMP/more.csv" "$MODEL/extras/data/more2.csv"
+    run_cmd sys_as_admin "$EXPORT"
+    assert_status 0
+    install -m 640 -o root -g "$SYS_GROUP" -- "$TEST_TMP/more.csv" "$MODEL/extras/data/more3.csv"
+    run_cmd sys_as_admin "$EXPORT"
+    assert_status 0
+    assert_eq 4 "$(archives | wc -l)" "number of archives after two quick changes"
+    assert_eq "$first_checksum" "$(sha256sum -- "$(archives | sed -n 2p)" | cut -d' ' -f1)" "checksum of the second archive"
 }

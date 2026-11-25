@@ -303,8 +303,9 @@ test_check_model_reports_a_correct_model_as_ok() {
     snapshot_unchanged_by --content "${WATCHED[@]}" -- sys_as_admin "$CHECK" "$MODEL"
     assert_status 0
     assert_output_contains 'Failed checks: 0. Warnings: 0.'
-    assert_output_contains 'OK  1. Model file'
-    assert_output_contains 'OK  4. Storage folders'
+    assert_output_contains '  Result of block 1: OK'
+    assert_output_contains '   1  Model file                                   OK'
+    assert_output_contains '  Result of block 4: OK'
     assert_output_contains 'No member has a working copy'
 }
 
@@ -345,7 +346,7 @@ test_check_model_finds_bad_extras() {
     assert_output_contains "'inputs/foreign.csv' belongs to bob"
     assert_output_contains 'Larger than 50 MB: inputs/large.bin (51 MB)'
     assert_output_contains "sudo chown -R root:$SYS_GROUP $extras"
-    assert_output_contains 'FAIL  3. Extra files'
+    assert_output_contains '  Result of block 3: FAIL'
     assert_output_not_contains "'inputs/tables/small table.csv'"
     # After removing the problems only the warning about the large file is
     # left, and the exit code is 0 again.
@@ -353,7 +354,7 @@ test_check_model_finds_bad_extras() {
         "$extras/inputs/open.csv" "$extras/inputs/closed.csv" "$extras/inputs/foreign.csv"
     run_cmd sys_as_admin "$CHECK" "$MODEL"
     assert_status 0
-    assert_output_contains 'WARN  3. Extra files'
+    assert_output_contains '  Result of block 3: WARN'
     assert_output_contains 'Failed checks: 0. Warnings: 1.'
     rm -f -- "$extras/inputs/large.bin"
 }

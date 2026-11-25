@@ -90,6 +90,9 @@ test_display_replaces_control_characters_and_cuts_long_text() {
     # printf with "%0300d" prints a number padded to 300 digits.
     long="$(printf '%0300d' 0)"
     assert_eq 203 "$(impact_display "$long" | wc -c)" "200 characters plus three dots"
+    # A larger limit, as the log uses it for the command's own step texts.
+    assert_eq 300 "$(impact_display "$long" 2000 | wc -c)" "a text below the given limit stays whole"
+    assert_eq 13 "$(impact_display "$long" 10 | wc -c)" "10 characters plus three dots"
 }
 
 test_version_compare() {

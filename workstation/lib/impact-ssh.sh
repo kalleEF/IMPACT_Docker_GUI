@@ -276,21 +276,29 @@ impact_ssh_client_address() {
     fi
 }
 
-# impact_ssh_effective ACCOUNT [ADDRESS]
+# impact_ssh_effective ACCOUNT [ADDRESS] [CONFIG_FILE]
 #   Prints every setting that sshd applies to a login of ACCOUNT coming from
 #   ADDRESS (default 127.0.0.1), sorted, one "name value" per line. This is
 #   "sshd -T -C user=...,host=...,addr=...": sshd evaluates its Match rules
-#   for exactly this connection. Read-only; needs root rights.
+#   for exactly this connection. With CONFIG_FILE sshd reads that file in
+#   place of /etc/ssh/sshd_config (impact-check uses a copy without the
+#   IMPACT rules, to compare). The question has a time limit of 30 seconds.
+#   Read-only; needs root rights.
 #   Result: failure when the account name or address is unusable or sshd
 #   reports an error (its text is then in IMPACT_SSH_OUTPUT).
 #   Example: impact_ssh_effective alice | grep '^permitopen '
 impact_ssh_effective() {
-    local account="$1" address="${2:-127.0.0.1}" output status=0
+    local account="$1" address="${2:-127.0.0.1}" config="${3:-}" output status=0
+    local -a options=()
     # The name goes into a comma-separated list for sshd; the name rule
     # allows neither commas nor blanks.
     impact__lookup_name_ok "$account" || return 1
     [[ "$address" =~ ^[0-9A-Fa-f:.]{2,45}$ ]] || return 1
-    output="$("$IMPACT_SSHD" -T -C "user=$account,host=$address,addr=$address" 2>&1)" || status=$?
+    if [[ -n "$config" ]]; then
+        [[ -f "$config" && ! -L "$config" ]] || return 1
+        options=(-f "$config")
+    fi
+    output="$(timeout 30 "$IMPACT_SSHD" -T "${options[@]}" -C "user=$account,host=$address,addr=$address" 2>&1)" || status=$?
     if ((status != 0)); then
         IMPACT_SSH_OUTPUT="$output"
         return 1

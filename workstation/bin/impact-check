@@ -1,0 +1,183 @@
+#!/bin/bash
+# =============================================================================
+# impact-check: health check of the IMPACT workstation
+#
+# Purpose
+#   Prints the state of the whole IMPACT setup in 15 numbered blocks. Each
+#   block ends in exactly one result: OK (in order), WARN (works, but needs
+#   attention) or FAIL (does not work, or a protection is missing). For WARN
+#   and FAIL the block says what to do. A summary follows at the end.
+#   The check only reads. It runs on a machine where nothing of IMPACT is
+#   installed or set up yet (the first step of the walk-through), on a half
+#   set-up machine, and on a fully set-up one. It prints no secret: no key
+#   material and no password hash.
+#
+# Who runs it
+#   The administrator, with sudo. Before the installation it can run from
+#   the unpacked archive folder: sudo ./bin/impact-check
+#
+# Usage
+#   sudo impact-check [--mask] [--shared-roots <paths>]
+#
+# Examples
+#   sudo impact-check                     the whole report
+#   sudo impact-check --mask              the same, with addresses and host
+#                                         names replaced, to share the output
+#   sudo impact-check --shared-roots /mnt/disk_a/shared,/mnt/disk_b/shared
+#                                         also look at these storage roots
+#                                         (before the setup has named them)
+#   sudo impact-check > check.txt 2>&1    keep the report in a file
+#
+# Options
+#   --mask                  replace network addresses with <address>,
+#                           hardware addresses with <hardware address> and
+#                           the names of this machine with <host>
+#   --shared-roots <paths>  further storage roots to look at, separated by
+#                           commas; their file system and free space are
+#                           checked, in addition to SHARED_ROOTS
+#   --help                  show this text
+#
+# The blocks
+#    1 System                    9 Working copies
+#    2 Docker                   10 Shared storage
+#    3 Free disk space          11 Containers and ports per person
+#    4 Settings file            12 Listeners on the port range
+#    5 SSH rules                13 Containers that publish ports to the network
+#    6 Groups                   14 Volumes named like IMPACT volumes
+#    7 Accounts                 15 Containers without IMPACT labels
+#    8 Models and extras
+#
+# Time
+#   Usually well below a minute. The size of each home folder is measured
+#   with a time limit of 60 seconds per folder; the shared storage is only
+#   sampled (at most 50 entries per folder), never walked through.
+#
+# What it changes on the system
+#   Nothing. It writes no file of the system and no log entry. It uses one
+#   private temporary folder in /tmp for a question to the SSH server and
+#   removes it at its end. Inside a home folder it runs its commands with
+#   the rights of that person; git runs there with --no-optional-locks, so
+#   it never rewrites a working copy's index file.
+#
+# How to undo
+#   Nothing to undo.
+#
+# Exit codes
+#   0 every block is OK; 1 at least one block is WARN and none is FAIL;
+#   2 at least one block is FAIL, or wrong usage (unknown option, not run
+#   with sudo).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Reading help: bash constructs that appear in this file
+#   NAME=text            store a text in the variable NAME; "$NAME" reads it
+#   local NAME           a variable that exists only inside one function
+#   "$1" "$2" "$@" "$#"  first parameter, second parameter, all parameters,
+#                        number of parameters
+#   "${NAME:-text}"      the value of NAME, or "text" when NAME is unset or empty
+#   $( command )         the text that the command prints
+#   [[ ... ]]            a test: -f plain file, -d folder, -L symbolic link,
+#                        -e exists, -r readable, -x executable, -z empty text,
+#                        -n text with content, == equal, != different,
+#                        =~ matches a pattern
+#   (( ... ))            arithmetic: true when the result is not zero
+#   A && B               run B only when A succeeded
+#   A || B               run B only when A failed
+#   ! command            true when the command fails
+#   if / case / for / while   branches and loops; "case" compares one value
+#                        with several patterns
+#   >file >>file <file   write to a file (replace it / add to its end), read
+#                        from a file
+#   2>/dev/null  >&2     throw error messages away / write to the error channel
+#   command1 | command2  hand the output of command1 to command2
+#   return N / exit N    end the function / the script with status N; 0 means
+#                        success
+#   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+# Constructs beyond these are explained where they are first used.
+# -----------------------------------------------------------------------------
+
+# "set -e" stops the script at the first command that fails, "-u" stops it
+# when a variable is read that was never set, and "-o pipefail" makes a chain
+# of commands joined with "|" fail when any part of it fails.
+set -euo pipefail
+
+# Find this file's real place (the name in /usr/local/bin is a link) and load
+# the shared functions that lie next to it in ../lib.
+IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+# The comment lines below tell the checking tool "shellcheck" where the
+# loaded files are.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-common.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/impact-check.sh
+source "$(dirname -- "$IMPACT_SELF")/../lib/impact-check.sh"
+impact_init "$IMPACT_SELF"
+
+# 1. Options. impact-check changes nothing, so it has no --dry-run.
+impact_parse_args 'mask' 'shared-roots' '' "$@"
+impact_require_arg_count 0 0
+
+# 2. Who runs it. Most questions (sshd -T, the shadow database, the folders
+#    of other accounts) need root rights.
+impact_require_root
+
+# 3. Validate the input before any use: the extra storage roots follow the
+#    rule of SHARED_ROOTS in the settings file.
+if impact_opt_given shared-roots; then
+    if ! impact_conf_check_value SHARED_ROOTS "$(impact_opt shared-roots)"; then
+        impact_die_usage "The value '$(impact_display "$(impact_opt shared-roots)")' of --shared-roots is not accepted: $IMPACT_CHECK_REASON."
+    fi
+    impact_split_list "$(impact_opt shared-roots)" IMPACT_CHECK_EXTRA_ROOTS
+fi
+
+# 4. Masking. From here on, everything the script prints (also the error
+#    messages) passes through the filter impact_mask_text, which replaces
+#    addresses and host names. The library waits at the end of the command
+#    until the filter has printed its last line.
+if impact_opt_given mask; then
+    # Further names of this machine (all its full names, and its domain),
+    # in addition to those impact_mask_text finds by itself.
+    # "read -a" splits the printed names at blanks into the list. Both
+    # questions may ask the name service, so they get a time limit.
+    read -r -a MORE_NAMES <<<"$(timeout 10 hostname -A 2>/dev/null || true) $(timeout 10 hostname -d 2>/dev/null || true)" || true
+    IMPACT_MASK_NAMES+=("${MORE_NAMES[@]}")
+    impact_mask_output_start
+fi
+
+# 5. Settings. impact_check_load_settings never stops the command: without
+#    a usable settings file the blocks work with default values, and
+#    block 4 reports the problem.
+impact_check_load_settings || true
+
+# A private temporary folder for the one question to sshd that needs a file.
+impact_mktemp_dir
+IMPACT_CHECK_TMP_DIR="$IMPACT_TMP"
+
+impact_say "impact-check $(impact_own_version): health check of the IMPACT workstation."
+impact_say "Time (UTC): $(impact_now_utc). Run by: $(impact_invoking_account)."
+impact_say "This check only reads; it changes nothing on the system."
+if impact_opt_given mask; then
+    impact_say "Addresses and host names are masked."
+fi
+
+# 6. The blocks, in the order of the specification.
+impact_check_run_block 'System' impact_check_block_system
+impact_check_run_block 'Docker' impact_check_block_docker
+impact_check_run_block 'Free disk space' impact_check_block_free_space
+impact_check_run_block 'Settings file' impact_check_block_settings
+impact_check_run_block 'SSH rules' impact_check_block_ssh
+impact_check_run_block 'Groups' impact_check_block_groups
+impact_check_run_block 'Accounts' impact_check_block_accounts
+impact_check_run_block 'Models and extras' impact_check_block_models
+impact_check_run_block 'Working copies' impact_check_block_working_copies
+impact_check_run_block 'Shared storage' impact_check_block_storage
+impact_check_run_block 'Containers and ports per person' impact_check_block_containers
+impact_check_run_block 'Listeners on the port range' impact_check_block_listeners
+impact_check_run_block 'Containers that publish ports to the network' impact_check_block_published
+impact_check_run_block 'Volumes named like IMPACT volumes' impact_check_block_volumes
+impact_check_run_block 'Containers without IMPACT labels' impact_check_block_unlabelled
+
+# 7. Summary and exit code: 0 all OK, 1 at least one WARN, 2 at least one FAIL.
+impact_check_print_summary
+exit "$IMPACT_CHECK_EXIT"

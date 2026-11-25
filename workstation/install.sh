@@ -93,14 +93,10 @@ impact_require_arg_count 0 0
 impact_require_root
 impact_log_enable "$@"
 
-# The tools the commands need. docker is checked separately, because it does
-# not come from Ubuntu's own package source.
-readonly -a NEEDED_TOOLS=(
-    sshd ssh-keygen ssh getfacl setfacl git curl runuser findmnt flock mountpoint
-    getent iconv useradd usermod groupadd gpasswd chage passwd realpath stat
-    install mktemp sha256sum timeout tar gzip awk sed grep diff cmp find xargs
-    ps pkill hostname dpkg-query
-)
+# The tools the commands need: the list IMPACT_NEEDED_TOOLS of the library.
+# docker is checked separately, because it does not come from Ubuntu's own
+# package source.
+readonly -a NEEDED_TOOLS=("${IMPACT_NEEDED_TOOLS[@]}")
 
 # Lists that the checks fill and the steps use.
 COMMAND_FILES=()   # full paths of the commands in the unpacked folder

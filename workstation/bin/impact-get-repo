@@ -71,15 +71,15 @@
 #   target_in_use (another folder has that name), no_key, several_keys,
 #   key_unusable, key_refused, no_access, host_key, network, branch_missing,
 #   extras_invalid, extras_clash, extras_not_ignored, repo_folder, busy,
-#   git_failed, unknown_model, model_invalid, not_prepared, run_as_root,
-#   usage, interrupted.
+#   git_failed, unknown_model, model_invalid, not_member, not_prepared,
+#   run_as_root, usage, interrupted.
 #
 # Exit codes
 #   0 done (also a dry run); 1 a check or step failed; 2 wrong usage (also:
 #   started as root, several key copies); 3 the workstation is not prepared;
 #   4 the copy exists already, or another command works in the folder;
-#   5 no access (no key copy, the key or the repository refused by GitHub);
-#   6 network problem.
+#   5 no access (no key copy, the key or the repository refused by GitHub,
+#   or your account is no member of the shared group); 6 network problem.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -136,7 +136,7 @@ impact_result_enable
 impact_parse_args 'dry-run anonymous-https' 'github-name' '' "$@"
 impact_require_arg_count 1 1
 MODEL="${IMPACT_ARGS[0]}"
-impact_require_not_root
+impact_require_not_root "Run it without sudo from the person's own account (the GUI does this). For a person, the administrator runs: sudo impact-give-repo <account> <model>"
 impact_require_conf
 if ! impact_valid_model_name "$MODEL"; then
     impact_die_usage "'$(impact_display "$MODEL")' is no valid model name."
