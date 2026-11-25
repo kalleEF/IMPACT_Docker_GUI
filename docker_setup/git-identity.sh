@@ -39,9 +39,10 @@
 #                                     under the name github.com-published (see below).
 #   /etc/ssh/ssh_config.d/impact-github.conf
 #                                     tells every SSH connection to github.com (in any mix
-#                                     of capital and small letters, also with a final dot)
-#                                     to look up its host key under the name
-#                                     github.com-published.
+#                                     of capital and small letters, also with a final dot,
+#                                     also when an SSH settings file sends the name on to
+#                                     another server) to look up its host key under the
+#                                     name github.com-published.
 #   /home/rstudio/.ssh/               created if missing, access mode 700, owner rstudio.
 #   /home/rstudio/.ssh/known_hosts    GitHub's three host keys. This is the file the
 #                                     IMPACT Docker GUI names in its own git settings.
@@ -75,13 +76,19 @@
 #   that only this script writes, and only with GitHub's published keys. The rule covers
 #   the name in any mix of capital and small letters (GitHub.com, GITHUB.COM) and with a
 #   final dot (github.com.), because a remote address can be written in each of these
-#   ways. Whichever of the two runs last, and whatever the scan received, SSH then
-#   accepts a server under such a name only with one of GitHub's published keys; the
-#   tests show this for the GUI's own command and these four spellings. The content of known_hosts itself differs with the order: after the GUI's
-#   step it holds the scanned lines, which SSH no longer uses for github.com.
-#   Other names of GitHub's servers (for example ssh.github.com, or an address in
-#   numbers) are outside this rule; the GUI's scan writes no line for them, and SSH
-#   handles them as any other server (see StrictHostKeyChecking below).
+#   ways. It covers the name as it was typed and also the name that an SSH settings file
+#   sends it to (see SSH_CONFIG_TEXT below). So it also holds when a person's
+#   ~/.ssh/config sends github.com to ssh.github.com on port 443, the set-up GitHub
+#   documents for networks that block the usual port 22. Whichever of the two runs last,
+#   and whatever the scan received, SSH then accepts a server under such a name only
+#   with one of GitHub's published keys; the tests show this for the GUI's own command,
+#   these four spellings and the port 443 set-up. The content of known_hosts itself
+#   differs with the order: after the GUI's step it holds the scanned lines, which SSH
+#   no longer uses for github.com.
+#   A remote address that names another of GitHub's servers directly (for example
+#   ssh.github.com, or an address in numbers) is outside this rule; the GUI's scan writes
+#   no line for it, and SSH handles it as any other server (see StrictHostKeyChecking
+#   below).
 #
 # WHEN GITHUB CHANGES A HOST KEY
 #   Replace the lines in GITHUB_HOST_KEYS with the ones GitHub publishes at
@@ -138,18 +145,36 @@ github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+V
 GITHUB_ALIAS_KEYS="${GITHUB_HOST_KEYS//github.com /$GITHUB_ALIAS }"
 
 # What impact-github.conf says. SSH reads every file of /etc/ssh/ssh_config.d (the line
-# "Include /etc/ssh/ssh_config.d/*.conf" of /etc/ssh/ssh_config). The line
-# "Match host github.com,github.com." makes the next line apply to connections to a
-# server of one of these two names, separated by the comma. "Match host" compares the
-# name without regard to capital letters, so GitHub.com and GITHUB.COM count as well.
-# (The shorter form "Host github.com" compares capital letters exactly; a remote address
-# such as git@GitHub.com:... would then escape the rule, while SSH still finds the
-# scanned keys for it, because the lookup in known hosts files ignores capitals.)
-# "github.com." with a final dot is a second valid way to write the same server name.
+# "Include /etc/ssh/ssh_config.d/*.conf" of /etc/ssh/ssh_config). A line "Match ..."
+# makes the indented lines below it apply to the connections it describes. The file has
+# two such parts, with the same setting, for two ways a connection can concern GitHub:
+#   "Match originalhost ..."  the server name as it was typed, in the remote address of
+#                             git or on the command line of ssh;
+#   "Match host ..."          the server name SSH connects to in the end. It differs
+#                             from the typed name when a "HostName" line of an SSH
+#                             settings file sends the typed name on: "Host gh" with
+#                             "HostName github.com" turns the typed name gh into
+#                             github.com.
+# Both parts are needed. GitHub documents a set-up for networks that block the usual
+# port 22: "Host github.com" with "HostName ssh.github.com" and "Port 443" in the
+# person's ~/.ssh/config. The typed name is then github.com and the name connected to
+# is ssh.github.com, so only the "originalhost" part applies. GitHub's servers answer
+# there with the same published keys.
+# Each part lists two names, separated by the comma: "github.com." with a final dot is a
+# second valid way to write the same server name. Both parts compare names without
+# regard to capital letters, so GitHub.com and GITHUB.COM count as well. (The shorter
+# form "Host github.com" compares capital letters exactly; a remote address such as
+# git@GitHub.com:... would then escape the rule, while SSH still finds the scanned keys
+# for it, because the lookup in known hosts files ignores capitals.) SSH keeps the first
+# value it finds for a setting, so a connection that both parts describe gets the same
+# name once.
 SSH_CONFIG_TEXT="# Written by git-identity.sh at every container start. SSH checks github.com
-# (any capital letters, also with a final dot) against GitHub's published host
-# keys, stored under the name $GITHUB_ALIAS in $SYSTEM_KNOWN_HOSTS.
+# (any capital letters, also with a final dot, also when a HostName line sends
+# it to another server) against GitHub's published host keys, stored under the
+# name $GITHUB_ALIAS in $SYSTEM_KNOWN_HOSTS.
 # Keys that a scan wrote under the name github.com are not used.
+Match originalhost github.com,github.com.
+    HostKeyAlias $GITHUB_ALIAS
 Match host github.com,github.com.
     HostKeyAlias $GITHUB_ALIAS"
 
@@ -210,7 +235,9 @@ fi
 # Inside [[ ]], "$mount_point"/* is a pattern: "starts with the mount point and a
 # slash". Inside [[ ]], "||" means "or" and "&&" means "and". "${#text}" is the number of
 # characters of a text. "local" makes variables that exist only inside the function; "$1"
-# is the first argument of the function.
+# is the first argument of the function. "for NAME in "${LIST[@]}"" runs the loop once for
+# each entry of the list LIST ("${LIST[@]}" stands for all entries, each kept as one
+# word).
 on_container_root() {
     local path="$1" mount_point best=""
     for mount_point in "${MOUNT_POINTS[@]}"; do
@@ -272,6 +299,7 @@ plain_file() {
 #      folder, where it would otherwise move the file into it.
 #   No program of "rstudio" runs while the start-up scripts run, so nobody can change
 #   the folder between these steps.
+# A backslash at the very end of a line continues the command on the next line.
 write_file() {
     local target="$1" mode="$2" owner="$3" new_file
     # "-e" is true for anything that exists, "-L" for a symbolic link, also one that points

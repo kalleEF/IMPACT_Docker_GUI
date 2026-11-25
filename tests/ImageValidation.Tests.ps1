@@ -242,8 +242,10 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
 
         if ($env:IMPACT_E2E_KEEP_ARTIFACTS -ne '1') {
             docker rmi $script:IMAGE_NAME 2>$null | Out-Null
-            Remove-Item -Recurse -Force -Path $script:cloneRoot -ErrorAction SilentlyContinue
-            Remove-Item -Recurse -Force -Path $script:sshDir    -ErrorAction SilentlyContinue
+            # BeforeAll stops early when Docker or the clone fails, and then these
+            # folders were never set. Remove-Item cannot take an empty path.
+            if ($script:cloneRoot) { Remove-Item -Recurse -Force -Path $script:cloneRoot -ErrorAction SilentlyContinue }
+            if ($script:sshDir)    { Remove-Item -Recurse -Force -Path $script:sshDir    -ErrorAction SilentlyContinue }
         }
 
         # Restore original Docker context
@@ -270,7 +272,9 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
     # ═════════════════════════════════════════════════════════════════════════
     #  Repository mount
     # ═════════════════════════════════════════════════════════════════════════
-    It 'Repository is bind-mounted at /home/rstudio/<RepoName>' {
+    # <REPO_NAME> in the name is replaced by the value of $script:REPO_NAME (set in
+    # BeforeAll above) when the test runs.
+    It 'Repository is bind-mounted at /home/rstudio/<REPO_NAME>' {
         if (-not (Assert-PreflightPassed)) { return }
         $r = Invoke-DockerExecSafe -ContainerName $script:CONTAINER_NAME `
             -Command @('ls', "/home/rstudio/$($script:REPO_NAME)")

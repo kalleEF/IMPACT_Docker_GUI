@@ -50,7 +50,8 @@ while [ "$#" -ge 2 ]; do
     # text-processing language, splits each line at "|" (-F'|'), puts "-" in place of the
     # size ($6) of a folder (type "d" in $3) and prints the line. The size of a folder is
     # left out because it depends on the file system. "LC_ALL=C sort" sorts byte by byte,
-    # the same on every computer. find never follows a symbolic link when it walks.
+    # the same on every computer. find never follows a symbolic link when it walks. A
+    # backslash at the very end of a line continues the command on the next line.
     find "$dir" -printf "$label|%P|%y|%U:%G|%m|%s|%T@|%C@|%l\n" \
         | awk -F'|' -v OFS='|' '$3 == "d" {$6 = "-"} {print}' \
         | LC_ALL=C sort

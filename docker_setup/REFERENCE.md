@@ -16,6 +16,10 @@ Two files exist only here:
 is the one of the Base model repository. The other model repositories keep their own values
 in `impact_model.json` (see `README.md`, section 5).
 
+This repository is public. In both Dockerfiles of this copy, the line `LABEL maintainer=...`
+therefore holds the placeholder `(as in the model repository)`. Each model repository keeps
+its own maintainer line.
+
 How the copies are kept in step:
 
 1. A change is made here first, on a branch, and must pass the tests:
@@ -24,9 +28,10 @@ How the copies are kept in step:
    GitHub runs both for every push that changes `docker_setup/` or `tests/docker_setup/`.
 2. Then the change goes into every model repository and every branch used with the GUI:
    the changed files of this folder, except the two files above, and
-   `dockerignore_for_repository_root` as `.dockerignore` at the top of the repository. A
-   model repository whose `Dockerfile.IMPACTncdGER` differs from this one gets the same
-   change by hand.
+   `dockerignore_for_repository_root` as `.dockerignore` at the top of the repository. The
+   line `LABEL maintainer=...` of the model repository stays as it is there. A model
+   repository whose `Dockerfile.IMPACTncdGER` differs from this one gets the same change by
+   hand.
 3. A change that was made in a model repository first is copied back here, and tested here.
 4. When a change alters what the GUI can expect from an image, raise `setup_version` in
    `impact_model.json` and the label `impact.setup_version` in `Dockerfile.IMPACTncdGER`
@@ -37,6 +42,7 @@ To check that a model repository is in step, compare its folder with this one, f
 These may differ:
 
 - `impact_model.json` and the two files above;
+- the line `LABEL maintainer=...` of both Dockerfiles (a placeholder here);
 - the files each model keeps for its own packages: `Dockerfile.prerequisite.IMPACTncdGER`,
   `apt-packages.txt`, `r-packages.txt`, `install_packages.sh`, `update-apt-packages.sh` and
   `update-apt-packages.ps1`;

@@ -39,6 +39,10 @@
 #                  "Host github.com", which compares capital letters exactly. After the
 #                  GUI's key scan, git then accepts a false server under the name
 #                  GitHub.com.
+#     git-no-originalhost   in git-identity.sh, the part "Match originalhost" of the SSH
+#                  rule is left out, and only "Match host" stays. With GitHub's port 443
+#                  set-up in ~/.ssh/config (github.com sent to ssh.github.com), git then
+#                  accepts a false server that answers as ssh.github.com on port 443.
 #
 #   Some checks of the scripts have a second barrier behind them (for example the device
 #   number test behind the mount list test for the home folder). Switching off one of
@@ -50,13 +54,13 @@
 # WHEN TO RUN IT
 #   After run-tests.sh, in the GitHub Actions job of these tests where that job is
 #   installed, and by hand after a change to run-tests.sh, lib/make-fixture.sh,
-#   lib/record-tree.sh, entrypoint.sh or git-identity.sh. It takes about 6 minutes for
-#   the nine mutants on a computer with 4 processors, once run-tests.sh has run on this
+#   lib/record-tree.sh, entrypoint.sh or git-identity.sh. It takes about 8 minutes for
+#   the ten mutants on a computer with 4 processors, once run-tests.sh has run on this
 #   computer: run-tests.sh builds the stand-in prerequisite image, which needs the
 #   internet once.
 #
 # HOW TO RUN IT
-#   bash tests/docker_setup/check-the-tests.sh              all nine mutants
+#   bash tests/docker_setup/check-the-tests.sh              all ten mutants
 #   bash tests/docker_setup/check-the-tests.sh usermod      only the named mutant(s)
 #
 # WHAT IT CHANGES
@@ -93,7 +97,7 @@ TMP_BASE="${IMPACT_TEST_TMP:-${TMPDIR:-/tmp}}"
 # entries of the list NAME, each kept as one word. "[[ A -gt B ]]" is true when the whole
 # number A is greater than B.
 ALL_MUTANTS=(usermod chown-home to-rocker no-mount-check home-mount-check git-no-covering git-fixed-name
-             around-mounts-path-only git-host-pattern)
+             around-mounts-path-only git-host-pattern git-no-originalhost)
 if [[ $# -gt 0 ]]; then
     MUTANTS=("$@")
 else
@@ -215,10 +219,21 @@ make_mutant() {
                 END { exit !done }' "$file" > "$new" || return 1
             ;;
         git-host-pattern)
-            # The line "Match host github.com,github.com." of the SSH rule becomes
-            # "Host github.com".
+            # Both "Match" lines of the SSH rule ("Match originalhost github.com,github.com."
+            # and "Match host github.com,github.com.") become "Host github.com". In the
+            # pattern, "(originalhost|host)" matches either word. "done++" counts the
+            # changed lines; awk fails unless both were found.
             awk '
-                /^Match host github\.com,github\.com\.$/ { print "Host github.com"; done = 1; next }
+                /^Match (originalhost|host) github\.com,github\.com\.$/ { print "Host github.com"; done++; next }
+                { print }
+                END { exit (done != 2) }' "$file" > "$new" || return 1
+            ;;
+        git-no-originalhost)
+            # The line "Match originalhost github.com,github.com." and the setting line
+            # below it are left out: "getline" reads the next line, and "next" skips it
+            # as well.
+            awk '
+                /^Match originalhost github\.com,github\.com\.$/ { getline; done = 1; next }
                 { print }
                 END { exit !done }' "$file" > "$new" || return 1
             ;;
@@ -250,7 +265,7 @@ groups_for() {
         home-mount-check|git-no-covering) echo '^home-mount$' ;;
         git-fixed-name)                   echo '^ssh-safety$' ;;
         around-mounts-path-only)          echo '^below-mount$' ;;
-        git-host-pattern)                 echo '^git$' ;;
+        git-host-pattern|git-no-originalhost) echo '^git$' ;;
         *)                                echo '^valid$' ;;
     esac
 }
@@ -282,6 +297,11 @@ expected_failures() {
             echo "[git] no network: SSH looks up the host key of GitHub.com under the name github.com-published (HostKeyAlias)"
             echo "[git] after the GUI's set-up: the false GitHub.com is refused (git, GIT_SSH_COMMAND)"
             echo "[git] after the GUI's set-up: the false GitHub.com is refused (git, core.sshCommand)"
+            ;;
+        git-no-originalhost)
+            echo "[git] stand-in server, before the GUI's set-up, ~/.ssh/config sends github.com to ssh.github.com port 443: SSH looks up the key under github.com-published"
+            echo "[git] stand-in server, before the GUI's set-up, port 443 set-up: the false github.com is refused (git, GIT_SSH_COMMAND)"
+            echo "[git] after the GUI's set-up, port 443 set-up: the false github.com is refused (git, core.sshCommand)"
             ;;
     esac
 }

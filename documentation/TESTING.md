@@ -28,11 +28,42 @@ In NonInteractive mode the dialog functions (`Show-CredentialDialog`, `Select-Lo
 
 ## Test framework
 
-[Pester 5](https://pester.dev/). The runner installs it if needed:
+[Pester](https://pester.dev/), the test tool for PowerShell, version **6.2.0**. The tests
+need PowerShell 7.4 or newer (`pwsh`): the IMPACT module needs PowerShell 7.3 or newer, and
+in PowerShell 7 Pester 6 needs version 7.4 or newer. Pester 6 itself also supports Windows
+PowerShell 5.1 (`powershell.exe`). The IMPACT module does not load there, so the tests
+cannot run in it.
+
+The version is fixed on purpose: the tests are checked with it, and a new Pester release
+can change how tests behave. CI always installs exactly this version (`PESTER_VERSION` in
+`.github/workflows/test.yml`), and the runner uses the same one (`$requiredPesterVersion`
+in `tests/Invoke-Tests.ps1`). When Pester 6.2.0 is not installed, the runner installs it
+for the current user:
 
 ```powershell
-Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+Install-Module Pester -Force -Scope CurrentUser -RequiredVersion 6.2.0 -SkipPublisherCheck
 ```
+
+Other Pester versions on the same PC can stay: several versions can be installed side by
+side, and one PowerShell session can load only one of them. The banner of the runner shows
+which Pester it uses. The runner uses a newer Pester 6 in two cases only, and then prints a
+note: when that version is already loaded in the PowerShell session (for example by an
+editor), and when Pester 6.2.0 cannot be installed and a newer Pester 6 is installed. The
+results on GitHub, with 6.2.0, are the reference. The runner stops with a message when a
+Pester version older than 6.2.0, or Pester 7 or newer, is already loaded, when no usable
+Pester can be found or installed, or when this is not PowerShell 7.4 or newer.
+
+**Moving to a newer Pester:** read its release notes, set `$requiredPesterVersion` and
+`PESTER_VERSION` to the new version, run all suites with it (locally and on GitHub) and
+fix what it reports.
+
+Many tests use **mocks**. A mock is a stand-in for a command during a test: Pester's
+`Mock` command replaces the command with a small piece of test code, and `Should -Invoke`
+checks how often it was called. A mock with `-ParameterFilter` handles only the calls its
+filter accepts. Pester stops every other call with the error
+`No mock for command ... matched the call`. So such a mock needs a default mock (a mock
+without a filter) for the same command, unless the filters of the mocks for that command
+together accept every possible call; see [Writing new tests](#writing-new-tests).
 
 ---
 
@@ -119,13 +150,13 @@ The runner:
 | Code | Meaning |
 |---|---|
 | 0 | Every requested suite ran and passed. |
-| 1 | A test failed, a test file / `BeforeAll` / `AfterAll` failed, or the parameters are invalid (for example `-Tag` with `-Level`, or an unknown `-Level`). |
+| 1 | A test failed, a test file / `BeforeAll` / `AfterAll` failed, the parameters are invalid (for example `-Tag` with `-Level`, or an unknown `-Level`), this is not PowerShell 7.4 or newer (`pwsh`), or no usable Pester (6.2.0 or a newer 6.x) could be loaded or installed (the message says why). |
 | 2 | Nothing failed, but at least one requested suite was NOT RUN. Use `-AllowSkip` to get 0 in that case (for example on a PC without Docker). |
 
 ### Direct Pester invocation
 
 ```powershell
-Import-Module Pester -MinimumVersion 5.0.0
+Import-Module Pester -RequiredVersion 6.2.0
 Invoke-Pester ./tests/Unit.Tests.ps1 -Output Detailed
 Invoke-Pester ./tests/Integration.Tests.ps1 -Output Detailed
 ```
@@ -243,6 +274,8 @@ Workflow: `.github/workflows/test.yml`.
 
 Failed jobs upload their result XML; the E2E jobs also upload container logs and `docker inspect` output.
 
+**Re-run with debug logging:** when a job is re-run on GitHub with *Enable debug logging*, Pester 6 also prints the verbose and debug messages written inside the test files (`Write-Verbose`, `Write-Debug`, and the `VERBOSE:` lines of `Import-Module`), so the test log gets much longer. The test results stay the same. This is Pester's setting `Output.CIDebugOutput` (default `Auto`); `$config.Output.CIDebugOutput = 'None'` in a Pester step of the workflow switches it off.
+
 ### Why Windows and Ubuntu
 
 | Runner | Why |
@@ -262,7 +295,7 @@ Failed jobs upload their result XML; the E2E jobs also upload container logs and
 
 | File | Contents |
 |---|---|
-| `tests/Helpers/TestSessionState.ps1` | `New-TestSessionState` (state for `LOCAL` or `REMOTE@<ip>`, key paths in the temp folder), `New-DummySshKeyPair`, `Test-IsSshKeyUsable`, `Save-TestArtifacts`, `Remove-TestArtifacts`, `Assert-PreflightPassed`, `Wait-ForRStudioReady` (treats HTTP 200/302/401/403 as "ready", also for PowerShell 7's `HttpResponseException`), `Invoke-DockerExecSafe`, `ConvertTo-Base64Script` |
+| `tests/Helpers/TestSessionState.ps1` | `New-TestSessionState` (state for `LOCAL` or `REMOTE@<ip>`, key paths in the temp folder), `Invoke-RealCommand` (runs the built-in command behind a mock inside the module; used by default mocks), `New-DummySshKeyPair`, `Test-IsSshKeyUsable`, `Save-TestArtifacts`, `Remove-TestArtifacts`, `Assert-PreflightPassed`, `Wait-ForRStudioReady` (treats HTTP 200/302/401/403 as "ready", also for PowerShell 7's `HttpResponseException`), `Invoke-DockerExecSafe`, `ConvertTo-Base64Script` |
 | `tests/Helpers/SshdContainer.Dockerfile` | Ubuntu 22.04 with SSHD, `testuser` and a fake `IMPACTncd_Germany` repository with the workstation's folder layout. Also used for the in-container SSH setup tests. |
 | `tests/Helpers/WorkstationContainer.Dockerfile` | Built from `ubuntu:22.04` with the same SSH set-up as the SSHD image (a separate copy: change both files), plus the Docker CLI (no daemon) for DooD. The entrypoint matches the `docker` group to the socket's GID, or changes the socket's group (see [DooD](#docker-out-of-docker-dood-for-remotee2e)). |
 | `tests/Invoke-Tests.ps1` | The runner described above. |
@@ -271,7 +304,7 @@ Failed jobs upload their result XML; the E2E jobs also upload container logs and
 
 ## Test hygiene: what the tests may touch
 
-- **The tests never write to your real `~/.ssh`.** PowerShell's `$HOME` cannot be changed, so the tests of `Ensure-SshConfigEntry` and `Ensure-GitKeySetup` mock `Join-Path` for the `Join-Path $HOME '.ssh'` calls inside the module (also the one the ssh config repair uses) and work in a temp folder. Guard mocks make any write below the real `~/.ssh` throw an error, so such a write fails loudly: `Add-Content`, `Set-Content` and `Remove-Item` (with `-Path` or `-LiteralPath`), `New-Item` (`-Path`) and `Copy-Item` (`-Destination`). `ssh-keygen`, `Set-Clipboard` and `ssh-agent` (`Get-Service`, `Start-Service`, `ssh-add`) are mocked, and a `Start-Process` mock fails if the code ever tries to start an elevated process, so no key is created, nothing is copied to the clipboard and no UAC prompt appears. Tests of the ssh config backup fallback folder mock it, so nothing is written to the real `~/.impact_gui/ssh-config-backups`.
+- **The tests never write to your real `~/.ssh`.** PowerShell's `$HOME` cannot be changed, so the tests of `Ensure-SshConfigEntry` and `Ensure-GitKeySetup` mock `Join-Path` for the `Join-Path $HOME '.ssh'` calls inside the module (also the one the ssh config repair uses) and work in a temp folder. Guard mocks make any write below the real `~/.ssh` throw an error, so such a write fails loudly: `Add-Content`, `Set-Content` and `Remove-Item` (with `-Path` or `-LiteralPath`), `New-Item` (`-Path`) and `Copy-Item` (`-Destination`). They turn every `\` into `/` before they compare paths, so they also catch a path that mixes the two (on Windows, `"$HOME/.ssh/config"` gives `C:\Users\me/.ssh/config`). Each of these commands, and `Join-Path`, also has a default mock that passes every other call on to the real command (`Invoke-RealCommand`), so the module still builds its paths, writes the config file in the temp folder and writes its log as usual. `ssh-keygen`, `Set-Clipboard` and `ssh-agent` (`Get-Service`, `Start-Service`, `ssh-add`) are mocked (the `ssh-keygen` stand-in of the `Ensure-GitKeySetup` tests writes dummy key files in the temp folder and refuses to write below the real `~/.ssh`), and a `Start-Process` mock fails if the code ever tries to start an elevated process, so no real key is created, nothing is copied to the clipboard and no UAC prompt appears. Tests of the ssh config backup fallback folder mock it, so nothing is written to the real `~/.impact_gui/ssh-config-backups`.
 - **Older versions of the tests did write there.** If you ran them before, you may want to remove, by hand: the `Host 198.51.100.99` block in `~/.ssh/config`, and the files `~/.ssh/id_ed25519_gitsetup` and `~/.ssh/id_ed25519_gitsetup.pub` (and `ssh-add -d ~/.ssh/id_ed25519_gitsetup` if it was loaded into ssh-agent).
 - The Unit and Integration files point the IMPACT log at a temp file (`IMPACT_LOG_FILE`, set in their top-level `BeforeAll` and restored in `AfterAll`), so the real `~/.impact_gui/logs/impact.log` is not touched. The `Write-Log` tests use their own temp file and restore the setting afterwards. The DockerSsh, ImageValidation and RemoteE2E files do not redirect the log.
 - If the socket of the Docker engine that runs the tests belongs to group 0 (root), the workstation container used by RemoteE2E changes the socket's group to GID 999 and makes it group-writable (see [DooD](#docker-out-of-docker-dood-for-remotee2e)). This lasts until the Docker engine restarts.
@@ -290,11 +323,21 @@ Failed jobs upload their result XML; the E2E jobs also upload container logs and
    }
    ```
 
-3. **Pester 5 scoping:** define variables inside `BeforeAll`/`BeforeEach`/`It`. Values set in `BeforeDiscovery` (or between it and `Describe`) are only available while `-Skip:` is evaluated, not while the tests run.
+3. **Pester scoping:** define variables inside `BeforeAll`/`BeforeEach`/`It`. Values set in `BeforeDiscovery` (or between it and `Describe`) are only available while `-Skip:` is evaluated, not while the tests run.
 4. Mock functions that the module calls with `Mock <name> -ModuleName IMPACT_Docker_GUI`, and check them with `Should -Invoke ... -ModuleName IMPACT_Docker_GUI`.
-5. Pester can only mock commands that exist. For `ssh`, `ssh-keygen`, `ssh-add`, `docker`, `Get-Service` or `Start-Service` on a machine without them, define a temporary global stub that throws when called without a mock (`function global:ssh { throw 'ssh stub called without a mock' }`), and remove it in `AfterAll` with `Remove-Item Function:\ssh`.
-6. Native commands (and stubs without a `param()` block) receive their arguments in `$args`, also in mock bodies and `-ParameterFilter`. Set `$global:LASTEXITCODE` in a mock when the code checks it.
-7. The module runs under `Set-StrictMode -Version Latest`: reading a missing hashtable key with dot notation throws, so use `$h['key']` or `ContainsKey` in test helpers that touch the session state.
-8. Use `New-TestSessionState` for a ready-made state, and `-Location 'REMOTE@<ip>'` plus mocked `ssh` for remote tests.
-9. Code that uses WinForms or System.Drawing cannot even be compiled on Linux; mark such tests `-Skip:(-not $IsWindows)` with a comment.
-10. If you add or export a module function, update **both** `Export-ModuleMember` in the `.psm1` and `FunctionsToExport` in the `.psd1`.
+5. A mock with `-ParameterFilter` handles only the calls its filter accepts, and any other call of that command stops with `No mock for command ... matched the call`. The module often catches that error and carries on quietly, so the test can pass while the module skipped work. Add a default mock (without a filter) for the same command, unless the filters together accept every possible call (like the two `Copy-Item` mocks of the test for the ssh config backup, whose filters use `-like` and `-notlike` on the same value):
+   - when the other calls should do what they normally do, let the default mock call the real command:
+
+     ```powershell
+     Mock Join-Path -ModuleName 'IMPACT_Docker_GUI' { Invoke-RealCommand -Name 'Join-Path' -Parameters $PesterBoundParameters }
+     Mock Join-Path -ModuleName 'IMPACT_Docker_GUI' -ParameterFilter { $Path -eq $HOME -and $ChildPath -eq '.ssh' } { $script:fakeSshDir }
+     ```
+
+     Pester tries the mocks with a filter first and uses the default mock only for the rest. `Invoke-RealCommand` (in `tests/Helpers/TestSessionState.ps1`) runs the built-in command inside the module, with the parameters of the call (`$PesterBoundParameters`). It works for built-in commands (cmdlets) only;
+   - when no other call may happen, let the default mock throw an error that says so.
+6. Pester can only mock commands that exist. For `ssh`, `ssh-keygen`, `ssh-add`, `docker`, `Get-Service` or `Start-Service` on a machine without them, define a temporary global stub that throws when called without a mock (`function global:ssh { throw 'ssh stub called without a mock' }`), and remove it in `AfterAll` with `Remove-Item Function:\ssh`.
+7. Native commands (and stubs without a `param()` block) receive their arguments in `$args`, also in mock bodies and `-ParameterFilter`. Set `$global:LASTEXITCODE` in a mock when the code checks it.
+8. The module runs under `Set-StrictMode -Version Latest`: reading a missing hashtable key with dot notation throws, so use `$h['key']` or `ContainsKey` in test helpers that touch the session state.
+9. Use `New-TestSessionState` for a ready-made state, and `-Location 'REMOTE@<ip>'` plus mocked `ssh` for remote tests.
+10. Code that uses WinForms or System.Drawing cannot even be compiled on Linux; mark such tests `-Skip:(-not $IsWindows)` with a comment.
+11. If you add or export a module function, update **both** `Export-ModuleMember` in the `.psm1` and `FunctionsToExport` in the `.psd1`.

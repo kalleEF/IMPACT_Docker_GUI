@@ -64,6 +64,56 @@ function New-TestSessionState {
     return $state
 }
 
+function Invoke-RealCommand {
+    <#
+    .SYNOPSIS Runs the real PowerShell command behind a mock, inside the IMPACT module.
+    .DESCRIPTION
+              A mock is a stand-in for a command during a test: Pester's 'Mock' command
+              replaces the command with a small piece of test code. A mock with a
+              -ParameterFilter only handles the calls that its filter accepts. Pester
+              stops every other call with the error "No mock for command ... matched the
+              call", so such a mock needs a second mock without a filter, the "default
+              mock", for all other calls. The default mocks in these tests call this
+              helper, so those calls do exactly what they would do without any mock:
+
+                  Mock Join-Path -ModuleName 'IMPACT_Docker_GUI' { Invoke-RealCommand -Name 'Join-Path' -Parameters $PesterBoundParameters }
+
+              Pester fills $PesterBoundParameters inside every mock with the parameters of
+              the call that the mock replaced. The mocks with a filter (for example the
+              safety nets that stop writes to the real ~/.ssh) still get their calls
+              first: Pester uses a default mock only when no filter accepts the call.
+
+              The real command is looked up as a cmdlet, the built-in kind of command, so
+              a mock with the same name is never picked by mistake. It runs inside the
+              module, the place the replaced call came from. That matters for
+              Get-Command: it only finds the module's own functions when it is asked from
+              inside the module.
+
+              Each call is passed on as one call of its own. The module never sends
+              pipeline input to the commands that are mocked this way. If it starts to,
+              check those tests: Set-Content would then keep only the last item.
+    .PARAMETER Name
+        Name of the built-in cmdlet, for example 'Join-Path' or 'Set-Content'.
+    .PARAMETER Parameters
+        The parameters to pass on, normally $PesterBoundParameters.
+    .PARAMETER ModuleName
+        The module that made the call. Default: IMPACT_Docker_GUI.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [hashtable]$Parameters = @{},
+        [string]$ModuleName = 'IMPACT_Docker_GUI'
+    )
+
+    $realCommand = Get-Command -Name $Name -CommandType Cmdlet -ErrorAction Stop
+    $module = @(Get-Module -Name $ModuleName)
+    if ($module.Count -ne 1) {
+        throw "Invoke-RealCommand: the module '$ModuleName' must be loaded exactly once, but $($module.Count) copies are loaded."
+    }
+    # '& <module> { ... }' runs the script block inside that module.
+    & $module[0] { param($Command, $CommandParameters) & $Command @CommandParameters } $realCommand $Parameters
+}
+
 function New-DummySshKeyPair {
     <#
     .SYNOPSIS Creates a throwaway ed25519 key pair in a temp directory.

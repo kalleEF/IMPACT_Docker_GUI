@@ -119,14 +119,20 @@
 #                         the output and the error messages ("2>&1" sends error messages
 #                         where the output goes); ">&2" sends the output to the error channel.
 #     <<< "text"          feeds the text to a command as its input.
+#     <(command)          stands for a file that holds what the command prints; "diff
+#                         <(a) <(b)" compares the output of a with the output of b.
 #     < <(command)        feeds the output of a command to a loop or command as its input.
 #     IFS= read -r NAME   reads one line into NAME and keeps its spaces and backslashes.
 #     { a; b; }           groups commands, for example to send their output to one place.
 #     ( ... )             runs the commands in a copy of the shell (a "subshell"); a
 #                         variable set there is lost when the copy ends.
+#     \ at a line end     a backslash at the very end of a line continues the command on
+#                         the next line.
 #   Tools: grep finds lines ("-q" only reports whether it found any, "-F" takes the text as
 #     written, "-c" counts, "-v" keeps the other lines); sed and awk change or pick parts of
-#     lines; cut keeps fields; sort sorts; xargs runs a command with the words it reads.
+#     lines; cut keeps fields; sort sorts; xargs runs a command with the words it reads;
+#     "comm -23 A B" prints the lines of the sorted list A that the sorted list B lacks;
+#     "paste -s -d '|'" joins all lines into one, with "|" between them.
 # =============================================================================
 
 # "set -u" stops the script when it reads a variable that was never set.
@@ -1071,7 +1077,14 @@ group_restart() {
     start restart "$IMG_PROBE" "${ENV_OPTS[@]}" "${COMMON_OPTS[@]}" "${GUI_MOUNTS[@]}" "${STORAGE_MOUNT[@]}"
 
     # While the probe script runs, the marker must not be there. Look every 0.2 seconds
-    # until the probe has ended.
+    # until the probe has ended. "looks" counts the rounds in which the probe was running.
+    # The marker is checked with one command that looks at the marker first and then at
+    # the probe's end file. In the right order the probe writes its end file before the
+    # marker script runs, so a marker seen while the end file is still missing proves
+    # that the marker came too early. (Three separate "docker exec" calls take about 0.3
+    # seconds; they could see the probe still running and, a moment later, the marker
+    # that was rightly written after the probe ended.) Inside "sh -c", "[ -f FILE ]" is
+    # the test of the plain shell sh: true when FILE exists as a file.
     local name seen_early=0 looks=0 deadline=$((SECONDS + 60))
     name="$(cname restart)"
     while (( SECONDS < deadline )); do
@@ -1080,8 +1093,8 @@ group_restart() {
         fi
         if docker exec "$name" test -f /run/impact-test-probe 2>/dev/null; then
             looks=$((looks + 1))
-            docker exec "$name" test -f "$MARKER" 2>/dev/null && seen_early=1
         fi
+        docker exec "$name" sh -c "[ -f $MARKER ] && [ ! -f /run/impact-test-probe-end ]" 2>/dev/null && seen_early=1
         sleep 0.2
     done
     if [[ "$looks" -ge 3 && "$seen_early" == 0 ]]; then
@@ -1522,6 +1535,44 @@ gui_refusal_checks() {
     done
 }
 
+# port443_checks WHEN: GitHub documents a set-up for networks that block the usual SSH
+# port 22: in ~/.ssh/config, "Host github.com" with "HostName ssh.github.com" and
+# "Port 443". SSH then connects to ssh.github.com on port 443 whenever github.com is
+# typed. The stand-in server answers under that name and port as well, with its own host
+# key, so git must still refuse it: SSH must look up the key under the name
+# github.com-published although the name it connects to is ssh.github.com. The
+# settings file is written for these checks only and removed afterwards. WHEN names the
+# moment in the test lines. A positive check shows first that the stand-in really
+# answers as ssh.github.com on port 443 (a name without any rule, which "accept-new" lets
+# through; the key goes into a separate file in /tmp, which is thrown away), so that a
+# refusal below comes from the host key check.
+port443_checks() {
+    local when="$1" out code host how
+    out="$(as_rstudio git ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/known_hosts_443 \
+        -i /home/rstudio/.ssh/id_ed25519_testuser -p 443 git@ssh.github.com echo reached-port-443 2>&1)"
+    expect_contains "$when: the stand-in answers as ssh.github.com on port 443" "$out" "reached-port-443"
+    in_container git rm -f /tmp/known_hosts_443
+    in_container git /bin/bash -c "printf 'Host github.com\n    HostName ssh.github.com\n    Port 443\n' > /home/rstudio/.ssh/config && chown $PERSON_UID:$SHARED_GID /home/rstudio/.ssh/config && chmod 600 /home/rstudio/.ssh/config"
+    # "ssh -G" prints where SSH would connect and under which name it looks up the key.
+    expect_equal "$when, ~/.ssh/config sends github.com to ssh.github.com port 443: SSH looks up the key under github.com-published" \
+        "hostkeyalias github.com-published|hostname ssh.github.com|port 443" \
+        "$(as_rstudio git ssh -G github.com 2>&1 | grep -i -E '^(hostname|port|hostkeyalias) ' | LC_ALL=C sort | paste -s -d '|')"
+    for host in github.com GitHub.com; do
+        for how in GIT_SSH_COMMAND core.sshCommand; do
+            case "$how" in
+                GIT_SSH_COMMAND) out="$(as_rstudio git git ls-remote "git@$host:standin/repo.git" 2>&1)"; code=$? ;;
+                core.sshCommand) out="$(as_rstudio git env -u GIT_SSH_COMMAND git ls-remote "git@$host:standin/repo.git" 2>&1)"; code=$? ;;
+            esac
+            if [[ "$code" != 0 && "$out" == *"Host key verification failed"* ]]; then
+                ok "$when, port 443 set-up: the false $host is refused (git, $how)"
+            else
+                bad "$when, port 443 set-up: the false $host is refused (git, $how)" "exit code $code" "$out"
+            fi
+        done
+    done
+    in_container git rm -f /home/rstudio/.ssh/config
+}
+
 group_git() {
     make_fixture git "$PERSON_UID" "$SHARED_GID"
     set_mounts git
@@ -1595,15 +1646,17 @@ group_git() {
 
     # --- A stand-in SSH server -------------------------------------------------------------
     # One container plays an SSH server with a git repository. On a private Docker
-    # network it answers to two names:
+    # network it answers to three names, on the usual SSH port 22 and on port 443:
     #   github.com        its host key is NOT GitHub's key, so every connection to this
     #                     name must be refused by the client;
+    #   ssh.github.com    the same, for the port 443 set-up of GitHub (see port443_checks);
     #   git.example.test  an unknown server, which "accept-new" lets git reach.
     docker network rm "$NETWORK" > /dev/null 2>&1
     docker network create --label "impact.test=$PREFIX" "$NETWORK" > /dev/null
     docker rm -f "$(cname gitserver)" > /dev/null 2>&1
     docker run -d --name "$(cname gitserver)" --label "impact.test=$PREFIX" \
-        --network "$NETWORK" --network-alias github.com --network-alias git.example.test \
+        --network "$NETWORK" --network-alias github.com --network-alias ssh.github.com \
+        --network-alias git.example.test \
         --entrypoint /bin/bash -v "$WORK/git/keys/id_ed25519_testuser.pub:/authorized-key.pub:ro" "$IMG_PREREQ" -c '
             # Runs inside the stand-in server container, as root.
             set -e
@@ -1618,7 +1671,7 @@ group_git() {
             mkdir -p /run/sshd
             ssh-keygen -A > /dev/null                 # host keys of this server, made now
             echo SERVER-READY
-            exec /usr/sbin/sshd -D -e
+            exec /usr/sbin/sshd -D -e -p 22 -p 443    # listen on port 22 and on port 443
         ' > /dev/null
     local tries=0
     while (( tries < 60 )) && ! docker logs "$(cname gitserver)" 2>&1 | grep -q 'Server listening'; do
@@ -1665,6 +1718,7 @@ group_git() {
         # final dot is a name SSH has never seen, so without the rule of git-identity.sh
         # "accept-new" would accept any key for it.
         gui_refusal_checks "stand-in server, before the GUI's set-up"
+        port443_checks "stand-in server, before the GUI's set-up"
         expect_equal "stand-in server: the refused connections added no key for github.com" "$(cat "$HERE/expected/github_known_hosts")" \
             "$(in_container git grep '^github.com ' /home/rstudio/.ssh/known_hosts 2>&1)"
 
@@ -1705,9 +1759,11 @@ group_git() {
         expect_contains "GUI set-up with the false github.com reachable: the scan wrote keys that are not GitHub's into known_hosts" \
             "$(in_container git /bin/bash -c "grep '^github.com ' /home/rstudio/.ssh/known_hosts | grep -c -v -x -F -f /etc/ssh/ssh_known_hosts") lines" "3 lines"
         gui_refusal_checks "after the GUI's set-up"
+        port443_checks "after the GUI's set-up"
         # The other order: the script runs after the GUI (as at the next start).
         in_container git /etc/cont-init.d/git-identity > "$WORK/second-run.log" 2>&1
         gui_refusal_checks "after the script ran again"
+        port443_checks "after the script ran again"
         expect_equal "after the script ran again: the github.com lines of known_hosts are GitHub's three published keys" "$expected_keys" \
             "$(in_container git grep -i 'github' /home/rstudio/.ssh/known_hosts 2>&1)"
 

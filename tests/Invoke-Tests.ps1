@@ -24,8 +24,10 @@
 
     Exit codes:
         0  every requested suite ran and passed
-        1  at least one test failed, a test file / BeforeAll / AfterAll block failed, or the
-           parameters are invalid (for example -Tag with -Level, or an unknown -Level)
+        1  at least one test failed, a test file / BeforeAll / AfterAll block failed, the
+           parameters are invalid (for example -Tag with -Level, or an unknown -Level),
+           this is not PowerShell 7.4 or newer (pwsh), or no usable Pester (6.2.0 or a
+           newer 6.x) could be loaded or installed (the message says why)
         2  nothing failed, but at least one requested suite was NOT RUN (for example
            Docker is not running). Use -AllowSkip to get 0 in that case.
 #>
@@ -48,13 +50,140 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
-# ── Ensure Pester 5+ ─────────────────────────────────────────────────────────
-$mod = Get-Module Pester -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
-if (-not $mod -or $mod.Version.Major -lt 5) {
-    Write-Host 'Installing Pester 5...' -ForegroundColor Yellow
-    Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck
+# ── Load Pester 6 (the test tool) ────────────────────────────────────────────
+# The tests are checked with Pester 6.2.0, the version below. The GitHub
+# workflow installs exactly this version (PESTER_VERSION in
+# .github/workflows/test.yml). The version is fixed so that a new Pester
+# release cannot change the test results without anyone noticing.
+#
+# This script loads Pester 6.2.0. When it is not installed, the script installs
+# it for the current user. Other Pester versions on the PC are left alone:
+# several versions can be installed side by side.
+# A newer Pester 6 is used in two cases only, and the script then prints a note:
+#  - it is already loaded in this PowerShell session (see below);
+#  - Pester 6.2.0 cannot be installed, and the newer Pester 6 is installed.
+# The banner shows the version in use. GitHub always uses 6.2.0, so its results
+# are the reference. When no usable Pester can be found or installed, the script
+# stops with a message that says how to install it.
+#
+# To move to a newer Pester: read its release notes, change the version below
+# and PESTER_VERSION in the workflow to the same value, run all suites with it
+# (here and on GitHub), and fix what the new version reports.
+$requiredPesterVersion = [version]'6.2.0'
+
+function Stop-PesterSetup {
+    # Prints why Pester cannot be used and how to fix it, then ends the script
+    # with exit code 1.
+    param([string[]]$Lines)
+    Write-Host ''
+    foreach ($line in $Lines) { Write-Host "  $line" -ForegroundColor Red }
+    Write-Host ''
+    exit 1
 }
-Import-Module Pester -MinimumVersion 5.0.0
+
+function Test-UsablePesterVersion {
+    # True for Pester $requiredPesterVersion and for newer versions with the same
+    # major version (6.x). Older versions, and Pester 7 or newer, are not usable.
+    param([version]$Version)
+    $Version.Major -eq $requiredPesterVersion.Major -and $Version -ge $requiredPesterVersion
+}
+
+function Get-UsablePester {
+    # The installed Pester $requiredPesterVersion, or $null when it is not installed.
+    # With -AllowNewer and without that version: the newest installed usable Pester.
+    param([switch]$AllowNewer)
+    $all = @(Get-Module Pester -ListAvailable)
+    $exact = $all | Where-Object { $_.Version -eq $requiredPesterVersion } | Select-Object -First 1
+    if ($exact -or -not $AllowNewer) { return $exact }
+    $all |
+        Where-Object { Test-UsablePesterVersion -Version $_.Version } |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+}
+
+# The tests need PowerShell 7.4 or newer (pwsh). The IMPACT module needs
+# PowerShell 7.3 or newer, so it does not load in Windows PowerShell 5.1
+# (powershell.exe). In PowerShell 7, Pester 6 needs version 7.4 or newer.
+# The check uses Major.Minor only, the way the module checks its version.
+$psVersion = [version]('{0}.{1}' -f $PSVersionTable.PSVersion.Major, $PSVersionTable.PSVersion.Minor)
+if ($PSVersionTable.PSEdition -ne 'Core') {
+    Stop-PesterSetup @(
+        "ERROR: the tests need PowerShell 7.4 or newer (pwsh). This is Windows PowerShell $($PSVersionTable.PSVersion), and the IMPACT module does not run in it.",
+        'Install PowerShell 7 (https://aka.ms/powershell), then run: pwsh tests/Invoke-Tests.ps1'
+    )
+}
+if ($psVersion -lt [version]'7.4') {
+    Stop-PesterSetup @(
+        "ERROR: the tests need PowerShell 7.4 or newer (pwsh). This is PowerShell $($PSVersionTable.PSVersion), and in PowerShell 7 Pester $requiredPesterVersion needs version 7.4 or newer.",
+        'Update PowerShell 7 (https://aka.ms/powershell), then run: pwsh tests/Invoke-Tests.ps1'
+    )
+}
+
+# One PowerShell session can hold only one Pester version. A Pester that is
+# already loaded (for example by an editor) is used when it is usable (6.2.0 or
+# a newer 6.x); any other version blocks the import, because Pester's program
+# library (its .dll file) stays in memory until the session ends.
+$pesterNote = $null
+$loaded = @(Get-Module Pester)
+$mod = $loaded | Where-Object { Test-UsablePesterVersion -Version $_.Version } | Select-Object -First 1
+if (-not $mod -and $loaded.Count -gt 0) {
+    Stop-PesterSetup @(
+        "ERROR: Pester $(($loaded | ForEach-Object { $_.Version }) -join ', ') is already loaded in this PowerShell session, and the tests need Pester $requiredPesterVersion.",
+        'Two Pester versions cannot be loaded in one session. Open a new PowerShell 7 window and run: pwsh tests/Invoke-Tests.ps1'
+    )
+}
+if ($mod -and $mod.Version -ne $requiredPesterVersion) {
+    $pesterNote = "Pester $($mod.Version) is already loaded in this PowerShell session, so the tests run with it. GitHub uses Pester $requiredPesterVersion. To run with that version, open a new PowerShell 7 window and run: pwsh tests/Invoke-Tests.ps1"
+}
+
+if (-not $mod) { $mod = Get-UsablePester }
+if (-not $mod) {
+    Write-Host "Installing Pester $requiredPesterVersion for the current user..." -ForegroundColor Yellow
+    $installError = $null
+    try {
+        Install-Module Pester -Force -Scope CurrentUser -RequiredVersion $requiredPesterVersion -SkipPublisherCheck -ErrorAction Stop
+    } catch {
+        $installError = $_.Exception.Message
+    }
+    $mod = Get-UsablePester
+    $installErrorText = if ($installError) { $installError } else { 'Install-Module finished, but the new version was not found.' }
+    if (-not $mod) {
+        # Pester 6.2.0 could not be installed. A newer installed Pester 6 is the
+        # next best choice.
+        $mod = Get-UsablePester -AllowNewer
+        if ($mod) {
+            $pesterNote = "Pester $requiredPesterVersion could not be installed ($installErrorText), so the tests run with the installed Pester $($mod.Version). GitHub uses Pester $requiredPesterVersion."
+        }
+    }
+    if (-not $mod) {
+        $installed = @(Get-Module Pester -ListAvailable | ForEach-Object { $_.Version.ToString() } | Sort-Object -Unique)
+        $installedLine = if ($installed.Count -gt 0) {
+            "Installed Pester versions: $($installed -join ', '). None of them can run these tests: they need Pester $requiredPesterVersion or a newer Pester $($requiredPesterVersion.Major).x."
+        } else {
+            'No installed Pester was found.'
+        }
+        Stop-PesterSetup @(
+            "ERROR: the tests need Pester $requiredPesterVersion, and it could not be installed.",
+            $installedLine,
+            "Install error: $installErrorText",
+            'Install it by hand when the PowerShell Gallery can be reached, then run this script again:',
+            "  Install-Module Pester -RequiredVersion $requiredPesterVersion -Scope CurrentUser -Force -SkipPublisherCheck"
+        )
+    }
+}
+
+# -RequiredVersion loads exactly the version found above, also when another
+# Pester is installed next to it. When that version is already loaded in this
+# session (for example by an editor), the import changes nothing.
+try {
+    Import-Module Pester -RequiredVersion $mod.Version -ErrorAction Stop
+} catch {
+    Stop-PesterSetup @(
+        "ERROR: Pester $($mod.Version) is installed in $($mod.ModuleBase) but could not be loaded:",
+        $_.Exception.Message,
+        'Open a new PowerShell 7 window and run: pwsh tests/Invoke-Tests.ps1'
+    )
+}
 
 # Source test helpers
 . (Join-Path $PSScriptRoot 'Helpers' 'TestSessionState.ps1')
@@ -121,6 +250,8 @@ Write-Host '=============================================' -ForegroundColor Cyan
 Write-Host '  IMPACT Docker GUI - Test Runner' -ForegroundColor Cyan
 Write-Host '=============================================' -ForegroundColor Cyan
 Write-Host "  Suites: $($suitesToRun -join ' + ')" -ForegroundColor White
+Write-Host "  Pester: $($mod.Version) ($($mod.ModuleBase))" -ForegroundColor White
+if ($pesterNote) { Write-Host "  Note: $pesterNote" -ForegroundColor Yellow }
 
 # ── Set up E2E environment variables ──────────────────────────────────────────
 $needsE2E = ($suitesToRun -contains 'ImageValidation') -or ($suitesToRun -contains 'RemoteE2E')

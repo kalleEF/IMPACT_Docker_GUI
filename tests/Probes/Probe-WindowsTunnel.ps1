@@ -226,6 +226,38 @@ function Get-ProbeFileText {
     return $content
 }
 
+function Get-ProbeFileTextShared {
+    <#
+    .SYNOPSIS
+        Reads a text file that another program may still have open for writing.
+    .DESCRIPTION
+        Get-Content can fail on a file that a running program holds open. This
+        function asks Windows for the file with the widest sharing: other
+        programs may read, write and delete it at the same time.
+        It returns a table with three entries: Ok (true or false), Text (the
+        content) and Error (the message when reading failed).
+    #>
+    param([string]$Path)
+
+    $result = @{ Ok = $false; Text = ''; Error = '' }
+    $stream = $null
+    $reader = $null
+    try {
+        # "-bor" combines the two sharing rights into one value.
+        $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+        $reader = [System.IO.StreamReader]::new($stream)
+        $result.Text = $reader.ReadToEnd()
+        $result.Ok = $true
+    } catch {
+        $result.Error = $_.Exception.Message
+    } finally {
+        # Close the file again in every case. Closing the reader closes the stream too.
+        if ($reader) { $reader.Dispose() } elseif ($stream) { $stream.Dispose() }
+    }
+    return $result
+}
+
 # ==============================================================================
 #  Helper functions: running programs, ports, HTTP
 # ==============================================================================
@@ -1386,6 +1418,17 @@ function Invoke-ProbeTunnelSteps {
     Write-ProbeLine "    log of the tunnel (${log1}):"
     Show-ProbeFile $log1
 
+    # Can the log of a RUNNING ssh.exe be read? The GUI wants to show the last
+    # lines of this file when a tunnel does not work. Two ways are tried: the
+    # plain way (Get-Content) and reading with shared access.
+    if (-not $tunnel.HasExited) {
+        $plainNote = 'works'
+        try { $null = Get-Content -LiteralPath $log1 -Raw -ErrorAction Stop } catch { $plainNote = "fails ($($_.Exception.Message))" }
+        $shared = Get-ProbeFileTextShared -Path $log1
+        $sharedNote = if ($shared.Ok) { 'works' } else { "fails ($($shared.Error))" }
+        Add-ProbeResult -Step 'e3' -State INFO -Text "the log file of the RUNNING ssh.exe: plain reading $plainNote; reading with shared access $sharedNote"
+    }
+
     # Did "accept-new" store the server key in the user's known_hosts file?
     $knownHostsAfter = Get-ProbeFileText $knownHosts
     if ($knownHostsAfter -ne $knownHostsBefore) {
@@ -1469,9 +1512,17 @@ function Invoke-ProbeTunnelSteps {
         } elseif ($ended) {
             Add-ProbeResult -Step 'h1' -State FAIL -Text ("could not be tested whether a second tunnel on the taken port ends by itself: the second ssh.exe ended after {0:N1} seconds with exit code {1}, but its log has no line about the port (bind, in use, cannot listen, forwarding); complete log: '{2}'" -f $watch.Elapsed.TotalSeconds, $second.ExitCode, (ConvertTo-ProbeOneLine $logText))
         } else {
-            Add-ProbeResult -Step 'h1' -State FAIL -Text "the second ssh.exe did NOT end within 20 seconds, although port $TunnelPort was taken; listeners now: $(@(Get-ProbePortListeners -Port $TunnelPort) -join ' ; ')"
+            $listenersThen = @(Get-ProbePortListeners -Port $TunnelPort) -join ' ; '
             try { $second.Kill($true) } catch { $null = $_ }
             [void]$second.WaitForExit(5000)
+            # The log of a running ssh.exe can be locked. The process has ended
+            # now, so the file is read again: it tells what the second ssh.exe
+            # did with the taken port. An empty log means that it reported no
+            # problem with the port.
+            $logAfter = Get-ProbeFileText $log2
+            Write-ProbeLine '    log of the second ssh.exe, read after the probe ended the process:'
+            Show-ProbeFile $log2
+            Add-ProbeResult -Step 'h1' -State FAIL -Text ("the second ssh.exe did NOT end within 20 seconds, although port $TunnelPort was taken; listeners at that moment: $listenersThen; its log, read after the probe ended it: '" + (ConvertTo-ProbeOneLine $logAfter) + "'")
         }
         # The first tunnel must not be disturbed by the second start.
         $again = Invoke-ProbeHttpRequest -Url "http://127.0.0.1:$TunnelPort/" -TotalSeconds 10

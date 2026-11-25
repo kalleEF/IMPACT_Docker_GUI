@@ -297,8 +297,9 @@ check_home_folder() {
 
 # own_one_folder FOLDER UID GID: gives one folder entry (nothing inside it) to UID:GID,
 # when it is a real folder (no link) that lies on the container's own files.
-# "stat -c %u:%g" prints the owner as "UID:GID"; nothing is changed when it already fits.
-# "chown -h" changes a symbolic link itself and never the file it points to.
+# "stat -c %u:%g" prints the owner as "UID:GID"; nothing is changed when it already fits
+# ("a && b" runs b only when a succeeded). "chown -h" changes a symbolic link itself and
+# never the file it points to.
 own_one_folder() {
     local folder="$1" uid="$2" gid="$3"
     [[ -d "$folder" && ! -L "$folder" ]] || return 0
@@ -648,7 +649,8 @@ apply_identity() {
     else
         # The new content is written to a second file next to the original and then
         # moved into its place. In awk, "-v OFS=:" joins the fields of a changed line
-        # with ":" again; "{print}" writes every line, changed or not.
+        # with ":" again; "{print}" writes every line, changed or not. A backslash at the
+        # very end of a line continues the command on the next line.
         if ! awk -F: -v OFS=: -v name="$RSTUDIO_GROUP" -v gid="$want_gid" \
                 '$1 == name {$3 = gid} {print}' /etc/group > /etc/group.impact-new \
            || ! replace_file /etc/group /etc/group.impact-new; then
