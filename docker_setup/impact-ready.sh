@@ -45,7 +45,11 @@ MARKER="/run/impact-ready"
 # The line is written to a second file first and then moved into place. "mv" inside one
 # folder is a rename, so the marker appears complete in a single step and a waiting
 # program never reads a half-written file.
-# "date -u" prints the time in UTC, the time zone used in logs.
+# "date -u" prints the time in UTC, the time zone used in logs. "$(command)" is replaced by
+# what the command prints. "printf 'ready %s\n' TEXT" prints the word "ready", the TEXT
+# and a line break; "> FILE" writes that into FILE. "a && b" runs b only when a succeeded.
+# "if ...; then ... else ... fi" runs the first part when the commands succeeded and the
+# second part when they failed; "exit 1" ends the script with the exit code 1 (failure).
 if printf 'ready %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$MARKER.tmp" && mv -f "$MARKER.tmp" "$MARKER"; then
     echo "[impact-ready] start-up scripts finished; marker written: $MARKER"
 else

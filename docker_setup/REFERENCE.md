@@ -19,8 +19,9 @@ in `impact_model.json` (see `README.md`, section 5).
 How the copies are kept in step:
 
 1. A change is made here first, on a branch, and must pass the tests:
-   `bash tests/docker_setup/run-tests.sh` (they also run on GitHub for every push that
-   changes `docker_setup/` or `tests/docker_setup/`).
+   `bash tests/docker_setup/run-tests.sh`, then `bash tests/docker_setup/check-the-tests.sh`.
+   When the workflow `.github/workflows/docker-setup.yml` is installed in this repository,
+   GitHub runs both for every push that changes `docker_setup/` or `tests/docker_setup/`.
 2. Then the change goes into every model repository and every branch used with the GUI:
    the changed files of this folder, except the two files above, and
    `dockerignore_for_repository_root` as `.dockerignore` at the top of the repository. A
@@ -33,6 +34,13 @@ How the copies are kept in step:
 
 To check that a model repository is in step, compare its folder with this one, for example
 `git diff --no-index --stat <GUI repository>/docker_setup <model repository>/docker_setup`.
-Only `impact_model.json`, the two files above and, for a model whose Dockerfile has lines of
-its own (for example another repository name), those lines of `Dockerfile.IMPACTncdGER` may
-differ.
+These may differ:
+
+- `impact_model.json` and the two files above;
+- the files each model keeps for its own packages: `Dockerfile.prerequisite.IMPACTncdGER`,
+  `apt-packages.txt`, `r-packages.txt`, `install_packages.sh`, `update-apt-packages.sh` and
+  `update-apt-packages.ps1`;
+- for a model whose Dockerfile has lines of its own (for example another repository name),
+  those lines of `Dockerfile.IMPACTncdGER`.
+
+All other files must be identical.

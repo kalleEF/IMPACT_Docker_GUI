@@ -18,7 +18,14 @@
 #
 #   /run/impact-test-probe        "absent" or "present": the marker at the start of this script
 #   /run/impact-test-probe-end    the time this script ended, in seconds with decimals
+#
+# WHAT IT NEVER TOUCHES
+#   Everything else: the marker itself, the home folder and every mount. It exists only in
+#   the "probe" variant of the test image and never in a model image.
 # =============================================================================
+# "rm -f" removes a file and is silent when it does not exist. "[ -e FILE ]" is true when
+# FILE exists. "echo TEXT > FILE" writes TEXT into FILE. "date +%s.%N" prints the time in
+# seconds since 1970, with nine decimals.
 rm -f /run/impact-test-probe-end
 if [ -e /run/impact-ready ]; then
     echo present > /run/impact-test-probe

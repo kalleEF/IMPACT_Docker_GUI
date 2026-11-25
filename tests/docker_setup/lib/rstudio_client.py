@@ -31,6 +31,10 @@ WHAT IT CHANGES
     Nothing by itself. The R file given to "run" does whatever it contains, as the user
     "rstudio", inside the RStudio session.
 
+WHAT IT NEVER TOUCHES
+    Files, accounts and settings of the container. It only talks to RStudio Server over
+    its web address, as a browser would, and keeps the password in memory only.
+
 EXIT CODE 2 means the script itself could not do its work (server not reachable,
 unexpected answer). The reason is printed.
 """

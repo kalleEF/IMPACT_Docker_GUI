@@ -80,6 +80,11 @@ In PowerShell:
 # add -Push to upload it to Docker Hub
 ```
 
+The image built this way is called `prerequisite.impactncdger:latest` on your computer. The
+model image is built on the name in the `FROM` line of `Dockerfile.IMPACTncdGER`
+(`kalleef/prerequisite.impactncdger:latest`), so a local test build needs that name as well
+(section 7 shows the whole test).
+
 ### 2.2 The model image
 
 - **Built from:** `Dockerfile.IMPACTncdGER`, with the whole repository folder as build
@@ -112,7 +117,9 @@ In PowerShell:
   Use the same command for a build by hand. `REPO_NAME` must be the name of the repository
   folder, because the GUI mounts the repository under `/home/rstudio/<that name>`.
   `docker_build_push.*` passes no `REPO_NAME`, so an image built with it uses the default
-  name written in the `ARG REPO_NAME` line of the Dockerfile.
+  name written in the `ARG REPO_NAME` line of the Dockerfile. The comment lines at the end
+  of `Dockerfile.IMPACTncdGER` give other build commands; they are out of date, so use the
+  command above.
 
 ## 3. What happens when a container starts
 
@@ -139,32 +146,65 @@ docker run
 
 1. **Ready marker.** It deletes `/run/impact-ready`, so a marker from an earlier start of the
    same container never counts.
-2. **User and group numbers.**
-   - Neither `IMPACT_UID` nor `IMPACT_GID` is set (LOCAL, and every GUI before 2.1): nothing
-     changes here.
-   - Both are set (REMOTE with GUI 2.1): the script checks that each is a whole number from
-     1000 to 60000, then changes the numbers of the user `rstudio` and of its group
-     `rstudio` in the account files `/etc/passwd` and `/etc/group`. It gives the new numbers
-     to the folder entry `/home/rstudio` itself (nothing inside it) and to a short fixed list
-     of small entries that belong to the image, with their content: `.bashrc .bash_logout
-     .profile .config .rstudio .local .cache .ssh .gitconfig .Rprofile .Renviron .Rhistory R`.
-     An entry that is a mount, that contains a mount or that is a symbolic link stays as it
-     is. The script never walks through a mount, so the repository, the results and the
-     storage folders keep every owner and every access right. It then removes Rocker's own variables `USERID` and `GROUPID`,
-     so Rocker makes no change of its own, and checks with `id rstudio` that the new numbers
-     are in place.
-   - Only one of the two is set, or a value is wrong: the container stops with a line that
-     starts with `ERROR` in its log (exit code 64). A user number that another account of
-     the image already has stops it with exit code 65; a failed change of the account files
-     with exit code 70. A group number that another group of the image already has is
-     accepted: both group names then stand for that number.
-3. **Repository folder.** The name comes from `/etc/environment` (written at build time),
+2. **Mounts.** It reads the list of mounts of the container and checks the home folder.
+   When `/home/rstudio` itself lies on a mount (a mount at `/home/rstudio` or at `/home`,
+   for example typed into the GUI's custom parameters), the script changes nothing in the
+   home folder at all, in any mode, and writes one `WARNING` line about it.
+3. **User and group numbers.**
+   - Neither `IMPACT_UID` nor `IMPACT_GID` is set (LOCAL, and every GUI before 2.1): the
+     numbers stay as they are, and Rocker's `USERID` and `GROUPID` reach Rocker unchanged.
+     When `USERID` differs from 1000 and mounts lie in the home folder, a `WARNING` line
+     names them: Rocker is about to change the owner of everything in them (section 3.2).
+     The entries of the home folder keep their owners as well, apart from `.rstudio` and
+     `.config` (step 5). A mount added below another entry, for example at
+     `.local/share/extra`, then leaves the folders that Docker creates for it (`.local`,
+     `.local/share`) to root. RStudio then cannot create its state folder
+     `.local/share/rstudio`, and its sessions can fail to start. A `WARNING` line names
+     such folders (`WARNING: these folders lead to a mount and do not belong to 'rstudio'
+     ...`); leave such mounts out in LOCAL.
+   - Both are set (REMOTE with GUI 2.1), in this order:
+     1. the script checks that each is a whole number from 1000 to 60000;
+     2. it changes the numbers of the user `rstudio` and of its group `rstudio` in the
+        account files `/etc/passwd` and `/etc/group`;
+     3. it checks with `id rstudio` that the new numbers are in place. When they are not,
+        the container stops here with exit code 70, before any owner has changed;
+     4. it gives the new numbers to the folder entry `/home/rstudio` itself (nothing inside
+        it) and to a short fixed list of small entries that belong to the image, with their
+        content: `.bashrc .bash_logout .profile .config .rstudio .local .cache .ssh
+        .gitconfig .Rprofile .Renviron .Rhistory R`. An entry that is a mount or a symbolic
+        link stays as it is, and so does a file with a second name elsewhere (a hard
+        link). In an entry with a mount inside it, everything except the mounts changes
+        owner. The script goes down only the folders that lead to a mount, one level at a
+        time, and stops at the mount itself. For a mount at `.local/share/extra`, that
+        gives `.local` and `.local/share` (Docker creates them for root, and RStudio keeps
+        its state there) to the new numbers; for a mount at `.config/extra`, also the
+        image's `.config/rstudio` with RStudio's preferences file, so RStudio can still
+        save its preferences. The log names the mounts in such an entry. The script never
+        walks through a mount, so the repository, the results and the storage folders
+        keep every owner and every access right;
+     5. it removes Rocker's own variables `USERID` and `GROUPID`, so Rocker makes no change
+        of its own.
+   - Only one of the two is set, or a value is wrong: the container stops with exit code
+     64. A user number that another account of the image already has stops it with exit
+     code 65; a failed change of the account files with exit code 70. The log then has a
+     line in which `ERROR:` follows the time stamp, for example
+     `[ENTRYPOINT] 2026-11-24 21:06:05 - ERROR: IMPACT_UID=12 is not valid. ...`. A group
+     number that another group of the image already has is accepted: both group names then
+     stand for that number.
+4. **Repository folder.** The name comes from `/etc/environment` (written at build time),
    else from `CONTAINER_REPO_NAME`, else the default `IMPACT-NCD-Germany_Base`.
-4. **RStudio settings.** It looks for the `.Rproj` file in the repository folder and writes
+5. **RStudio settings.** It looks for the `.Rproj` file in the repository folder and writes
    RStudio's settings so that RStudio opens that project and starts in the repository
-   folder. It writes nothing into a settings folder that is a mount or is reached through a
-   symbolic link.
-5. **Hand-over.** `exec /init` replaces the script with Rocker's start program.
+   folder. Then it gives `.rstudio` and `.config`, with their content, to the numbers
+   `rstudio` has at that moment, in every mode (the settings files were written by root).
+   It writes no settings file that is a mount, lies in a mount or is reached through a
+   symbolic link; a mount elsewhere in the same settings folder does not stop it. The
+   change of owner follows the rules of step 3.4.
+6. **`UMASK`.** When `UMASK` is set, Rocker adds a line to `/home/rstudio/.Rprofile` as
+   root. When that file is a symbolic link, a mount or a file with a second name (hard
+   link), or the home folder lies on a mount, the script removes `UMASK` and writes a
+   `WARNING` line, so nothing is written outside the container's own files.
+7. **Hand-over.** `exec /init` replaces the script with Rocker's start program.
 
 ### 3.2 The start-up scripts
 
@@ -184,10 +224,23 @@ once per start, as root, sorted by name. These scripts receive the variables of 
    at every start, as before.
 3. `git-identity` (from `git-identity.sh`) writes GitHub's three published host keys into
    `/etc/ssh/ssh_known_hosts` and `/home/rstudio/.ssh/known_hosts`, so SSH can check that it
-   talks to the real GitHub. No network is needed for this. It copies the person's private
-   key from `/keys/` into `/home/rstudio/.ssh/` with access mode 600, sets git's
-   `core.sshCommand` to the same SSH options the GUI uses, and sets the git user name and
-   e-mail address when none is set. It never writes into a mount.
+   talks to the real GitHub. No network is needed for this. At every start it drops every
+   other line for `github.com` from these files (also lines with capital letters, several
+   names, patterns or in coded form). It also stores the three keys under the name
+   `github.com-published` and writes `/etc/ssh/ssh_config.d/impact-github.conf`, which
+   makes SSH look up the key of `github.com` under that name (`HostKeyAlias`). The rule
+   applies to the name in any mix of capital and small letters (`GitHub.com`,
+   `GITHUB.COM`) and with a final dot (`github.com.`), so a remote address such as
+   `git@GitHub.com:owner/repo.git` is checked in the same way. Keys that another program
+   writes for `github.com`, for example the GUI's key scan, are therefore never used. The
+   log line `SSH uses the name github.com-published for the host key of github.com`
+   confirms that SSH follows the rule; a `WARNING` line appears when it does not. It copies the person's private key from `/keys/` into
+   `/home/rstudio/.ssh/` with access mode 600, sets git's `core.sshCommand` to the same SSH
+   options the GUI uses, and sets the git user name and e-mail address when none is set.
+   It never writes into a mount, and never writes or reads through a symbolic link: each
+   new file is written under a new, unused name and then renamed into place, and a link,
+   a folder or a file with a second name where it would write stays as it is, with an
+   `ERROR` line in the log.
 4. `zz-impact-ready` (from `impact-ready.sh`) writes the ready marker `/run/impact-ready`.
    The name starts with `zz`, so it sorts after all other scripts and runs last. A start-up
    script added later needs a name that sorts before it.
@@ -212,11 +265,20 @@ password and configures git inside the container.
   GUI sends the password straight into the password program of the container (`chpasswd`).
   The password is then stored only as a one-way code, and it appears neither in the
   container's settings nor in its log. A restart of the container (`docker restart`) runs
-  Rocker's start-up again and sets a new random password; the GUI then sets the password
-  again.
+  Rocker's start-up again and sets a new random password; set the password again with
+  "Set new password" in the GUI.
 - **LOCAL:** the GUI passes the password with `PASSWORD`, as in earlier versions.
-- In both modes the GUI then copies the SSH key and writes the same git settings as
-  `git-identity`, so the result is the same whichever of the two runs last.
+- In both modes the GUI then copies the SSH key, writes the same `core.sshCommand` as
+  `git-identity`, and rewrites `/home/rstudio/.ssh/known_hosts` with the keys its own key
+  scan of `github.com` receives. Nobody checks those keys. Whichever of the two runs
+  last, SSH accepts a server under the name `github.com` (in any spelling of section 3.2)
+  only with one of GitHub's published keys (`HostKeyAlias`, section 3.2). The tests run
+  the GUI's own command while a false `github.com` can be reached, and git refuses it
+  afterwards. The content of `known_hosts` differs with the order: after the GUI's step it
+  holds the scanned lines, which SSH no longer uses for `github.com`, and the next start
+  of the container replaces them with the published keys. Other names of GitHub's
+  servers, such as `ssh.github.com`, are outside this rule and are checked like any other
+  server. The image itself needs no key scan.
 
 ## 4. Environment variables the image understands
 
@@ -226,11 +288,11 @@ the same ones.
 | Variable | Read by | Meaning |
 |----------|---------|---------|
 | `IMPACT_UID` | `entrypoint.sh` | The user number for `rstudio`, normally the number of the person's account on the workstation. Whole number from 1000 to 60000. Give it together with `IMPACT_GID`, or leave out both. |
-| `IMPACT_GID` | `entrypoint.sh` | The group number for `rstudio`, normally the number of the shared group that owns the storage folders. Same rules. |
-| `USERID`, `GROUPID` | Rocker (`02_userconf`) | Rocker's own way to set the numbers. It changes the owner of everything in `/home/rstudio`, mounted folders included, when `USERID` differs from 1000. Removed by `entrypoint.sh` when `IMPACT_UID` and `IMPACT_GID` are set. The GUI passes 1000 in LOCAL. |
+| `IMPACT_GID` | `entrypoint.sh` | The group number for `rstudio`, normally the number of the shared group that owns the storage folders. Same rules. New files get the access mode 644 (folders 755), because R sessions and the RStudio terminal run with the umask 022. Colleagues can change them only when the storage folder has a default access list (ACL) that gives the group write access; R's `file.copy()` keeps the access mode of the source file. Repair a folder without that list with `impact-share-folder --repair`. |
+| `USERID`, `GROUPID` | Rocker (`02_userconf`) | Rocker's own way to set the numbers. When `USERID` differs from 1000, Rocker deletes and recreates the user and changes the owner of everything in `/home/rstudio`, mounted folders included (special access bits such as setuid are lost). Removed by `entrypoint.sh` when `IMPACT_UID` and `IMPACT_GID` are set. Without them, they pass unchanged, and `entrypoint.sh` writes a `WARNING` that names the mounts concerned. The GUI passes 1000 in LOCAL, which changes nothing; GUI 2.0 passes the workstation account's numbers in REMOTE. |
 | `PASSWORD` | Rocker (`02_userconf`) | The RStudio password of `rstudio`. Without it Rocker sets a random password and prints it to the container log. |
 | `DISABLE_AUTH` | Rocker (`02_userconf`) | `true` switches off the RStudio sign-in. The GUI passes `false`. |
-| `ROOT`, `UMASK`, `TZ`, `LANG` | Rocker (`02_userconf`) | Administrator rights for `rstudio`, the default access mode of new files, the time zone and the language. The GUI passes none of them. |
+| `ROOT`, `UMASK`, `TZ`, `LANG` | Rocker (`02_userconf`) | Administrator rights for `rstudio`, the default access mode of new files, the time zone and the language. The GUI passes none of them. For `UMASK` other than 022, Rocker adds a line to `/home/rstudio/.Rprofile` as root; `entrypoint.sh` removes `UMASK` when that file cannot be written safely (section 3.1, step 6). |
 | `CONTAINER_REPO_NAME` | `entrypoint.sh` | The repository folder name below `/home/rstudio`. The value written into the image at build time takes precedence. |
 | `GIT_SSH_COMMAND` | git | The SSH command git uses. The GUI passes the same options as `git-identity.sh` writes. |
 | `SYNC_ENABLED`, `REPO_SYNC_PATH` | `entrypoint.sh` | Accepted and without effect. The repository is used where Docker mounts it. |
@@ -238,6 +300,10 @@ the same ones.
 Exit codes of `entrypoint.sh`: 64 (a missing or wrong value of `IMPACT_UID` or `IMPACT_GID`),
 65 (the user number belongs to another account of the image), 70 (the account files could not
 be changed, or the check afterwards failed). `docker logs <container>` shows the reason.
+A container started with `docker run --rm`, as the GUI starts its containers, is removed
+together with its log the moment `entrypoint.sh` ends. To read the reason, run the same start
+command again without `--rm`, then `docker logs <container>`, and remove the container
+afterwards with `docker rm <container>`.
 
 ## 5. `impact_model.json`
 
@@ -298,8 +364,20 @@ so the file has no effect there.
 
 ## 7. Updating the package lists
 
-All package changes go into the prerequisite image. After a change: build the prerequisite
-image (section 2.1), upload it, and rebuild the model images (GUI: "Rebuild image").
+All package changes go into the prerequisite image. Test a change on your computer before
+it is uploaded, because the model images of all colleagues are built on the uploaded image:
+
+1. Build the prerequisite image (section 2.1), without `--push`.
+2. Give it the name the model Dockerfile uses:
+   `docker tag prerequisite.impactncdger:latest kalleef/prerequisite.impactncdger:latest`.
+   This changes only the copy on your computer.
+3. Build the model image on top of it (section 2.2, or "Rebuild image" in the GUI in LOCAL)
+   and run the checks of section 8.
+4. Only then upload it: run the build of step 1 again with `--push` (PowerShell: `-Push`).
+   After the upload, colleagues rebuild their model images (GUI: "Rebuild image").
+
+To go back on your computer after a failed test, download the uploaded image again:
+`docker pull kalleef/prerequisite.impactncdger:latest`.
 
 **System packages (`apt-packages.txt`).** One package per line as `name=version`. Lines that
 start with `#` are comments. During the build, `install_packages.sh` installs each package in
@@ -333,18 +411,29 @@ package, add its name on a line of its own. `CKutils` comes from GitHub at the c
 Test every change on a branch, before it reaches the branch that colleagues use.
 
 **Automatic tests.** The repository of the IMPACT Docker GUI contains tests for this folder
-in `tests/docker_setup/`; run them in a clone of that repository. They build a small test image with the start-up scripts installed
-exactly as `Dockerfile.IMPACTncdGER` installs them, start real containers and check the user
-and group numbers, that no mounted file changes, the RStudio sign-in, the ready marker and
-git. They run on a Linux computer with Docker and bash, and need the internet on the first
-run. To test the `docker_setup` folder of a model repository:
+in `tests/docker_setup/`; run them in a clone of that repository. They build a small test
+image with the start-up scripts installed exactly as `Dockerfile.IMPACTncdGER` installs
+them, start real containers and check the user and group numbers, that no mounted file
+changes, the RStudio sign-in, the ready marker and git. They run on a Linux computer with
+Docker and bash, and need the internet on the first run. On a Windows PC that is WSL 2
+(the Linux part of Windows that Docker Desktop also uses) or the shared workstation; the
+GitHub Actions job of the GUI repository runs them as well, where it is installed. To test
+the `docker_setup` folder of a model repository:
 
 ```bash
 IMPACT_DOCKER_SETUP_DIR=/path/to/model-repository/docker_setup bash tests/docker_setup/run-tests.sh
 ```
 
-The tests use a stand-in for the model's prerequisite image and repository. They do not build
-the real model image.
+The tests leave files named `.env` (for example `docker_setup/.env` with a Docker Hub token)
+out of their test image. They use a stand-in for the model's prerequisite image and
+repository; they do not build the real model image. To run them on the real prerequisite
+image, download it and name it in `IMPACT_TEST_BASE_IMAGE`; the tests use that image as it
+is and never change it:
+
+```bash
+docker pull kalleef/prerequisite.impactncdger:latest
+IMPACT_TEST_BASE_IMAGE=kalleef/prerequisite.impactncdger:latest bash tests/docker_setup/run-tests.sh
+```
 
 **With the GUI in LOCAL.** On a PC with Docker Desktop:
 
@@ -361,18 +450,25 @@ the real model image.
 4. In RStudio: the project of the repository is open; in its terminal, `git pull` works;
    a model run writes its results into the output folder.
 
-**By hand on Linux, REMOTE style** (numbers as on the workstation, password set afterwards):
+**By hand on Linux, REMOTE style** (numbers as on the workstation, password set afterwards).
+Choose a free port for `<port>`, for example 28787; on the workstation, port 8787 may belong
+to someone else's container:
 
 ```bash
 docker run -d --name setup-test -e IMPACT_UID=<your user number> -e IMPACT_GID=<shared group number> \
   --mount type=bind,source=<repository folder>,target=/home/rstudio/<repository folder name> \
-  -p 127.0.0.1:8787:8787 <image name>
+  -p 127.0.0.1:<port>:8787 <image name>
 docker logs setup-test                      # lines of entrypoint.sh and the start-up scripts
 docker exec setup-test id rstudio           # shows the two numbers
-docker exec setup-test cat /run/impact-ready    # repeat until it prints a line
+# wait for the ready marker: the loop asks every second and ends when the file exists
+until docker exec setup-test test -f /run/impact-ready; do sleep 1; done
 printf 'rstudio:%s\n' '<a test password>' | docker exec -i setup-test chpasswd
 ```
 
 Set the password only after the marker exists: Rocker's start-up sets its own random password
-before that. Then sign in at `http://localhost:8787` with `rstudio` and the test password,
-and remove the container with `docker rm -f setup-test`.
+before that, and `chpasswd` reports success also for a password that Rocker overwrites a
+moment later. Then sign in at `http://localhost:<port>` with `rstudio` and the test password,
+and remove the container with `docker rm -f setup-test`. On the workstation, the browser of
+your PC reaches that port through an SSH tunnel: `ssh -L <port>:localhost:<port>
+<your account>@<workstation>` in a terminal of the PC, then `http://localhost:<port>` in its
+browser.

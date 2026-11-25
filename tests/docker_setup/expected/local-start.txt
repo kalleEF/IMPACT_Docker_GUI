@@ -6,10 +6,10 @@
 #
 # Where the values come from: the lines marked "as before" are what the start-up
 # scripts of setup version 1 (the scripts in the model repositories before version 2.1)
-# produce for the same start. They were worked out by reading those scripts line by
-# line; the old scripts were never executed for this file. A LOCAL start with the
-# version 2 scripts must give the same owners and modes for these entries.
-# The line marked "new" exists from setup version 2 on.
+# produce for the same start. They were measured with an image built from those scripts
+# and started with the GUI's LOCAL arguments; the version 2 scripts give the same owners
+# and modes for these entries. The lines marked "changed" and "new" differ from
+# version 1, for the reason given next to them.
 
 # From the Rocker image (created together with the user rstudio): as before.
 /home/rstudio|d|1000:1000|750
@@ -29,9 +29,15 @@
 /home/rstudio/.rstudio/projects_settings/last-project-path|f|1000:1000|644
 /home/rstudio/.rstudio/projects_settings/project-settings|f|1000:1000|644
 
-# Written by git-identity.sh: the key copy and the git settings, as before.
+# Written by git-identity.sh: the key copy, as before.
 /home/rstudio/.ssh|d|1000:1000|700
 /home/rstudio/.ssh/id_ed25519_testuser|f|1000:1000|600
+
+# Changed in setup version 2: the git settings file has the mode 644 (version 1: 664).
+# The "umask" decides the access mode of new files. git-identity.sh runs git as rstudio
+# with "runuser", which keeps the umask 022 of the start-up; version 1 used "su -", whose
+# login set-up gives rstudio the umask 002. This file describes the start without the
+# GUI's own "docker exec" commands.
 /home/rstudio/.gitconfig|f|1000:1000|644
 
 # New in setup version 2: GitHub's host keys also in the user's own file, the one the

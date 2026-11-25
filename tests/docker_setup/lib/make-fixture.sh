@@ -21,6 +21,8 @@
 #   $2  user number of "the person" (the owner of the repository copy)
 #   $3  group number of the person
 #   $4  folder with the stand-in repository (tests/docker_setup/standin/repository)
+#   or, to fill only a home folder (used for a Docker volume):
+#   --home-only FOLDER REPOSITORY_NAME
 #
 # WHAT IT CREATES in $1
 #   repo/       the repository copy, with the folder "mixed" (see make_mixed_tree)
@@ -29,6 +31,9 @@
 #   storage/    mounted by the tests outside the home folder
 #   keys/       an SSH key pair made for this test run (never used anywhere else)
 #   settings/   folders and a file that one test mounts over RStudio's settings folders
+#   home/       a person's home folder, which one test mounts at /home/rstudio
+#   homes/      a folder with two home folders (rstudio/ and otherperson/), which one
+#               test mounts at /home
 #
 # WHAT IT NEVER TOUCHES
 #   Anything outside $1.
@@ -37,10 +42,19 @@
 # -e: stop at the first failing command; -u: stop when a variable was never set.
 set -eu
 
-ROOT="$1"
-PERSON_UID="$2"
-PERSON_GID="$3"
-STANDIN_REPO="$4"
+# "${1:-}" gives the first argument, or nothing when there is none. "[[ A == B ]]"
+# compares two texts.
+MODE=full
+if [[ "${1:-}" == "--home-only" ]]; then
+    MODE=home
+    ROOT="$2"
+    REPO_NAME="$3"
+else
+    ROOT="$1"
+    PERSON_UID="$2"
+    PERSON_GID="$3"
+    STANDIN_REPO="$4"
+fi
 
 # The three kinds of owner in the fixture:
 #   1000:1000   the number the image gives to "rstudio" when it is built
@@ -50,6 +64,8 @@ THIRD_UID=4242
 THIRD_GID=4343
 
 # put FILE OWNER MODE TEXT: creates a file with the given owner, access mode and content.
+# "NAME() { ... }" defines a function, used afterwards like a command; "$1" to "$4" are its
+# arguments. "printf '%s\n' TEXT > FILE" writes TEXT and a line break into FILE.
 put() {
     printf '%s\n' "$4" > "$1"
     chown "$2" "$1"
@@ -67,6 +83,7 @@ folder() {
 # in owner, group or access mode, so that any program that walks through the folder and
 # changes owners leaves a visible trace.
 make_mixed_tree() {
+    # "local" makes a variable that exists only inside the function.
     local d="$1"
     folder "$d" 0:0 755
 
@@ -76,6 +93,9 @@ make_mixed_tree() {
     put    "$d/owned-by-1000/file-600"   1000:1000 600 "owned by 1000, private"
     put    "$d/owned-by-1000/script-755" 1000:1000 755 "#!/bin/sh"
     put    "$d/owned-by-1000/group-of-third" 1000:$THIRD_GID 660 "owner 1000, group of the third account"
+    # The "setuid" bit (the 4 in 4755): the program runs with the rights of its owner.
+    # A change of owner clears it, so a re-owned file shows in the mode as well.
+    put    "$d/owned-by-1000/setuid-4755" 1000:1000 4755 "#!/bin/sh"
 
     # Owned by the third account.
     folder "$d/owned-by-third" $THIRD_UID:$THIRD_GID 750
@@ -83,6 +103,8 @@ make_mixed_tree() {
     put    "$d/owned-by-third/file-600" $THIRD_UID:$THIRD_GID 600 "a colleague's private file"
     put    "$d/owned-by-third/file-664" $THIRD_UID:$THIRD_GID 664 "a colleague's shared file"
     put    "$d/owned-by-third/group-1000" $THIRD_UID:1000 640 "owner third, group 1000"
+    # The "setgid" bit on a file (the 2 in 2755): the program runs with the rights of its group.
+    put    "$d/owned-by-third/setgid-2755" $THIRD_UID:$THIRD_GID 2755 "#!/bin/sh"
 
     # Owned by root.
     folder "$d/owned-by-root" 0:0 755
@@ -132,6 +154,32 @@ make_mixed_tree() {
     folder "$d/writable" 0:0 777
 }
 
+# make_home_tree DIR REPOSITORY_NAME: a home folder as a person's real home folder on a
+# computer looks: the settings folders the image also has, each with a mixed tree inside,
+# and settings files of the third account. The folder for the repository mount exists,
+# so that Docker creates nothing inside the mounted home folder.
+make_home_tree() {
+    local d="$1" entry
+    folder "$d" $THIRD_UID:$THIRD_GID 750
+    for entry in .config .local .cache .ssh .rstudio R; do
+        make_mixed_tree "$d/$entry"
+    done
+    put    "$d/.bashrc"    $THIRD_UID:$THIRD_GID 600 "export FROM_OUTSIDE=1"
+    put    "$d/.Rprofile"  $THIRD_UID:$THIRD_GID 600 "options(from_outside = TRUE)"
+    put    "$d/.gitconfig" $THIRD_UID:$THIRD_GID 600 "[user]
+	name = Name From Outside"
+    folder "$d/.config/rstudio" $THIRD_UID:$THIRD_GID 755
+    put    "$d/.config/rstudio/rstudio-prefs.json" $THIRD_UID:$THIRD_GID 600 '{ "note": "preferences from outside the container" }'
+    put    "$d/.ssh/known_hosts" $THIRD_UID:$THIRD_GID 600 "other.example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureKeyThatBelongsToNoServerAtAll0000000000"
+    folder "$d/$2" $THIRD_UID:$THIRD_GID 755
+}
+
+if [[ "$MODE" == home ]]; then
+    make_home_tree "$ROOT" "$REPO_NAME"
+    echo "home folder created in $ROOT"
+    exit 0
+fi
+
 # --- the repository copy -----------------------------------------------------------
 mkdir -p "$ROOT/repo"
 cp -r "$STANDIN_REPO/." "$ROOT/repo/"
@@ -171,5 +219,12 @@ folder "$ROOT/settings/local" $THIRD_UID:$THIRD_GID 755
 put    "$ROOT/settings/local/marker" $THIRD_UID:$THIRD_GID 644 "state from outside the container"
 put    "$ROOT/settings/gitconfig" $THIRD_UID:$THIRD_GID 644 "[user]
 	name = Name From Outside"
+
+# --- a mounted home folder, and a mounted /home -----------------------------------------
+# The repository folder name is the last part of the repository path in the tests.
+make_home_tree "$ROOT/home" IMPACT_Standin_Model
+folder "$ROOT/homes" 0:0 755
+make_home_tree "$ROOT/homes/rstudio" IMPACT_Standin_Model
+make_mixed_tree "$ROOT/homes/otherperson"
 
 echo "fixture created in $ROOT for the person $PERSON_UID:$PERSON_GID"

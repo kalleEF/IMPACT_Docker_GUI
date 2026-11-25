@@ -43,11 +43,24 @@
 #   IMPACT_TEST_PREFIX        first part of all image, container and network names
 #                             (default: impact-setup-test)
 #   IMPACT_TEST_PREREQ_IMAGE  name of the stand-in prerequisite image to use or build
+#                             (default: impact-setup-test-prereq:local). It must name an
+#                             image that only these tests use, never the prerequisite image
+#                             of a model: the script refuses to build or tag over an existing
+#                             image that it did not build itself (exit code 2).
+#   IMPACT_TEST_BASE_IMAGE    an existing image to build the test image on, used as it is,
+#                             for example the real prerequisite image of a model
+#                             (kalleef/prerequisite.impactncdger:latest) after "docker pull".
+#                             The script never builds, tags or changes that image. Without
+#                             this setting the test image is built on the stand-in. The
+#                             stand-in is built in both cases, because the helper containers
+#                             and the stand-in SSH server of the tests use it.
 #
 # WHAT IT CHANGES ON THE COMPUTER
-#   - Docker images named <prefix>*:local. They stay, so the next run is fast.
-#   - Containers and one network with the label impact.test=<prefix>. They are removed
-#     at the end (kept with --keep when a test failed).
+#   - Docker images named <prefix>*:local. They stay, so the next run is fast. Files named
+#     .env (private settings such as a Docker Hub token) in the docker_setup folder under
+#     test are not copied into the test image.
+#   - Containers, one network and Docker volumes with the label impact.test=<prefix>.
+#     They are removed at the end (kept with --keep when a test failed).
 #   - One work folder below IMPACT_TEST_TMP with the mounted test folders. It is removed
 #     at the end. Files in it belong to several user numbers; they are created and
 #     removed inside helper containers, so this script needs no root rights itself.
@@ -59,6 +72,61 @@
 # EXIT CODE
 #   0 when every test passed, 1 when at least one failed, 2 when the tests could not run
 #   (Docker missing, image build failed).
+#
+# SHELL CONSTRUCTS USED BELOW (for a reader new to bash; each is explained here once)
+#   Functions and arguments
+#     NAME() { ...; }     defines a function: a named group of commands, used afterwards
+#                         like a command. "local NAME" makes a variable that exists only
+#                         inside the function. "return 0" ends the function with success,
+#                         "return 1" (or any other number) with failure.
+#     "$1", "$2"          the first and second argument of the script or the function;
+#                         "$@" stands for all arguments, each kept as one word; "$#" is
+#                         their number; "shift" (or "shift 2") drops the first one (two).
+#     "$?"                the exit code of the command that ran last (0 means success).
+#   Text and commands
+#     "$(command)"        is replaced by what the command prints.
+#     "$((a + 1))"        is arithmetic: it is replaced by the result.
+#     "(( a < b ))"       compares whole numbers and succeeds when the comparison is true.
+#     "${NAME:-text}"     the value of NAME, or "text" when NAME is empty or not set.
+#     "${text#prefix}" and "${text%suffix}"   the text without that start or end;
+#                         "##" and "%%" remove the longest match, for example
+#                         "${path##*/}" is the name after the last slash and
+#                         "${pair%%:*}" the part before the first colon.
+#     $'\r'               a carriage return, the character Windows adds at line ends.
+#     printf 'FORMAT' A   prints A in the given format; '%s\n' is the text and a line break.
+#   Lists
+#     NAME=(a b c)        makes a list; "NAME+=(d)" adds an entry.
+#     "${NAME[@]}"        all entries, each kept as one word; "${NAME[*]}" all entries
+#                         joined into one text; "${#NAME[@]}" their number;
+#                         "${NAME[@]:0:6}" the first six entries.
+#   Tests and decisions
+#     [[ ... ]]           a test: "==" and "!=" compare texts (on the right side "*" matches
+#                         any text), "=~" compares with a pattern, "-f FILE" is true for a
+#                         file, "-n TEXT" for a text that is not empty, "-z TEXT" for an
+#                         empty one, "A -gt B" when the number A is greater than B.
+#     ! command           turns success into failure and back.
+#     a && b, a || b      run b only when a succeeded, or only when a failed. Inside
+#                         [[ ]] they mean "and" and "or". "|| true" makes a failure count
+#                         as success.
+#     case V in P) ...;; esac   runs the part after the first pattern P that matches V;
+#                         "|" separates several patterns, "*" matches anything.
+#     while ...; do ...; done   repeats while the condition succeeds; "break" leaves the
+#                         loop, "continue" goes on with its next round.
+#   Input and output
+#     a | b               passes what a prints to b.
+#     > FILE, >> FILE     write the output into FILE, or add it at the end.
+#     2>/dev/null         throws away the error messages; "> /dev/null 2>&1" throws away
+#                         the output and the error messages ("2>&1" sends error messages
+#                         where the output goes); ">&2" sends the output to the error channel.
+#     <<< "text"          feeds the text to a command as its input.
+#     < <(command)        feeds the output of a command to a loop or command as its input.
+#     IFS= read -r NAME   reads one line into NAME and keeps its spaces and backslashes.
+#     { a; b; }           groups commands, for example to send their output to one place.
+#     ( ... )             runs the commands in a copy of the shell (a "subshell"); a
+#                         variable set there is lost when the copy ends.
+#   Tools: grep finds lines ("-q" only reports whether it found any, "-F" takes the text as
+#     written, "-c" counts, "-v" keeps the other lines); sed and awk change or pick parts of
+#     lines; cut keeps fields; sort sorts; xargs runs a command with the words it reads.
 # =============================================================================
 
 # "set -u" stops the script when it reads a variable that was never set.
@@ -75,6 +143,7 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 SETUP_DIR="${IMPACT_DOCKER_SETUP_DIR:-$REPO_ROOT/docker_setup}"
 PREFIX="${IMPACT_TEST_PREFIX:-impact-setup-test}"
 IMG_PREREQ="${IMPACT_TEST_PREREQ_IMAGE:-impact-setup-test-prereq:local}"
+BASE_IMAGE="${IMPACT_TEST_BASE_IMAGE:-}"
 IMG="$PREFIX:local"
 IMG_CLASH="$PREFIX-clash:local"
 IMG_PROBE="$PREFIX-probe:local"
@@ -96,6 +165,50 @@ THIRD="4242:4343"    # the "third account" of the fixture (see lib/make-fixture.
 # current_version/IMPACT_Docker_GUI.psm1), for the test user "testuser".
 GUI_SSH_COMMAND="ssh -i /home/rstudio/.ssh/id_ed25519_testuser -o IdentitiesOnly=yes -o UserKnownHostsFile=/home/rstudio/.ssh/known_hosts -o StrictHostKeyChecking=accept-new"
 
+# expected_system_known_hosts: what git-identity.sh writes into /etc/ssh/ssh_known_hosts:
+# GitHub's three published keys under the name github.com, and the same three under the
+# name github.com-published, which SSH uses for github.com (HostKeyAlias). sed replaces
+# the first word of each line.
+expected_system_known_hosts() {
+    cat "$HERE/expected/github_known_hosts"
+    sed 's/^github\.com /github.com-published /' "$HERE/expected/github_known_hosts"
+}
+
+# gui_ssh_setup_command OWNER: prints the shell command that the GUI runs as root inside
+# the container after the start (function Get-ContainerSshSetupCommand of
+# current_version/IMPACT_Docker_GUI.psm1), for the test user "testuser" and the owner
+# OWNER ("UID:GID"). The command is read from the GUI code itself, so the tests follow a
+# change of the GUI:
+#   1. awk prints the lines between "$steps = @(" and the closing ")" of that function;
+#   2. grep drops comment lines, and sed keeps the text between the double quotes;
+#   3. sed puts in the values of the PowerShell variables ($sshDir and the others);
+#   4. awk joins the steps with " && ", as the function does.
+# When the GUI code is not next to these tests (a model repository), the copy below is
+# used: the command as the GUI version 2.1 writes it.
+GUI_MODULE="$REPO_ROOT/current_version/IMPACT_Docker_GUI.psm1"
+gui_ssh_setup_command() {
+    local owner="$1" steps=""
+    if [[ -f "$GUI_MODULE" ]]; then
+        steps="$(awk '/^function Get-ContainerSshSetupCommand/ {f = 1} f && /\$steps = @\(/ {s = 1; next} s && /^    \)/ {exit} s' "$GUI_MODULE" \
+                 | grep -v '^[[:space:]]*#' | sed -n 's/^[[:space:]]*"\(.*\)",\{0,1\}[[:space:]]*$/\1/p')"
+    fi
+    if [[ -z "$steps" ]]; then
+        steps="mkdir -p \$sshDir
+chmod 700 \$sshDir
+tr -d '\\r' < \$keySource > \$keyTarget
+chmod 600 \$keyTarget
+touch \$knownHost
+{ grep -v '^github.com ' \$knownHost 2>/dev/null; ssh-keyscan -T 10 -t ed25519,ecdsa,rsa github.com 2>/dev/null || true; } > \$knownHost.tmp
+mv \$knownHost.tmp \$knownHost
+chmod 644 \$knownHost
+chown -R \$owner \$sshDir
+echo KEY_FIXED"
+    fi
+    printf '%s\n' "$steps" | sed -e 's#\$sshDir#/home/rstudio/.ssh#g' -e 's#\$keySource#/keys/id_ed25519_testuser#g' \
+        -e 's#\$keyTarget#/home/rstudio/.ssh/id_ed25519_testuser#g' -e 's#\$knownHost#/home/rstudio/.ssh/known_hosts#g' \
+        -e "s#\\\$owner#$owner#g" | awk 'NR > 1 {printf " && "} {printf "%s", $0}'
+}
+
 # Extra options for "docker build". The text is split at spaces into a list.
 # shellcheck disable=SC2206
 BUILD_OPTS=(${IMPACT_TEST_BUILD_OPTS:-})
@@ -111,7 +224,10 @@ while [[ $# -gt 0 ]]; do
         --only) ONLY="${2:-}"; shift 2 ;;
         --keep) KEEP=1; shift ;;
         --list) LIST=1; shift ;;
-        -h|--help) sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        # --help prints the header of this file from its second line up to the list of
+        # shell constructs: sed prints (p) that range, the second sed drops the last line
+        # ($d) and the "# " at the start of each line.
+        -h|--help) sed -n '2,/^# SHELL CONSTRUCTS/p' "${BASH_SOURCE[0]}" | sed -e '$d' -e 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -208,7 +324,17 @@ record() {
     docker run --rm --network none --label "impact.test=$PREFIX" --entrypoint /bin/bash \
         -v "$WORK/$1:/fx:ro" -v "$HERE:/tests:ro" "$IMG_PREREQ" \
         /tests/lib/record-tree.sh repo /fx/repo outputs /fx/outputs synthpop /fx/synthpop \
-        storage /fx/storage keys /fx/keys settings /fx/settings > "$WORK/records/$1.$2"
+        storage /fx/storage keys /fx/keys settings /fx/settings home /fx/home homes /fx/homes \
+        > "$WORK/records/$1.$2"
+}
+
+# record_volume VOLUME LABEL: the same for a Docker volume, written to
+# $WORK/records/VOLUME.LABEL.
+record_volume() {
+    mkdir -p "$WORK/records"
+    docker run --rm --network none --label "impact.test=$PREFIX" --entrypoint /bin/bash \
+        -v "$1:/fx:ro" -v "$HERE:/tests:ro" "$IMG_PREREQ" \
+        /tests/lib/record-tree.sh volume /fx > "$WORK/records/$1.$2"
 }
 
 # expect_untouched NAME FIXTURE LABEL_BEFORE LABEL_AFTER: the central test. Passes when
@@ -281,6 +407,13 @@ wait_exit() {
 # in colour).
 logs() {
     docker logs "$(cname "$1")" 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
+}
+
+# last_start_log SHORT: the part of the log written by the latest start of the
+# container, from the last line "Container starting..." of entrypoint.sh on. awk keeps
+# the lines in "part" and starts again at every such line.
+last_start_log() {
+    logs "$1" | awk '/\[ENTRYPOINT\] .* - Container starting\.\.\./ {part = ""} {part = part $0 "\n"} END {printf "%s", part}'
 }
 
 # host_port SHORT: the port on this computer that leads to RStudio in the container.
@@ -428,9 +561,18 @@ group_build() {
     ok "the prerequisite Dockerfile names its Rocker image: $rocker_image"
 
     # The stand-in prerequisite image is reused when it was built for the same Rocker
-    # image. A label on the image remembers which one that was.
+    # image. A label on the image remembers which one that was. An image of that name
+    # without the label was not built by these tests (for example a model's real
+    # prerequisite image named by mistake in IMPACT_TEST_PREREQ_IMAGE): it is never
+    # replaced, and the tests stop.
     local have
     have="$(docker image inspect -f '{{index .Config.Labels "impact.test.rocker"}}' "$IMG_PREREQ" 2>/dev/null)"
+    if [[ -z "$have" ]] && docker image inspect "$IMG_PREREQ" > /dev/null 2>&1; then
+        bad "the stand-in prerequisite image can be built" \
+            "an image named $IMG_PREREQ exists and was not built by these tests (it has no label impact.test.rocker)." \
+            "It is left as it is. Name another image in IMPACT_TEST_PREREQ_IMAGE, or use IMPACT_TEST_BASE_IMAGE to test on an existing image."
+        return 2
+    fi
     if [[ "$have" != "$rocker_image" ]]; then
         echo "      building the stand-in prerequisite image $IMG_PREREQ from $rocker_image (needs the internet once) ..."
         if ! docker build "${BUILD_OPTS[@]}" --build-arg "ROCKER_IMAGE=$rocker_image" \
@@ -442,14 +584,40 @@ group_build() {
     fi
     ok "the stand-in prerequisite image is ready: $IMG_PREREQ"
 
+    # The image the test image is built on: the stand-in, or IMPACT_TEST_BASE_IMAGE as it is.
+    local base="$IMG_PREREQ"
+    if [[ -n "$BASE_IMAGE" ]]; then
+        if ! docker image inspect "$BASE_IMAGE" > /dev/null 2>&1; then
+            bad "the image named in IMPACT_TEST_BASE_IMAGE exists" "no image $BASE_IMAGE on this computer; download it first with: docker pull $BASE_IMAGE"
+            return 2
+        fi
+        base="$BASE_IMAGE"
+        ok "the test image is built on $BASE_IMAGE, used as it is"
+    fi
+
     # The build context of the test image: the stand-in repository with the docker_setup
     # folder under test inside it, as in a model repository.
     local context="$WORK/context"
     mkdir -p "$context/docker_setup"
     cp -r "$HERE/standin/repository/." "$context/"
     cp -r "$SETUP_DIR/." "$context/docker_setup/"
-    # The real Dockerfile with one change: its first FROM line names the stand-in image.
-    awk -v image="$IMG_PREREQ" '!done && /^FROM[ \t]/ {print "FROM " image; done = 1; next} {print}' \
+    # Files named .env hold private settings (for example a Docker Hub token); they never
+    # go into the test image, which stays on this computer. A stand-in .env is added to the
+    # copy, as a model repository often has one, so the test "no file named .env is in the
+    # test image" below has something to find. "find ... -delete" removes what it finds;
+    # it runs on the copy only.
+    printf 'DOCKERHUB_TOKEN=stand-in-value-of-the-tests\n' > "$context/docker_setup/.env"
+    find "$context/docker_setup" -name .env -type f -delete
+    # The .dockerignore of the repository root, as a model repository has it: the file
+    # next to the docker_setup folder under test, or else the reference text of it. The
+    # build then shows that the Dockerfile needs nothing the file leaves out.
+    if [[ -f "$SETUP_DIR/../.dockerignore" ]]; then
+        cp "$SETUP_DIR/../.dockerignore" "$context/.dockerignore"
+    elif [[ -f "$SETUP_DIR/dockerignore_for_repository_root" ]]; then
+        cp "$SETUP_DIR/dockerignore_for_repository_root" "$context/.dockerignore"
+    fi
+    # The real Dockerfile with one change: its first FROM line names the base image.
+    awk -v image="$base" '!done && /^FROM[ \t]/ {print "FROM " image; done = 1; next} {print}' \
         "$SETUP_DIR/Dockerfile.IMPACTncdGER" > "$WORK/Dockerfile.generated"
     if ! docker build "${BUILD_OPTS[@]}" -f "$WORK/Dockerfile.generated" --build-arg "REPO_NAME=$REPO_NAME" \
             -t "$IMG" "$context" > "$WORK/build-image.log" 2>&1; then
@@ -472,8 +640,16 @@ group_build() {
         target="${pair#*:}"       # the part after the colon
         sum_source="$(tr -d '\r' < "$SETUP_DIR/$source" | sha256sum | cut -d' ' -f1)"
         sum_target="$(docker run --rm --entrypoint /bin/bash "$IMG" -c "test -x $target && sha256sum < $target" | cut -d' ' -f1)"
-        expect_equal "$source is installed as $target and can be executed" "$sum_source" "$sum_target"
+        if [[ -z "$sum_target" ]]; then
+            bad "$source is installed as $target and can be executed" "$target is missing in the image or cannot be executed"
+        else
+            expect_equal "$source is installed as $target and can be executed" "$sum_source" "$sum_target"
+        fi
     done
+    # A .env file of the docker_setup folder is not in the image. "find / -xdev" stays on
+    # the image's own files.
+    expect_equal "no file named .env is in the test image" "" \
+        "$(docker run --rm --entrypoint /bin/bash "$IMG" -c "find /home/rstudio -xdev -name .env 2>/dev/null")"
 
     # The order of the start-up scripts. The init system sorts the names byte by byte;
     # "LC_ALL=C sort" sorts the same way.
@@ -749,6 +925,75 @@ group_rocker_env() {
         bad "the LOCAL container reaches the ready marker" "$(logs rockerenv2 | tail -n 20)"
     fi
     finish_case rockerenv2 rockerenv2
+
+    # USERID other than 1000 without the IMPACT variables (for example typed into the
+    # GUI's custom parameters): Rocker's start-up re-owns everything in the home folder,
+    # the mounts in it included. entrypoint.sh passes the variables on and warns, naming
+    # the mounts. The last test records what Rocker then does to a mounted file.
+    make_fixture userid 1000 1000
+    set_mounts userid
+    record userid before
+    start userid "$IMG" -e "PASSWORD=$LOCAL_PASSWORD" -e USERID=2000 -e GROUPID=2000 -e "CONTAINER_REPO_NAME=$REPO_NAME" \
+        "${COMMON_OPTS[@]}" "${GUI_MOUNTS[@]}" "${STORAGE_MOUNT[@]}"
+    if wait_ready userid 120; then
+        local log
+        log="$(logs userid)"
+        expect_contains "USERID=2000 without IMPACT_UID: the log warns that Rocker will re-own the mounts" "$log" \
+            "WARNING: USERID=2000 is set and IMPACT_UID is not. Rocker's start-up will now delete and recreate the user 'rstudio' and change the owner of everything in /home/rstudio to the user number 2000, also in these mounts:"
+        expect_contains "USERID=2000 without IMPACT_UID: the warning names the repository mount" "$log" " $REPO_IN_CONTAINER"
+        expect_contains "USERID=2000 without IMPACT_UID: Rocker did delete and recreate the user (its own log line)" "$log" "creating new rstudio with UID 2000"
+        expect_equal "USERID=2000 without IMPACT_UID: Rocker re-owned a colleague's file in the repository mount (documented behaviour of the base image)" "2000" \
+            "$(in_container userid stat -c %u "$REPO_IN_CONTAINER/mixed/owned-by-third/file-640")"
+        record userid after
+        # The storage lies outside the home folder: Rocker's walk does not reach it.
+        # "grep '^storage|'" keeps the lines of the storage tree.
+        expect_equal "USERID=2000 without IMPACT_UID: the storage outside the home folder is unchanged" \
+            "$(grep '^storage|' "$WORK/records/userid.before")" "$(grep '^storage|' "$WORK/records/userid.after")"
+    else
+        bad "USERID=2000 without IMPACT_UID: the container reaches the ready marker" "$(logs userid | tail -n 20)"
+    fi
+    finish_case userid userid
+    # The control: USERID=1000 with another GROUPID gives no warning.
+    make_fixture userid2 1000 1000
+    set_mounts userid2
+    start userid2 "$IMG" -e "PASSWORD=$LOCAL_PASSWORD" -e USERID=1000 -e "GROUPID=$SHARED_GID" -e "CONTAINER_REPO_NAME=$REPO_NAME" \
+        "${COMMON_OPTS[@]}" "${GUI_MOUNTS[@]}"
+    if wait_ready userid2 90; then
+        expect_lacks "USERID=1000 with GROUPID=$SHARED_GID: no warning about re-owning" "$(logs userid2)" "WARNING: USERID="
+    else
+        bad "USERID=1000 with GROUPID=$SHARED_GID: the container reaches the ready marker" "$(logs userid2 | tail -n 20)"
+    fi
+    finish_case userid2 userid2
+
+    # UMASK: Rocker adds "Sys.umask(mode=...)" to ~/.Rprofile as root. First a normal
+    # start, where it does so; then ~/.Rprofile is replaced by a link into the storage
+    # mount, and at the next start entrypoint.sh must remove UMASK, so nothing is
+    # written through the link.
+    make_fixture umask "$PERSON_UID" "$SHARED_GID"
+    set_mounts umask
+    remote_env "$PERSON_UID" "$SHARED_GID"
+    start umask "$IMG" "${ENV_OPTS[@]}" -e UMASK=0002 "${COMMON_OPTS[@]}" "${GUI_MOUNTS[@]}" "${STORAGE_MOUNT[@]}"
+    if wait_ready umask 90; then
+        expect_contains "UMASK=0002, plain .Rprofile: Rocker adds its line to ~/.Rprofile" \
+            "$(in_container umask cat /home/rstudio/.Rprofile 2>&1)" "Sys.umask(mode=0002)"
+        as_rstudio umask /bin/bash -c "rm -f /home/rstudio/.Rprofile && ln -s '$STORAGE_IN_CONTAINER/owned-by-third/file-664' /home/rstudio/.Rprofile"
+        docker stop -t 10 "$(cname umask)" > /dev/null
+        record umask before
+        docker start "$(cname umask)" > /dev/null
+        if wait_ready umask 90; then
+            record umask after
+            expect_untouched "UMASK=0002, .Rprofile a link into the storage: mounted trees unchanged" umask before after
+            expect_contains "UMASK=0002, .Rprofile a link: the log says UMASK is removed and why" "$(last_start_log umask)" \
+                "WARNING: UMASK=0002 is removed, because /home/rstudio/.Rprofile is a symbolic link"
+            expect_equal "UMASK=0002, .Rprofile a link: the Rocker start-up does not see UMASK" "" \
+                "$(in_container umask ls /var/run/s6/container_environment/UMASK 2>/dev/null)"
+        else
+            bad "UMASK=0002, .Rprofile a link: the container starts again" "$(logs umask | tail -n 20)"
+        fi
+    else
+        bad "UMASK=0002: the container reaches the ready marker" "$(logs umask | tail -n 20)"
+    fi
+    finish_case umask umask
 }
 
 # ---------------------------------------------------------------------------
@@ -801,6 +1046,11 @@ group_invalid() {
     # A user number that another account of the image has (variant image "clash": its
     # account "otheraccount" has the number 1777).
     invalid_case "IMPACT_UID=1777, the number of another account of the image" 65 "otheraccount" "$IMG_CLASH" -e IMPACT_UID=1777 -e "IMPACT_GID=$SHARED_GID"
+    # Account files that cannot be changed: /etc/passwd is a read-only mount of a copy of
+    # the image's own file, so the rename onto it fails.
+    docker run --rm --entrypoint /bin/cat "$IMG" /etc/passwd > "$WORK/passwd-copy"
+    invalid_case "/etc/passwd cannot be changed" 70 "/etc/passwd could not be changed" "$IMG" -e "IMPACT_UID=$PERSON_UID" -e "IMPACT_GID=$SHARED_GID" \
+        --mount "type=bind,source=$WORK/passwd-copy,target=/etc/passwd,readonly"
 
     record invalid after
     expect_untouched "mounted trees unchanged after all invalid starts: owner, group, mode and times" invalid before after
@@ -1009,13 +1259,14 @@ group_settings_mount() {
         expect_equal "settings folders as mounts: the mounted .gitconfig keeps its content" "Name From Outside" \
             "$(in_container setmount git config --file /home/rstudio/.gitconfig user.name 2>&1)"
         log="$(logs setmount)"
-        expect_contains "settings folders as mounts: the log names the skipped entry .config" "$log" "Owner of /home/rstudio/.config left unchanged: a mount is at or inside it"
-        expect_contains "settings folders as mounts: the log names the skipped entry .ssh" "$log" "Owner of /home/rstudio/.ssh left unchanged: a mount is at or inside it"
+        expect_contains "settings folders as mounts: the log says that everything in .config except the mount changed" "$log" "Owner of /home/rstudio/.config: mounts lie inside it (/home/rstudio/.config/rstudio). Everything else in /home/rstudio/.config was given to $PERSON_UID:$SHARED_GID; the mounts and their content were left as they are."
+        expect_equal "settings folders as mounts: the folder .config itself (on the way to the mount) belongs to $PERSON_UID:$SHARED_GID" "$PERSON_UID:$SHARED_GID" "$(owner_of setmount /home/rstudio/.config)"
+        expect_contains "settings folders as mounts: the log names the skipped entry .ssh" "$log" "Owner of /home/rstudio/.ssh left unchanged: it is a mount"
         expect_contains "settings folders as mounts: the log says the preferences file was not written" "$log" "Settings file /home/rstudio/.config/rstudio/rstudio-prefs.json not written"
         expect_contains "settings folders as mounts: git-identity says it writes nothing into .ssh" "$log" "/home/rstudio/.ssh is a mount"
         # GitHub's keys are still known through the system-wide file.
         expect_equal "settings folders as mounts: GitHub's keys are in the system-wide known hosts file" \
-            "$(cat "$HERE/expected/github_known_hosts")" "$(in_container setmount cat /etc/ssh/ssh_known_hosts 2>&1)"
+            "$(expected_system_known_hosts)" "$(in_container setmount cat /etc/ssh/ssh_known_hosts 2>&1)"
         # Entries of the image that hold no mount were still handed over.
         expect_equal "settings folders as mounts: .rstudio (no mount) belongs to $PERSON_UID:$SHARED_GID" "$PERSON_UID:$SHARED_GID" "$(owner_of setmount /home/rstudio/.rstudio)"
     else
@@ -1062,7 +1313,7 @@ group_symlink() {
         log="$(logs symlink)"
         expect_contains "symbolic links into mounts: the log names a skipped link" "$log" "Owner of /home/rstudio/.cache left unchanged: it is a symbolic link"
         expect_contains "symbolic links into mounts: the settings file behind a link was not written" "$log" "Settings file /home/rstudio/.config/rstudio/rstudio-prefs.json not written"
-        expect_contains "symbolic links into mounts: git-identity writes nothing through the .ssh link" "$log" "/home/rstudio/.ssh is a mount, has a mount inside it, or is reached through a symbolic link"
+        expect_contains "symbolic links into mounts: git-identity writes nothing through the .ssh link" "$log" "/home/rstudio/.ssh is a mount, has a mount inside it, lies on a mount, or is reached through a symbolic link: nothing is written there"
         expect_equal "symbolic links into mounts: the links themselves are still links" "6" \
             "$(in_container symlink /bin/bash -c 'cd /home/rstudio && for e in .config .rstudio .ssh .cache .gitconfig .local; do test -L $e && echo x; done | wc -l')"
     else
@@ -1235,6 +1486,42 @@ group_session() {
 # ---------------------------------------------------------------------------
 # Group "git": known hosts without network, and git against a stand-in SSH server
 # ---------------------------------------------------------------------------
+# The ways of writing GitHub's server name that SSH treats as github.com: capital letters
+# and a final dot. A remote address such as git@GitHub.com:owner/repo.git is valid, and the
+# check of the host key must not depend on how it is written.
+GITHUB_SPELLINGS=(github.com GitHub.com GITHUB.COM github.com.)
+
+# gui_refusal_checks WHEN: connections to the false github.com of the git tests, each of
+# which must be refused because the host key differs from GitHub's. For each spelling in
+# GITHUB_SPELLINGS: git with the GUI's GIT_SSH_COMMAND, and git with the script's
+# core.sshCommand alone ("env -u NAME" runs a command without the variable NAME). Then
+# plain ssh with github.com and GitHub.com.
+gui_refusal_checks() {
+    local when="$1" out code how host
+    for host in "${GITHUB_SPELLINGS[@]}"; do
+        for how in GIT_SSH_COMMAND core.sshCommand; do
+            case "$how" in
+                GIT_SSH_COMMAND) out="$(as_rstudio git git ls-remote "git@$host:standin/repo.git" 2>&1)"; code=$? ;;
+                core.sshCommand) out="$(as_rstudio git env -u GIT_SSH_COMMAND git ls-remote "git@$host:standin/repo.git" 2>&1)"; code=$? ;;
+            esac
+            if [[ "$code" != 0 && "$out" == *"Host key verification failed"* ]]; then
+                ok "$when: the false $host is refused (git, $how)"
+            else
+                bad "$when: the false $host is refused (git, $how)" "exit code $code" "$out"
+            fi
+        done
+    done
+    for host in github.com GitHub.com; do
+        out="$(as_rstudio git ssh -o BatchMode=yes -i /home/rstudio/.ssh/id_ed25519_testuser "git@$host" true 2>&1)"
+        code=$?
+        if [[ "$code" != 0 && "$out" == *"Host key verification failed"* ]]; then
+            ok "$when: the false $host is refused (plain ssh)"
+        else
+            bad "$when: the false $host is refused (plain ssh)" "exit code $code" "$out"
+        fi
+    done
+}
+
 group_git() {
     make_fixture git "$PERSON_UID" "$SHARED_GID"
     set_mounts git
@@ -1249,8 +1536,16 @@ group_git() {
     start nonet "$IMG" "${ENV_OPTS[@]}" --network none --workdir "$REPO_IN_CONTAINER" "${GUI_MOUNTS[@]}"
     if wait_ready nonet 90; then
         ok "no network: the container reaches the ready marker (after $((SECONDS - started)) s)"
-        expect_equal "no network: /etc/ssh/ssh_known_hosts holds exactly GitHub's three published keys" "$expected_keys" \
-            "$(in_container nonet cat /etc/ssh/ssh_known_hosts 2>&1)"
+        expect_equal "no network: /etc/ssh/ssh_known_hosts holds exactly GitHub's three published keys, under github.com and under github.com-published" \
+            "$(expected_system_known_hosts)" "$(in_container nonet cat /etc/ssh/ssh_known_hosts 2>&1)"
+        # "ssh -G host" prints the settings SSH would use, without connecting.
+        local spelling
+        for spelling in "${GITHUB_SPELLINGS[@]}"; do
+            expect_equal "no network: SSH looks up the host key of $spelling under the name github.com-published (HostKeyAlias)" \
+                "hostkeyalias github.com-published" "$(as_rstudio nonet ssh -G "$spelling" 2>&1 | grep -i '^hostkeyalias')"
+        done
+        expect_contains "no network: git-identity checked the spellings of github.com itself" "$(logs nonet)" \
+            "SSH uses the name github.com-published for the host key of github.com (checked for: github.com GitHub.com GITHUB.COM github.com.)"
         expect_equal "no network: /home/rstudio/.ssh/known_hosts holds exactly GitHub's three published keys" "$expected_keys" \
             "$(in_container nonet cat /home/rstudio/.ssh/known_hosts 2>&1)"
         # ssh-keygen -l prints the fingerprint of every key in a file; awk takes the
@@ -1274,10 +1569,11 @@ group_git() {
             "$(as_rstudio nonet git config --global user.name 2>&1) $(as_rstudio nonet git config --global user.email 2>&1)"
         expect_contains "no network: git-identity ended with exit code 0" "$(logs nonet)" "[cont-init.d] git-identity: exited 0."
 
-        # The GUI's own set-up (Get-ContainerSshSetupCommand and the git settings of the
-        # Start button), run after the script as in REMOTE. Without network its key scan
-        # finds nothing, and it removes the github.com lines from the user's file.
-        in_container nonet sh -c "mkdir -p /home/rstudio/.ssh && chmod 700 /home/rstudio/.ssh && tr -d '\r' < /keys/id_ed25519_testuser > /home/rstudio/.ssh/id_ed25519_testuser && chmod 600 /home/rstudio/.ssh/id_ed25519_testuser && touch /home/rstudio/.ssh/known_hosts && { grep -v '^github.com ' /home/rstudio/.ssh/known_hosts 2>/dev/null; ssh-keyscan -T 3 -t ed25519,ecdsa,rsa github.com 2>/dev/null || true; } > /home/rstudio/.ssh/known_hosts.tmp && mv /home/rstudio/.ssh/known_hosts.tmp /home/rstudio/.ssh/known_hosts && chmod 644 /home/rstudio/.ssh/known_hosts && chown -R $PERSON_UID:$SHARED_GID /home/rstudio/.ssh && echo KEY_FIXED" > "$WORK/gui-setup.log" 2>&1
+        # The GUI's own set-up (Get-ContainerSshSetupCommand, read from the GUI code, and
+        # the git settings of the Start button), run after the script as in REMOTE.
+        # Without network its key scan finds nothing, and it removes the github.com lines
+        # from the user's file.
+        in_container nonet sh -c "$(gui_ssh_setup_command "$PERSON_UID:$SHARED_GID")" > "$WORK/gui-setup.log" 2>&1
         as_rstudio nonet sh -c "git config --global user.name 'testuser' && git config --global user.email 'testuser@users.noreply.github.com' && git config --global core.sshCommand '$GUI_SSH_COMMAND' && echo GIT_CONFIGURED" >> "$WORK/gui-setup.log" 2>&1
         expect_contains "no network: the GUI's own key and git set-up runs after the script" "$(cat "$WORK/gui-setup.log")" "GIT_CONFIGURED"
         expect_equal "no network: after the GUI's set-up, core.sshCommand is unchanged" "$GUI_SSH_COMMAND" \
@@ -1365,6 +1661,10 @@ group_git() {
         else
             bad "stand-in server: plain ssh refuses the false github.com as well (system-wide known hosts file)" "exit code $code" "$out"
         fi
+        # The other spellings of the name, before the GUI's step. "github.com." with a
+        # final dot is a name SSH has never seen, so without the rule of git-identity.sh
+        # "accept-new" would accept any key for it.
+        gui_refusal_checks "stand-in server, before the GUI's set-up"
         expect_equal "stand-in server: the refused connections added no key for github.com" "$(cat "$HERE/expected/github_known_hosts")" \
             "$(in_container git grep '^github.com ' /home/rstudio/.ssh/known_hosts 2>&1)"
 
@@ -1390,6 +1690,55 @@ group_git() {
         # A clone and a push, as a person would do them from the RStudio terminal.
         out="$(as_rstudio git /bin/bash -c 'cd /tmp && rm -rf clone && git clone --quiet git@git.example.test:standin/repo.git clone && cd clone && git commit --quiet --allow-empty -m "from the test" && git push --quiet origin HEAD:main && git log --format=%an -1' 2>&1)"
         expect_equal "stand-in server: clone, commit and push work; the commit carries the git user name" "testuser" "$out"
+
+        # --- The GUI's set-up while the false github.com can be reached -----------------
+        # The GUI's command (read from the GUI code) scans github.com with ssh-keyscan and
+        # writes whatever key it receives into the user's known hosts file. Here the scan
+        # reaches the stand-in server. git must still refuse it, because SSH looks up the
+        # key of github.com under the name github.com-published, which only the script
+        # writes, with GitHub's published keys.
+        in_container git sh -c "$(gui_ssh_setup_command "$PERSON_UID:$SHARED_GID")" > "$WORK/gui-setup.log" 2>&1
+        expect_contains "GUI set-up with the false github.com reachable: the GUI's command runs" "$(cat "$WORK/gui-setup.log")" "KEY_FIXED"
+        # The scan really received the stand-in's keys: the user's file now holds github.com
+        # lines that are not GitHub's. "grep -v -x -F -f FILE" keeps the lines that are not
+        # in FILE.
+        expect_contains "GUI set-up with the false github.com reachable: the scan wrote keys that are not GitHub's into known_hosts" \
+            "$(in_container git /bin/bash -c "grep '^github.com ' /home/rstudio/.ssh/known_hosts | grep -c -v -x -F -f /etc/ssh/ssh_known_hosts") lines" "3 lines"
+        gui_refusal_checks "after the GUI's set-up"
+        # The other order: the script runs after the GUI (as at the next start).
+        in_container git /etc/cont-init.d/git-identity > "$WORK/second-run.log" 2>&1
+        gui_refusal_checks "after the script ran again"
+        expect_equal "after the script ran again: the github.com lines of known_hosts are GitHub's three published keys" "$expected_keys" \
+            "$(in_container git grep -i 'github' /home/rstudio/.ssh/known_hosts 2>&1)"
+
+        # --- Wrong github.com keys in the user's file -------------------------------------
+        # The script rebuilds the github.com part of known_hosts at every start: it drops
+        # every line SSH would use for github.com and adds the three published keys.
+        # Three hand-made states, each with the stand-in's key (a wrong key):
+        #   beside:  the three published keys plus a wrong one;
+        #   hashed:  the same wrong key in coded form ("ssh-keygen -H" writes it so);
+        #   capital: "GitHub.com" with the wrong key, and one published key missing.
+        local wrong state
+        wrong="$(in_container git ssh-keyscan -t ed25519 github.com 2>/dev/null)"
+        for state in beside hashed capital; do
+            case "$state" in
+                beside)  in_container git /bin/bash -c "cat /etc/ssh/ssh_known_hosts | grep '^github.com ' > /home/rstudio/.ssh/known_hosts && printf '%s\n' '$wrong' >> /home/rstudio/.ssh/known_hosts" ;;
+                hashed)  in_container git /bin/bash -c "printf '%s\n' '$wrong' > /tmp/wrong && ssh-keygen -q -H -f /tmp/wrong > /dev/null 2>&1; grep '^github.com ' /etc/ssh/ssh_known_hosts > /home/rstudio/.ssh/known_hosts && cat /tmp/wrong >> /home/rstudio/.ssh/known_hosts" ;;
+                capital) in_container git /bin/bash -c "grep '^github.com ' /etc/ssh/ssh_known_hosts | sed 1d > /home/rstudio/.ssh/known_hosts && printf '%s\n' '$wrong' | sed 's/^github.com/GitHub.com/' >> /home/rstudio/.ssh/known_hosts" ;;
+            esac
+            in_container git chown "$PERSON_UID:$SHARED_GID" /home/rstudio/.ssh/known_hosts
+            in_container git /etc/cont-init.d/git-identity > "$WORK/state-run.log" 2>&1
+            # ssh-keygen -F lists every line SSH finds for github.com, coded ones included.
+            expect_equal "wrong key ($state): after the script, SSH finds exactly GitHub's three keys for github.com in known_hosts" \
+                "$(LC_ALL=C sort "$HERE/expected/github_fingerprints")" \
+                "$(in_container git /bin/bash -c "ssh-keygen -F github.com -f /home/rstudio/.ssh/known_hosts | grep -v '^#' | ssh-keygen -l -f - | awk '{print \$2 \" \" \$NF}' | LC_ALL=C sort" 2>&1)"
+            out="$(as_rstudio git git ls-remote git@github.com:standin/repo.git 2>&1)"
+            if [[ $? != 0 && "$out" == *"REMOTE HOST IDENTIFICATION HAS CHANGED"* ]]; then
+                ok "wrong key ($state): git refuses the false github.com"
+            else
+                bad "wrong key ($state): git refuses the false github.com" "$out"
+            fi
+        done
     else
         bad "stand-in server: the container reaches the ready marker" "$(logs git | tail -n 20)"
     fi
@@ -1472,18 +1821,282 @@ group_local() {
 }
 
 # ---------------------------------------------------------------------------
+# Group "home-mount": the home folder itself, or /home, is a mount
+# ---------------------------------------------------------------------------
+# A colleague can add any "-v" or "--mount" option in the GUI's custom parameters, also
+# one for /home/rstudio or for /home. Every file there then belongs to the computer, and
+# the start-up must change nothing in it: no owner, no access mode, no file content.
+
+# home_mount_case ID TITLE MODE KIND
+#   MODE  remote (the variables of GUI 2.1 in REMOTE) or local (the GUI's LOCAL start)
+#   KIND  home:   a bind mount of a person's home folder at /home/rstudio
+#         homes:  a bind mount at /home, with the folders rstudio/ and otherperson/
+#         volume: a Docker volume at /home/rstudio that already holds files of other owners
+home_mount_case() {
+    local id="$1" title="$2" mode="$3" kind="$4"
+    local t="$id: $title:" want_uid=1000 want_gid=1000 vol="" extra=() where
+    make_fixture "$id" "$PERSON_UID" "$SHARED_GID"
+    set_mounts "$id"
+    case "$kind" in
+        home)   extra=(--mount "type=bind,source=$WORK/$id/home,target=/home/rstudio"); where="/home/rstudio" ;;
+        homes)  extra=(--mount "type=bind,source=$WORK/$id/homes,target=/home"); where="/home" ;;
+        volume)
+            # A new volume, filled by a helper container, as a volume that was used before.
+            vol="$PREFIX-$id-home"
+            docker volume rm -f "$vol" > /dev/null 2>&1
+            docker volume create --label "impact.test=$PREFIX" "$vol" > /dev/null
+            docker run --rm --network none --label "impact.test=$PREFIX" --entrypoint /bin/bash \
+                -v "$vol:/v" -v "$HERE:/tests:ro" "$IMG_PREREQ" /tests/lib/make-fixture.sh --home-only /v "$REPO_NAME" > /dev/null
+            extra=(--mount "type=volume,source=$vol,target=/home/rstudio"); where="/home/rstudio" ;;
+    esac
+    if [[ "$mode" == remote ]]; then
+        remote_env "$PERSON_UID" "$SHARED_GID"
+        want_uid="$PERSON_UID"; want_gid="$SHARED_GID"
+    else
+        local_env
+    fi
+    record "$id" before
+    [[ -n "$vol" ]] && record_volume "$vol" before
+
+    start "$id" "$IMG" "${ENV_OPTS[@]}" "${COMMON_OPTS[@]}" "${extra[@]}" "${GUI_MOUNTS[@]}" "${STORAGE_MOUNT[@]}"
+    if wait_ready "$id" 90; then
+        ok "$t the container reaches the ready marker"
+        wait_rstudio "$id" 60 > /dev/null
+        record "$id" after
+        expect_untouched "$t mounted trees unchanged, the mounted home folder included" "$id" before after
+        if [[ -n "$vol" ]]; then
+            record_volume "$vol" after
+            expect_untouched "$t the volume at /home/rstudio is unchanged" "$vol" before after
+        fi
+        local log
+        log="$(logs "$id")"
+        expect_contains "$t the log says that nothing in the home folder is changed" "$log" \
+            "WARNING: nothing in /home/rstudio is changed (no owner, no settings file): the home folder lies on the mount $where"
+        expect_contains "$t git-identity writes nothing into the mounted home folder" "$log" \
+            "/home/rstudio/.ssh is a mount, has a mount inside it, lies on a mount, or is reached through a symbolic link: nothing is written there"
+        expect_equal "$t 'id rstudio' shows $want_uid:$want_gid" "$want_uid:$want_gid" \
+            "$(in_container "$id" id -u rstudio):$(in_container "$id" id -g rstudio)"
+    else
+        bad "$t the container reaches the ready marker" "$(logs "$id" | tail -n 20)"
+    fi
+    finish_case "$id" "$id"
+    [[ -n "$vol" ]] && docker volume rm -f "$vol" > /dev/null 2>&1
+}
+
+group_home_mount() {
+    home_mount_case homer "a bind mount at /home/rstudio, REMOTE" remote home
+    home_mount_case homel "a bind mount at /home/rstudio, LOCAL" local home
+    home_mount_case homesr "a bind mount at /home, REMOTE" remote homes
+    home_mount_case homesl "a bind mount at /home, LOCAL" local homes
+    home_mount_case volr "a Docker volume at /home/rstudio, REMOTE" remote volume
+    home_mount_case voll "a Docker volume at /home/rstudio, LOCAL" local volume
+}
+
+# ---------------------------------------------------------------------------
+# Group "below-mount": mounts deep inside the settings folders of the image
+# ---------------------------------------------------------------------------
+# A colleague can add mounts below a settings folder in the GUI's custom parameters, for
+# example to keep RStudio's state. Four mounts at once:
+#   .local/share/extra     Docker creates the folders .local and .local/share for root.
+#                          RStudio keeps its session state in .local/share/rstudio.
+#   .config/extra          next to the image's folder .config/rstudio, which holds
+#                          RStudio's preferences file rstudio-prefs.json.
+#   .config/rstudio/extra  inside .config/rstudio, next to rstudio-prefs.json.
+#   .rstudio/projects_settings/last-project-path   a single mounted file at the place of
+#                          a settings file that entrypoint.sh writes.
+# In REMOTE, everything in .local, .config and .rstudio except the four mounts must
+# belong to rstudio afterwards, and nothing in the mounts may change: no owner, and no
+# content written into the mounted file. In LOCAL the script changes no owner in .local
+# and must say so in a WARNING.
+group_below_mount() {
+    make_fixture below "$PERSON_UID" "$SHARED_GID"
+    set_mounts below
+    remote_env "$PERSON_UID" "$SHARED_GID"
+    record below before
+    local s="$WORK/below/settings" t="mounts below .local, .config and .rstudio"
+    start below "$IMG" "${ENV_OPTS[@]}" "${COMMON_OPTS[@]}" "${GUI_MOUNTS[@]}" "${STORAGE_MOUNT[@]}" \
+        --mount "type=bind,source=$s/local,target=/home/rstudio/.local/share/extra" \
+        --mount "type=bind,source=$s/ssh,target=/home/rstudio/.config/extra" \
+        --mount "type=bind,source=$s/config-rstudio,target=/home/rstudio/.config/rstudio/extra" \
+        --mount "type=bind,source=$s/gitconfig,target=/home/rstudio/.rstudio/projects_settings/last-project-path"
+    if ! wait_ready below 90 || ! wait_rstudio below 60 > /dev/null; then
+        bad "$t: the container starts and RStudio answers" "$(logs below | tail -n 20)"
+        finish_case below below
+        return
+    fi
+    ok "$t: the container starts and RStudio answers"
+    record below after-start
+    expect_untouched "$t: mounted trees unchanged, the four mounts included" below before after-start
+    local path
+    for path in .local .local/share .config .config/rstudio .config/rstudio/rstudio-prefs.json \
+                .rstudio .rstudio/projects_settings .rstudio/projects_settings/project-settings; do
+        expect_equal "$t: ~/$path belongs to $PERSON_UID:$SHARED_GID" "$PERSON_UID:$SHARED_GID" "$(owner_of below "/home/rstudio/$path")"
+    done
+    for path in .local/share/extra .config/extra .config/rstudio/extra; do
+        expect_equal "$t: the mount point ~/$path keeps its owner" "$THIRD" "$(owner_of below "/home/rstudio/$path")"
+    done
+    local log
+    log="$(logs below)"
+    expect_contains "$t: the log names the mount in .local and what changed" "$log" \
+        "Owner of /home/rstudio/.local: mounts lie inside it (/home/rstudio/.local/share/extra). Everything else in /home/rstudio/.local was given to $PERSON_UID:$SHARED_GID; the mounts and their content were left as they are."
+    expect_contains "$t: the log names the mounts in .config" "$log" "Owner of /home/rstudio/.config: mounts lie inside it ("
+    expect_contains "$t: the settings file that is a mount was not written" "$log" \
+        "Settings file /home/rstudio/.rstudio/projects_settings/last-project-path not written"
+    # The preferences file lies next to the mounts, on the container's own files, so the
+    # start-up writes it as always: it names the repository folder.
+    expect_contains "$t: the start-up wrote RStudio's preferences file" "$(in_container below cat /home/rstudio/.config/rstudio/rstudio-prefs.json 2>&1)" \
+        "\"initial_working_directory\": \"$REPO_IN_CONTAINER\""
+    # rstudio can save its preferences: it can replace the file and create a new one.
+    expect_equal "$t: rstudio can save its RStudio preferences" "saved" \
+        "$(as_rstudio below /bin/bash -c 'cp ~/.config/rstudio/rstudio-prefs.json /tmp/prefs && cat /tmp/prefs > ~/.config/rstudio/rstudio-prefs.json && touch ~/.config/rstudio/new-file && echo saved' 2>&1)"
+
+    # An R session through RStudio Server: it needs .local/share/rstudio.
+    local name new_password out
+    name="$(cname below)"
+    docker exec "$name" mkdir -p /tmp/impact-test
+    docker cp "$HERE/lib/rstudio_client.py" "$name:/tmp/impact-test/rstudio_client.py" > /dev/null
+    new_password="Pw-$RANDOM-$RANDOM-$RANDOM-ok"
+    printf 'rstudio:%s\n' "$new_password" | docker exec -i "$name" chpasswd
+    out="$(run_in_session below "$new_password" "writeLines('made by the R session', '/tmp/impact-test/below.txt')")"
+    if [[ "$out" == *"SESSION-RAN-FILE"* ]]; then
+        ok "$t: an R session starts through RStudio Server and runs code"
+    else
+        bad "$t: an R session starts through RStudio Server and runs code" "$out"
+    fi
+    expect_equal "$t: RStudio's own state folder belongs to $PERSON_UID:$SHARED_GID" "$PERSON_UID:$SHARED_GID" \
+        "$(owner_of below /home/rstudio/.local/share/rstudio)"
+    # The session itself writes into the repository (RStudio's project state .Rproj.user),
+    # so only the entries that existed before are compared, without their times: cut keeps
+    # the fields tree, path, type, owner:group and mode, and "comm -23" prints the lines
+    # of the first list that the second list lacks.
+    record below after-session
+    expect_equal "$t: after the session, all earlier entries keep owner, group and mode" "" \
+        "$(LC_ALL=C comm -23 <(cut -d'|' -f1-5 "$WORK/records/below.before" | LC_ALL=C sort) <(cut -d'|' -f1-5 "$WORK/records/below.after-session" | LC_ALL=C sort) | head -n 10)"
+    finish_case below below
+
+    # LOCAL: the same mount below .local. Without IMPACT_UID and IMPACT_GID the script
+    # changes no owner in .local, and it says so.
+    t="a mount below .local, LOCAL"
+    make_fixture belowl 1000 1000
+    set_mounts belowl
+    local_env
+    record belowl before
+    start belowl "$IMG" "${ENV_OPTS[@]}" "${COMMON_OPTS[@]}" "${GUI_MOUNTS[@]}" \
+        --mount "type=bind,source=$WORK/belowl/settings/local,target=/home/rstudio/.local/share/extra"
+    if wait_ready belowl 90; then
+        ok "$t: the container reaches the ready marker"
+        record belowl after
+        expect_untouched "$t: mounted trees unchanged" belowl before after
+        expect_contains "$t: a WARNING names the folders on the way to the mount that belong to root" "$(logs belowl)" \
+            "WARNING: these folders lead to a mount and do not belong to 'rstudio' (user number 1000): /home/rstudio/.local /home/rstudio/.local/share."
+        expect_equal "$t: .local keeps its owner (the script changes nothing there in LOCAL)" "0:0" "$(owner_of belowl /home/rstudio/.local)"
+    else
+        bad "$t: the container reaches the ready marker" "$(logs belowl | tail -n 20)"
+    fi
+    finish_case belowl belowl
+}
+
+# ---------------------------------------------------------------------------
+# Group "ssh-safety": links and odd entries inside ~/.ssh
+# ---------------------------------------------------------------------------
+# The user rstudio owns /home/rstudio/.ssh and can put symbolic links there, for example
+# under the names of files git-identity.sh writes as root. At the next start of the same
+# container ("docker restart") the script must write nothing through them and read
+# nothing through them.
+group_ssh_safety() {
+    make_fixture sshsafe "$PERSON_UID" "$SHARED_GID"
+    set_mounts sshsafe
+    remote_env "$PERSON_UID" "$SHARED_GID"
+    # The key folder is mounted as a whole, so the public key lies next to the private
+    # key and the script copies it too (a start by hand can do this; the GUI mounts one
+    # file). The other mounts are the GUI's, without its single key file.
+    local mounts=("${GUI_MOUNTS[@]:0:6}" --mount "type=bind,source=$WORK/sshsafe/keys,target=/keys,readonly")
+    start sshsafe "$IMG" "${ENV_OPTS[@]}" "${COMMON_OPTS[@]}" "${mounts[@]}" "${STORAGE_MOUNT[@]}"
+    if ! wait_ready sshsafe 90; then
+        bad "links in .ssh: the first start reaches the ready marker" "$(logs sshsafe | tail -n 20)"
+        finish_case sshsafe sshsafe
+        return
+    fi
+    local s="$STORAGE_IN_CONTAINER" name log
+    name="$(cname sshsafe)"
+    # As rstudio, links to files of other owners in the storage mount:
+    #   known_hosts.impact-new, id_ed25519_testuser.impact-new   fixed names a script
+    #                        could use for its new files;
+    #   id_ed25519_testuser.pub   the name of the public key copy;
+    #   known_hosts          the user's known hosts file itself.
+    as_rstudio sshsafe /bin/bash -c "cd /home/rstudio/.ssh && rm -f known_hosts id_ed25519_testuser.pub &&
+        ln -s '$s/owned-by-third/file-640' known_hosts.impact-new &&
+        ln -s '$s/owned-by-third/file-600' id_ed25519_testuser.impact-new &&
+        ln -s '$s/owned-by-root/file-600' id_ed25519_testuser.pub &&
+        ln -s '$s/owned-by-root/file-644' known_hosts"
+    docker stop -t 10 "$name" > /dev/null
+    record sshsafe before
+    docker start "$name" > /dev/null
+    if wait_ready sshsafe 90; then
+        ok "links in .ssh: the container starts again"
+        record sshsafe after
+        expect_untouched "links in .ssh: mounted trees unchanged (nothing written, re-owned or changed through a link)" sshsafe before after
+        log="$(last_start_log sshsafe)"
+        expect_contains "links in .ssh: the log refuses the link at known_hosts" "$log" \
+            "ERROR: /home/rstudio/.ssh/known_hosts is a symbolic link, a folder, a file with a second name, or another kind of entry; it is left as it is and nothing is read through it"
+        expect_equal "links in .ssh: the four links are still links" "4" \
+            "$(in_container sshsafe /bin/bash -c 'cd /home/rstudio/.ssh && for e in known_hosts known_hosts.impact-new id_ed25519_testuser.impact-new id_ed25519_testuser.pub; do test -L $e && echo x; done | wc -l')"
+        # Nothing of the files behind the links was copied into a file of rstudio.
+        # "grep -r" searches all files below a folder and does not follow links.
+        expect_equal "links in .ssh: no content of a linked file was copied into .ssh" "" \
+            "$(in_container sshsafe grep -r -l "root's" /home/rstudio/.ssh 2>&1)"
+        expect_equal "links in .ssh: the private key copy is a plain file of rstudio, mode 600" "f $PERSON_UID:$SHARED_GID 600" \
+            "$(in_container sshsafe stat -c '%F %u:%g %a' /home/rstudio/.ssh/id_ed25519_testuser 2>&1 | sed 's/^regular file/f/')"
+    else
+        bad "links in .ssh: the container starts again" "$(logs sshsafe | tail -n 20)"
+    fi
+
+    # known_hosts as a folder: refused with an ERROR line; nothing is put into the folder.
+    in_container sshsafe /bin/bash -c "rm -f /home/rstudio/.ssh/known_hosts && mkdir /home/rstudio/.ssh/known_hosts"
+    docker restart -t 10 "$name" > /dev/null
+    if wait_ready sshsafe 90; then
+        expect_contains "known_hosts is a folder: the log of this start has an ERROR line for it" "$(last_start_log sshsafe)" \
+            "ERROR: /home/rstudio/.ssh/known_hosts is a symbolic link, a folder"
+        expect_equal "known_hosts is a folder: nothing was put into the folder" "" \
+            "$(in_container sshsafe ls -A /home/rstudio/.ssh/known_hosts 2>&1)"
+    else
+        bad "known_hosts is a folder: the container starts again" "$(logs sshsafe | tail -n 20)"
+    fi
+    finish_case sshsafe sshsafe
+
+    # .ssh mounted: no key copy, and the git user name still comes from the key file name.
+    make_fixture sshmount "$PERSON_UID" "$SHARED_GID"
+    set_mounts sshmount
+    record sshmount before
+    start sshmount "$IMG" "${ENV_OPTS[@]}" "${COMMON_OPTS[@]}" "${GUI_MOUNTS[@]}" \
+        --mount "type=bind,source=$WORK/sshmount/settings/ssh,target=/home/rstudio/.ssh"
+    if wait_ready sshmount 90; then
+        record sshmount after
+        expect_untouched ".ssh mounted: mounted trees unchanged" sshmount before after
+        expect_equal ".ssh mounted: the git user name comes from the name of the mounted key file" "testuser testuser@users.noreply.github.com" \
+            "$(as_rstudio sshmount git config --global user.name 2>&1) $(as_rstudio sshmount git config --global user.email 2>&1)"
+    else
+        bad ".ssh mounted: the container reaches the ready marker" "$(logs sshmount | tail -n 20)"
+    fi
+    finish_case sshmount sshmount
+}
+
+# ---------------------------------------------------------------------------
 # The list of groups: name, function, what it covers
 # ---------------------------------------------------------------------------
 GROUPS_LIST=(
     "static|group_static|checks of the script text (forbidden commands, GitHub's keys)"
     "valid|group_valid|six valid starts, each with the full fixture comparison"
-    "rocker-env|group_rocker_env|what the Rocker start-up sees of USERID and GROUPID"
+    "rocker-env|group_rocker_env|what the Rocker start-up sees of USERID, GROUPID and UMASK"
     "invalid|group_invalid|invalid values must end the container"
     "restart|group_restart|stop and start of the same container; order of the ready marker"
     "failing-script|group_failing_script|the marker appears also when a start-up script failed"
     "readonly|group_readonly|all folders mounted read-only"
     "settings-mount|group_settings_mount|RStudio's settings folders are mounts themselves"
+    "home-mount|group_home_mount|the home folder itself, or /home, is a mount (REMOTE and LOCAL)"
+    "below-mount|group_below_mount|mounts deep inside .local and .config; R session and preferences still work"
     "symlink|group_symlink|symbolic links in the home folder that point into a mount"
+    "ssh-safety|group_ssh_safety|links and a folder in .ssh where the script writes; .ssh mounted"
     "session|group_session|password, RStudio sign-in, R session, R library"
     "git|group_git|known hosts without network; git against a stand-in SSH server"
     "local|group_local|a LOCAL start compared with the stored expectation"
@@ -1531,6 +2144,7 @@ cleanup() {
     # only when there is something to remove.
     docker ps -aq --filter "label=impact.test=$PREFIX" | xargs -r docker rm -f > /dev/null 2>&1
     docker network ls -q --filter "label=impact.test=$PREFIX" | xargs -r docker network rm > /dev/null 2>&1
+    docker volume ls -q --filter "label=impact.test=$PREFIX" | xargs -r docker volume rm > /dev/null 2>&1
     # The work folder holds files of other user numbers; a helper container removes them.
     if docker image inspect "$IMG_PREREQ" > /dev/null 2>&1; then
         docker run --rm --network none --entrypoint /bin/bash -v "$WORK:/work" "$IMG_PREREQ" \
