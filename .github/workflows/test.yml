@@ -22,7 +22,9 @@ on:
       # The reference copy of the folder docker_setup that every model
       # repository carries, and its tests. The second line is already
       # covered by 'tests/**'. Both are listed because the job
-      # docker-setup-tests reacts to exactly these two folders.
+      # docker-setup-tests reacts to these two folders. It also reacts to
+      # current_version/IMPACT_Docker_GUI.psm1, which 'current_version/**'
+      # covers.
       - 'docker_setup/**'
       - 'tests/docker_setup/**'
       - '.github/workflows/test.yml'
@@ -87,7 +89,8 @@ permissions:
 #    Tiers 4 and 5  manual start with run_e2e ticked, and the weekly schedule.
 #    docker_setup   every push to main or dev-v2.1 and every pull request
 #                   into main or dev-v2.1 that changes a file below
-#                   docker_setup/ or tests/docker_setup/ (the job
+#                   docker_setup/ or tests/docker_setup/, or the GUI module
+#                   current_version/IMPACT_Docker_GUI.psm1 (the job
 #                   docker-setup-gate looks this up), every manual start, and
 #                   the weekly schedule.
 #
@@ -502,8 +505,11 @@ jobs:
   #  The folder docker_setup/ is the reference copy of the folder that every
   #  model repository carries (the Dockerfiles and the start-up scripts of
   #  the model images); tests/docker_setup/ holds its tests. These tests
-  #  take about 20 minutes, so a push or a pull request runs them only when
-  #  it changes a file below one of these two folders.
+  #  take about 27 minutes, so a push or a pull request runs them only
+  #  when it changes a file below one of these two folders, or the GUI module
+  #  current_version/IMPACT_Docker_GUI.psm1: the tests read the GUI's
+  #  in-container SSH set-up (Get-ContainerSshSetupCommand) from that file
+  #  and run it in their containers.
   #  A push starts this workflow when it changes any path of the list under
   #  "on: push", and a pull request starts it for any change. A job
   #  condition ("if:") cannot see which files changed. So this small job
@@ -561,16 +567,16 @@ jobs:
             # After a forced push, or for the first push of a branch, the old
             # commit is not available.
             echo "A commit to compare with is not available ($base, $head). To be safe, the docker_setup tests run."
-          # The "--" ends the options; the two folder names after it limit the
-          # comparison to these folders. "if x=$(command)" takes the branch
-          # when the command succeeded.
-          elif changed="$(git diff --name-only "$range" -- docker_setup/ tests/docker_setup/)"; then
+          # The "--" ends the options; the paths after it limit the comparison
+          # to the two folders and to the GUI module. "if x=$(command)" takes
+          # the branch when the command succeeded.
+          elif changed="$(git diff --name-only "$range" -- docker_setup/ tests/docker_setup/ current_version/IMPACT_Docker_GUI.psm1)"; then
             if [ -n "$changed" ]; then
-              echo "These files below docker_setup/ or tests/docker_setup/ changed, so the docker_setup tests run:"
+              echo "These files below docker_setup/ or tests/docker_setup/, or the GUI module, changed, so the docker_setup tests run:"
               echo "$changed"
             else
               run_docker_setup=false
-              echo "Nothing below docker_setup/ or tests/docker_setup/ changed: the docker_setup tests do not run."
+              echo "Nothing below docker_setup/ or tests/docker_setup/ changed, and the GUI module current_version/IMPACT_Docker_GUI.psm1 did not change: the docker_setup tests do not run."
             fi
           else
             echo "git diff failed. To be safe, the docker_setup tests run."
@@ -585,10 +591,10 @@ jobs:
   #  prerequisite image of the models (the Rocker image named in
   #  docker_setup/Dockerfile.prerequisite.IMPACTncdGER plus a few packages)
   #  and with a tiny stand-in repository. It starts containers with the
-  #  options the GUI uses and checks about 490 things: user and group
+  #  options the GUI uses and checks about 530 things: user and group
   #  numbers, that nothing in a mounted folder changes, the ready marker,
   #  the RStudio sign-in, R sessions, git against a stand-in SSH server, and
-  #  GitHub's host keys against the real github.com.
+  #  GitHub's host keys against the real github.com and ssh.github.com.
   #  Runs when the gate above says "true". Needs no token: the test key is
   #  made during the run, and against the real github.com the tests only
   #  check the host key.
@@ -633,12 +639,13 @@ jobs:
           IMPACT_TEST_TMP: ${{ runner.temp }}
         run: bash tests/docker_setup/run-tests.sh
 
-      # Twelve deliberate mistakes ("mutants") in entrypoint.sh and
+      # Fourteen deliberate mistakes ("mutants") in entrypoint.sh and
       # git-identity.sh, each of which would re-own other people's files or
-      # let git accept a false github.com. For each mutant the script runs
-      # the matching test groups and checks that the tests named for it fail.
-      # About 11 minutes. Runs only when every step above passed (the default
-      # for a step): on top of failing tests, a mutant run says nothing.
+      # let git accept a false GitHub server (github.com or ssh.github.com).
+      # For each mutant the script runs the matching test groups and checks
+      # that the tests named for it fail. About 18 minutes. Runs only
+      # when every step above passed (the default for a step): on top of
+      # failing tests, a mutant run says nothing.
       # It runs every time this job runs, on purpose:
       #   - It can only find something new when the scripts or the tests
       #     change, and exactly then this job runs. A check once a week would
@@ -649,9 +656,9 @@ jobs:
       #   - A mutant counts as caught when the tests named for it fail. A
       #     test that fails by chance elsewhere cannot make this step red.
       #   - This repository is public, so the minutes on GitHub's runners
-      #     cost nothing, and pushes that change these folders are rare.
+      #     cost nothing, and pushes that change these files are rare.
       - name: Check that the tests notice deliberate mistakes
-        timeout-minutes: 25
+        timeout-minutes: 30
         env:
           IMPACT_TEST_TMP: ${{ runner.temp }}
         run: bash tests/docker_setup/check-the-tests.sh

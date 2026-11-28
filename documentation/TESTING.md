@@ -77,7 +77,7 @@ together accept every possible call; see [Writing new tests](#writing-new-tests)
 | 4 | `tests/ImageValidation.Tests.ps1` | `ImageValidation` | Builds the real IMPACT image, starts it, checks RStudio, R packages, `global.R`, the production SSH setup, known_hosts, a strict host-key check, `GIT_SSH_COMMAND` in a clean R session (as RStudio starts them), and with a token GitHub auth and `git pull` | Ubuntu | Docker, internet |
 | 5 | `tests/RemoteE2E.Tests.ps1` | `RemoteE2E` | Full SSH to workstation to Docker flow (Docker-out-of-Docker): clone, build, start, RStudio, `global.R`, the production SSH setup and `GIT_SSH_COMMAND`, and with a token GitHub auth and `git pull` over SSH | Ubuntu | Docker, internet, Docker socket |
 | - | `tests/Preflight.Tests.ps1` | `Preflight` | Quick checks run by `Invoke-Tests.ps1` before suites 3 to 5; in CI only before ImageValidation and RemoteE2E: Docker reachable, git and GitHub reachable, `ssh-keygen` present, test keys usable, temp folder writable | Ubuntu | Docker, git, `ssh-keygen`, access to github.com |
-| - | `tests/docker_setup/run-tests.sh` and `tests/docker_setup/check-the-tests.sh` | none (bash scripts, not Pester) | The start-up scripts of the model images in `docker_setup/`, with real containers: user and group numbers, that nothing in a mounted folder changes, the ready marker, the RStudio sign-in, R sessions, git and GitHub's host keys; and a check that the tests notice twelve deliberate mistakes. See [docker_setup tests](#docker_setup-tests-bash-and-docker) | Ubuntu | A Linux computer with Docker and bash; internet on the first run |
+| - | `tests/docker_setup/run-tests.sh` and `tests/docker_setup/check-the-tests.sh` | none (bash scripts, not Pester) | The start-up scripts of the model images in `docker_setup/`, with real containers: user and group numbers, that nothing in a mounted folder changes, the ready marker, the RStudio sign-in, R sessions, git and GitHub's host keys; and a check that the tests notice fourteen deliberate mistakes. See [docker_setup tests](#docker_setup-tests-bash-and-docker) | Ubuntu | A Linux computer with Docker and bash; internet on the first run |
 
 The number of tests changes often; the runner prints the counts per suite.
 `Invoke-Tests.ps1` runs only the Pester suites; the docker_setup tests have their own
@@ -243,17 +243,19 @@ with the options the GUI uses and prints one line per test (`ok`, `FAIL` with th
 `skip` with the reason) and a summary.
 
 ```bash
-bash tests/docker_setup/run-tests.sh                  # all tests (about 7 minutes)
+bash tests/docker_setup/run-tests.sh                  # all tests (about 8 minutes)
 bash tests/docker_setup/run-tests.sh --list           # the names of the test groups
 bash tests/docker_setup/run-tests.sh --only session   # only the groups whose name matches
 bash tests/docker_setup/run-tests.sh --keep           # keep containers and files of failed tests
-bash tests/docker_setup/check-the-tests.sh            # the twelve deliberate mistakes (about 11 minutes)
+bash tests/docker_setup/check-the-tests.sh            # the fourteen deliberate mistakes (about 18 minutes)
 ```
 
 - The first run downloads the Rocker image (about 760 MB) and installs packages with
   `apt-get`, so it needs the internet once. The images stay (names starting with
-  `impact-setup-test`), so later runs are faster and need no network. One test checks
-  GitHub's host key against the real github.com; without internet it is reported as `skip`.
+  `impact-setup-test`), so later runs are faster and need no network. Eight tests check
+  GitHub's host keys against the real servers, github.com on port 22 and ssh.github.com on
+  port 443, each with the key type SSH chooses and once for each published key type;
+  without internet they are reported as `skip`.
 - Three tests of the group `git` report a known gap of the GUI as `skip`, for as long as
   the GUI's in-container set-up (`Get-ContainerSshSetupCommand`) scans GitHub's host keys
   without a check: after that scan, a person's own `HostKeyAlias github.com` in
@@ -267,7 +269,8 @@ bash tests/docker_setup/check-the-tests.sh            # the twelve deliberate mi
   or to the tests. `bash tests/docker_setup/check-the-tests.sh usermod` runs one mutant only.
 - The tests read the GUI's in-container SSH set-up (`Get-ContainerSshSetupCommand` and
   `Get-ContainerGitSshCommand` in `current_version/IMPACT_Docker_GUI.psm1`) and run it inside
-  the test containers. Run them also after a change to these two functions.
+  the test containers. Run them also after a change to these two functions; CI runs them
+  for every change of that file (see [CI](#ci-github-actions)).
 - Exit codes of `run-tests.sh`: 0 all tests passed, 1 at least one failed, 2 the tests could
   not run (Docker missing, an image could not be built). `check-the-tests.sh`: 0 every
   mutant was caught, 1 at least one was not, 2 a mutant could not be made (the line it
@@ -282,6 +285,7 @@ them):
 | `IMPACT_DOCKER_SETUP_DIR` | The `docker_setup` folder to test (default: `docker_setup/` of this repository), for example the folder of a model repository. |
 | `IMPACT_TEST_BASE_IMAGE` | An existing image to build the test image on, used as it is, for example the real prerequisite image of a model after `docker pull`. |
 | `IMPACT_TEST_BUILD_OPTS` | Extra options for `docker build`, for example `--network host`. |
+| `IMPACT_TEST_FAKE_GITHUB` | Only for a check of the tests themselves; leave it unset. `accepted` or `refused` runs the checks of the real GitHub once more against the stand-in SSH server of the group `git`: with `accepted` they must all pass, with `refused` they must all fail. |
 
 What the scripts change on the computer: Docker images named `impact-setup-test*:local`
 (they stay; `check-the-tests.sh` removes its own `impact-setup-mutant-*` images at the end),
@@ -318,7 +322,7 @@ never change the repository.
 4. If SSH/remote logic or the container SSH setup changed: `pwsh tests/Invoke-Tests.ps1 -Level DockerSsh`.
 5. If the image, the container start or `global.R` handling changed: `pwsh tests/Invoke-Tests.ps1 -Level RemoteE2E -GitHubToken ghp_xxx`.
 6. If `docker_setup/`, `tests/docker_setup/` or the in-container SSH set-up of the module changed: `bash tests/docker_setup/run-tests.sh`, then `bash tests/docker_setup/check-the-tests.sh` (see [docker_setup tests](#docker_setup-tests-bash-and-docker)).
-7. Push. CI runs Unit, Integration and DockerSsh, and the docker_setup tests when `docker_setup/` or `tests/docker_setup/` changed (see below); start the E2E jobs by hand when needed.
+7. Push. CI runs Unit, Integration and DockerSsh, and the docker_setup tests when `docker_setup/`, `tests/docker_setup/` or `current_version/IMPACT_Docker_GUI.psm1` changed (see below); start the E2E jobs by hand when needed.
 
 ---
 
@@ -328,7 +332,7 @@ Workflow: `.github/workflows/test.yml`.
 
 **Triggers:**
 
-- **Push** to `main` or `dev-v2.1`, but **only when** files under `current_version/`, `tests/`, `workstation/`, `docker_setup/` or the workflow file change (documentation-only pushes do not run CI): Unit, Integration, DockerSsh; and the docker_setup tests when the push changes a file below `docker_setup/` or `tests/docker_setup/`.
+- **Push** to `main` or `dev-v2.1`, but **only when** files under `current_version/`, `tests/`, `workstation/`, `docker_setup/` or the workflow file change (documentation-only pushes do not run CI): Unit, Integration, DockerSsh; and the docker_setup tests when the push changes a file below `docker_setup/` or `tests/docker_setup/`, or the module `current_version/IMPACT_Docker_GUI.psm1`.
 - **Pull request** into `main` or `dev-v2.1` (any change): the same jobs, with the same rule for the docker_setup tests.
 - **Manual run** (`workflow_dispatch`): Unit, Integration, DockerSsh and the docker_setup tests; ImageValidation and RemoteE2E only when **run_e2e** is ticked.
 - **Weekly** (Sunday 03:00 UTC): all five tiers and the docker_setup tests.
@@ -338,10 +342,9 @@ certain paths. A single job cannot see which files changed, so the small job
 `docker-setup-gate` compares the commits with git: for a push, the commit before
 the push with the newest one; for a pull request, its changes since it branched off. It
 tells `docker-setup-tests` to run when a file below `docker_setup/` or `tests/docker_setup/`
-changed, and whenever it cannot compare (for example after a forced push). A change of
-`current_version/IMPACT_Docker_GUI.psm1` alone does not start them, although the tests run
-the module's in-container SSH set-up; after such a change, start the workflow by hand or
-run the tests locally.
+changed, or the module `current_version/IMPACT_Docker_GUI.psm1` (the tests run the module's
+in-container SSH set-up), and whenever it cannot compare (for example after a forced push).
+A change of another file of `current_version/` alone does not start them.
 
 | Job | Runner | Runs on | What it does |
 |---|---|---|---|
@@ -351,7 +354,7 @@ run the tests locally.
 | `image-validation` | `ubuntu-latest` | manual with run_e2e, weekly; after `docker-ssh-tests` | Preflight, then builds the real image and validates the container. Before the build it copies the start-up files of `docker_setup/` of this repository over the cloned model repository (`IMPACT_E2E_DOCKER_SETUP_DIR`, see [Environment variables](#environment-variables)), so the real model image is built with the reference start-up scripts. 45 min timeout. |
 | `remote-e2e` | `ubuntu-latest` | manual with run_e2e, weekly; after `docker-ssh-tests` | Builds the workstation container (SSH port 2222), Preflight (the key path is set for the whole job, so Preflight checks it), then the full DooD flow. It builds the model repository with its own `docker_setup`. 60 min timeout. |
 | `docker-setup-gate` | `ubuntu-latest` | every run of the workflow | Decides with git whether `docker-setup-tests` runs (see above). |
-| `docker-setup-tests` | `ubuntu-latest` | when `docker-setup-gate` says so: push or pull request that changes `docker_setup/` or `tests/docker_setup/`, manual, weekly | Builds the test images (`run-tests.sh --only '^build$'`: only the build, which always comes first), runs all docker_setup tests, then `check-the-tests.sh`, and checks the reference `.dockerignore` with a real build. About 20 minutes once the images are downloaded; the first download and build add a few minutes. 60 min timeout. No token needed. |
+| `docker-setup-tests` | `ubuntu-latest` | when `docker-setup-gate` says so: push or pull request that changes `docker_setup/`, `tests/docker_setup/` or `current_version/IMPACT_Docker_GUI.psm1`, manual, weekly | Builds the test images (`run-tests.sh --only '^build$'`: only the build, which always comes first), runs all docker_setup tests, then `check-the-tests.sh`, and checks the reference `.dockerignore` with a real build. About 27 minutes once the images are downloaded; the first download and build add a few minutes. 60 min timeout. No token needed. |
 
 Failed jobs upload their result XML; the E2E jobs also upload container logs and `docker inspect` output. `docker-setup-tests` prints its results into the job log and uploads the full output of each mutant that was not caught.
 
@@ -361,7 +364,7 @@ runs; a check once a week would report a weakened test days after it was merged.
 to `entrypoint.sh` or `git-identity.sh` can also remove a line that a mutant changes, and
 the push that made the change should show that. A test that fails by chance cannot make
 this step red, because a mutant counts as caught when the tests named for it fail. The
-step adds about 11 minutes, and pushes that change these folders are rare.
+step adds about 18 minutes, and pushes that change these files are rare.
 
 **Re-run with debug logging:** when a job is re-run on GitHub with *Enable debug logging*, Pester 6 also prints the verbose and debug messages written inside the test files (`Write-Verbose`, `Write-Debug`, and the `VERBOSE:` lines of `Import-Module`), so the test log gets much longer. The test results stay the same. This is Pester's setting `Output.CIDebugOutput` (default `Auto`); `$config.Output.CIDebugOutput = 'None'` in a Pester step of the workflow switches it off.
 

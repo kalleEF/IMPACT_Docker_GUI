@@ -26,16 +26,17 @@ How the copies are kept in step:
    `bash tests/docker_setup/run-tests.sh`, then `bash tests/docker_setup/check-the-tests.sh`.
    GitHub runs both in the job `docker-setup-tests` of `.github/workflows/test.yml`: for
    every push to `main` or `dev-v2.1` and every pull request into one of them that changes
-   `docker_setup/` or `tests/docker_setup/`, at every manual start of the workflow, and
-   once a week. A change of the GUI code alone does not start them, although the tests run
-   the GUI's SSH set-up (`current_version/IMPACT_Docker_GUI.psm1`); after such a change,
-   run them by hand or start the workflow by hand.
+   `docker_setup/`, `tests/docker_setup/` or the GUI module
+   `current_version/IMPACT_Docker_GUI.psm1` (the tests run the GUI's in-container SSH
+   set-up from that file), at every manual start of the workflow, and once a week. A
+   change of another GUI file alone does not start them.
 2. Then the change goes into every model repository and every branch used with the GUI:
-   the changed files of this folder, except the two files above, and
-   `dockerignore_for_repository_root` as `.dockerignore` at the top of the repository. The
-   line `LABEL maintainer=...` of the model repository stays as it is there. A model
-   repository whose `Dockerfile.IMPACTncdGER` differs from this one gets the same change by
-   hand.
+   the changed files of this folder, except the two files above and `impact_model.json`
+   (each model keeps its own values there; `setup_version` is raised there by hand, see
+   point 4), and `dockerignore_for_repository_root` as `.dockerignore` at the top of the
+   repository. The line `LABEL maintainer=...` of the model repository stays as it is
+   there. A model repository whose `Dockerfile.IMPACTncdGER` differs from this one gets the
+   same change by hand.
 3. A change that was made in a model repository first is copied back here, and tested here.
 4. When a change alters what the GUI can expect from an image, raise `setup_version` in
    `impact_model.json` and the label `impact.setup_version` in `Dockerfile.IMPACTncdGER`

@@ -38,6 +38,8 @@ A Windows tool for building, starting and stopping **IMPACT NCD Germany** RStudi
 |---|---|
 | `current_version/` | The tool: `IMPACT.bat` (launcher), `Create-Shortcut.bat`, `IMPACT_Docker_GUI_v2.ps1` (GUI and workflow), `IMPACT_Docker_GUI.psm1` (module with the core functions), `IMPACT_Docker_GUI.psd1` (manifest), `IMPACT_icon.ico` |
 | `tests/` | Pester test suites (Unit, Integration, DockerSsh, ImageValidation, RemoteE2E, Preflight), the test runner `Invoke-Tests.ps1`, helpers and test container Dockerfiles |
+| `docker_setup/` | Reference copy of the folder `docker_setup` that every model repository carries: the Dockerfiles and the start-up scripts of the model images (see `docker_setup/REFERENCE.md` and `docker_setup/README.md`) |
+| `tests/docker_setup/` | Tests of `docker_setup/` with real containers (bash and Docker, no Pester): `run-tests.sh` and `check-the-tests.sh` |
 | `documentation/` | User guide, technical documentation, testing guide, known bugs |
 | `.github/workflows/test.yml` | GitHub Actions CI |
 | `.gitattributes` | Keeps the `.bat` files with Windows (CRLF) line endings |

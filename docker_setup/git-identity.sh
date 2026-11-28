@@ -35,8 +35,10 @@
 #
 # WHAT IT CHANGES
 #   /etc/ssh/ssh_known_hosts          GitHub's three host keys, for every user of the
-#                                     container, once under the name github.com and once
-#                                     under the name github.com-published (see below).
+#                                     container: under the name github.com, under the
+#                                     name github.com-published (see below), and under
+#                                     the names ssh.github.com and [ssh.github.com]:443
+#                                     (for the cases without the rule, see below).
 #   /etc/ssh/ssh_config.d/impact-github.conf
 #                                     tells every SSH connection to github.com or
 #                                     ssh.github.com (in any mix of capital and small
@@ -47,8 +49,9 @@
 #   /home/rstudio/.ssh/               created if missing, access mode 700, owner rstudio.
 #   /home/rstudio/.ssh/known_hosts    GitHub's three host keys. This is the file the
 #                                     IMPACT Docker GUI names in its own git settings.
-#                                     Lines that SSH would use for github.com and are not
-#                                     GitHub's published keys are removed from it.
+#                                     Every other line that SSH would use for github.com,
+#                                     github.com-published, ssh.github.com or
+#                                     [ssh.github.com]:443 is removed from it.
 #   /home/rstudio/.ssh/<key name>     a copy of the private key, access mode 600.
 #   /home/rstudio/.gitconfig          core.sshCommand, and user.name and user.email when
 #                                     they are missing.
@@ -85,28 +88,47 @@
 #   ssh://git@ssh.github.com:443/owner/repo.git, for GitHub's port 443 set-up in a
 #   person's ~/.ssh/config (github.com sent to ssh.github.com on port 443), and for a
 #   name of the person's own that such a file sends to ssh.github.com. With the usual
-#   settings (see the three cases below), whichever of the two runs last and
+#   settings (see the cases below), whichever of the two runs last and
 #   whatever the scan received, SSH then accepts a server under such a name only with one
 #   of GitHub's published keys; the tests show this for the GUI's own command, these
 #   spellings and these set-ups. The content of known_hosts itself differs with the
 #   order: after the GUI's step it holds the scanned lines, which SSH then does not use
 #   for these names.
-#   Three cases are outside this protection, because the GUI's scan runs after this
-#   script and writes into the person's known hosts file:
-#     - a person's ~/.ssh/config sets a HostKeyAlias of its own for github.com, for
-#       example "HostKeyAlias github.com". SSH reads that file before the system-wide
-#       settings and keeps the first value it finds, so it then uses the scanned lines.
-#       Do not set HostKeyAlias for github.com in ~/.ssh/config.
+#   SSH skips the rule in two set-ups, and then looks up the key under the name and port
+#   it connects to:
 #     - ssh is started with "-F FILE" (another settings file). SSH then reads no
-#       system-wide settings, and this rule with them, and the scanned lines count.
+#       system-wide settings, and the rule with them.
+#     - a person's ~/.ssh/config sets a HostKeyAlias of its own for one of GitHub's
+#       servers. SSH reads that file before the system-wide settings and keeps the first
+#       value it finds.
+#   For these set-ups the script also stores GitHub's published keys under the names
+#   ssh.github.com (port 22) and [ssh.github.com]:443 (port 443) in the system-wide file.
+#   The GUI's scan writes no line for these names, so a false ssh.github.com is refused
+#   under "-F" and with "HostKeyAlias ssh.github.com", before and after the GUI's step.
+#   These cases stay open (SSH accepts a false server):
+#     - github.com (also written GitHub.com) under "-F", and a person's own
+#       "HostKeyAlias github.com", after the GUI's step: the GUI's scan runs after this
+#       script and writes the keys it received under github.com into the person's known
+#       hosts file, and SSH then uses them. Before the GUI's step both are refused. Only
+#       a change of the GUI (no key scan) closes this.
+#     - under "-F", a name that is stored nowhere: a final dot (github.com.,
+#       ssh.github.com.) or github.com on port 443. SSH accepts such a server on first
+#       contact, and every new container makes a first contact.
+#     - a person's own HostKeyAlias with a name nobody stores (for example my-github):
+#       accepted on first contact at every start, with or without the GUI.
 #     - /home/rstudio/.ssh is a mount, for example a person's own .ssh folder. This
 #       script writes nothing there; the GUI's command replaces GitHub's keys in its
 #       known_hosts with the scanned ones and changes the owner of the folder, and an
 #       SSH outside the container that reads that file then trusts the scanned keys.
-#   Only a change of the GUI (no key scan) closes these cases.
-#   A remote address in numbers (an IP address) is outside the rule as well; the GUI's
-#   scan writes no line for it, and SSH handles it as any other server (see
-#   StrictHostKeyChecking below).
+#     - remotes outside the rule: an address in numbers (an IP address), a name of the
+#       person's own in /etc/hosts, and gist.github.com (GitHub's published keys name
+#       github.com only). SSH handles them as any other server (see
+#       StrictHostKeyChecking below).
+#   Do not set HostKeyAlias for GitHub's servers, do not start ssh with "-F", and do not
+#   mount a .ssh folder into the container. "StrictHostKeyChecking no" (in ~/.ssh/config
+#   or in a repository's own core.sshCommand) or a GlobalKnownHostsFile of the person's
+#   own switch the check off by the person's own choice; this script does not try to
+#   prevent that.
 #
 # WHEN GITHUB CHANGES A HOST KEY
 #   Replace the lines in GITHUB_HOST_KEYS with the ones GitHub publishes at
@@ -162,6 +184,11 @@ github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+V
 # The same three lines under the name github.com-published. "${text//old/new}" replaces
 # every "old" in text; "github.com " occurs only at the start of each line.
 GITHUB_ALIAS_KEYS="${GITHUB_HOST_KEYS//github.com /$GITHUB_ALIAS }"
+# The same three lines once more, under the two names that SSH looks up for ssh.github.com
+# when no rule of impact-github.conf applies (see "ssh -F" in the header): ssh.github.com
+# for port 22, and [ssh.github.com]:443 for port 443. A known hosts file writes a server
+# on a port other than 22 as "[name]:port". A comma separates several names on one line.
+SSH_GITHUB_KEYS="${GITHUB_HOST_KEYS//github.com /ssh.github.com,[ssh.github.com]:443 }"
 
 # What impact-github.conf says. SSH reads every file of /etc/ssh/ssh_config.d (the line
 # "Include /etc/ssh/ssh_config.d/*.conf" of /etc/ssh/ssh_config). A line "Match ..."
@@ -355,15 +382,17 @@ write_file() {
 
 # ensure_github_keys FILE OWNER WITH_ALIAS
 #   Rebuilds the part of FILE that is about GitHub, at every start:
-#     - every line that SSH would use for github.com or for github.com-published is
-#       dropped: also lines with capital letters (GitHub.com), with several names
-#       (other.example,github.com), with patterns (*.com), and lines stored in coded
-#       ("hashed") form. "ssh-keygen -F NAME -f FILE" lists exactly the lines SSH finds
-#       for NAME, each after a line "# Host NAME found: line N"; sed takes the numbers N.
-#       An awk filter on the names catches the same lines when ssh-keygen is missing;
+#     - every line that SSH would use for github.com, github.com-published,
+#       ssh.github.com or [ssh.github.com]:443 is dropped: also lines with capital letters
+#       (GitHub.com), with several names (other.example,github.com), with patterns
+#       (*.com), and lines stored in coded ("hashed") form. "ssh-keygen -F NAME -f FILE"
+#       lists exactly the lines SSH finds for NAME, each after a line
+#       "# Host NAME found: line N"; sed takes the numbers N. An awk filter on the names
+#       catches the same lines when ssh-keygen is missing;
 #     - all other lines are kept as they are;
-#     - GitHub's three published keys are added (with WITH_ALIAS=1 also under the name
-#       github.com-published).
+#     - GitHub's three published keys are added under the name github.com (with
+#       WITH_ALIAS=1 also under the names github.com-published, ssh.github.com and
+#       [ssh.github.com]:443).
 #   FILE is replaced only when the result differs from it. FILE must be missing or a
 #   plain file; anything else is left as it is and the function fails. OWNER is
 #   "UID:GID" for a new FILE.
@@ -384,7 +413,9 @@ ensure_github_keys() {
         # "printf '%s\n' TEXT" prints TEXT followed by a line break. sed prints (p) the
         # line number from each line where the replacement (s) worked.
         drop="$( { printf '%s\n' "$old" | ssh-keygen -F github.com -f /dev/stdin 2>/dev/null
-                   printf '%s\n' "$old" | ssh-keygen -F "$GITHUB_ALIAS" -f /dev/stdin 2>/dev/null; } \
+                   printf '%s\n' "$old" | ssh-keygen -F "$GITHUB_ALIAS" -f /dev/stdin 2>/dev/null
+                   printf '%s\n' "$old" | ssh-keygen -F ssh.github.com -f /dev/stdin 2>/dev/null
+                   printf '%s\n' "$old" | ssh-keygen -F "[ssh.github.com]:443" -f /dev/stdin 2>/dev/null; } \
                  | sed -n 's/^# Host .* found: line \([0-9][0-9]*\).*/\1/p')"
     fi
     # awk: "drop" holds the line numbers, one per line; "split" turns them into a list.
@@ -397,12 +428,12 @@ ensure_github_keys() {
         {
             names = ($1 ~ /^@/) ? $2 : $1
             count = split(tolower(names), name, ",")
-            for (i = 1; i <= count; i++) if (name[i] == "github.com" || name[i] == alias) next
+            for (i = 1; i <= count; i++) if (name[i] == "github.com" || name[i] == alias || name[i] == "ssh.github.com" || name[i] == "[ssh.github.com]:443") next
             print
         }')"
     wanted="$GITHUB_HOST_KEYS"
     if [[ "$with_alias" == 1 ]]; then
-        wanted="$wanted"$'\n'"$GITHUB_ALIAS_KEYS"
+        wanted="$wanted"$'\n'"$GITHUB_ALIAS_KEYS"$'\n'"$SSH_GITHUB_KEYS"
     fi
     # "[[ -n TEXT ]]" is true when TEXT is not empty.
     if [[ -n "$kept" ]]; then

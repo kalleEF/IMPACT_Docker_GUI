@@ -44,12 +44,22 @@
 #                  and "HostName <address in numbers>" in ~/.ssh/config, git then accepts
 #                  a false server at that address.
 #     git-no-ssh-github   in git-identity.sh, ssh.github.com is left out of both parts
-#                  of the SSH rule. git then accepts a false server under the name
-#                  ssh.github.com, for example in ssh://git@ssh.github.com:443/...
+#                  of the SSH rule. SSH then checks ssh.github.com without the rule: git
+#                  accepts a false server under the name ssh.github.com. with a final
+#                  dot, a name that no known hosts file stores.
 #     git-host-no-ssh-github   in git-identity.sh, ssh.github.com is left out of the part
 #                  "Match host" only. With a name of the person's own in ~/.ssh/config
-#                  ("Host github-443" with "HostName ssh.github.com"), git then accepts
-#                  a false server that answers as ssh.github.com on port 443.
+#                  ("Host github-443" with "HostName ssh.github.com"), SSH then skips the
+#                  rule and looks up the host key under [ssh.github.com]:443.
+#     git-originalhost-no-ssh-github   in git-identity.sh, ssh.github.com is left out of
+#                  the part "Match originalhost" only. With "Host ssh.github.com" and
+#                  "HostName <address in numbers>" in ~/.ssh/config, git then accepts a
+#                  false server at that address.
+#     git-system-no-ssh-github   in git-identity.sh, GitHub's keys are not written under
+#                  the names ssh.github.com and [ssh.github.com]:443 into
+#                  /etc/ssh/ssh_known_hosts. With "ssh -F" (no rule of the image applies)
+#                  or a person's own "HostKeyAlias ssh.github.com", git then accepts a
+#                  false ssh.github.com on first contact.
 #
 #   Some checks of the scripts have a second barrier behind them (for example the device
 #   number test behind the mount list test for the home folder). Switching off one of
@@ -59,15 +69,15 @@
 #   caught" (they passed, so the tests have a gap).
 #
 # WHEN TO RUN IT
-#   After run-tests.sh, in the GitHub Actions job of these tests where that job is
-#   installed, and by hand after a change to run-tests.sh, lib/make-fixture.sh,
-#   lib/record-tree.sh, entrypoint.sh or git-identity.sh. It takes about 11 minutes for
-#   the twelve mutants on a computer with 4 processors, once run-tests.sh has run on this
+#   After run-tests.sh, in the job docker-setup-tests of .github/workflows/test.yml, and
+#   by hand after a change to run-tests.sh, lib/make-fixture.sh, lib/record-tree.sh,
+#   entrypoint.sh or git-identity.sh. It takes about 18 minutes for the
+#   fourteen mutants on a computer with 4 processors, once run-tests.sh has run on this
 #   computer: run-tests.sh builds the stand-in prerequisite image, which needs the
 #   internet once.
 #
 # HOW TO RUN IT
-#   bash tests/docker_setup/check-the-tests.sh              all twelve mutants
+#   bash tests/docker_setup/check-the-tests.sh              all fourteen mutants
 #   bash tests/docker_setup/check-the-tests.sh usermod      only the named mutant(s)
 #
 # WHAT IT CHANGES
@@ -104,7 +114,8 @@ TMP_BASE="${IMPACT_TEST_TMP:-${TMPDIR:-/tmp}}"
 # entries of the list NAME, each kept as one word. "[[ A -gt B ]]" is true when the whole
 # number A is greater than B.
 ALL_MUTANTS=(usermod chown-home to-rocker no-mount-check home-mount-check git-no-covering git-fixed-name
-             around-mounts-path-only git-host-pattern git-no-originalhost git-no-ssh-github git-host-no-ssh-github)
+             around-mounts-path-only git-host-pattern git-no-originalhost git-no-ssh-github git-host-no-ssh-github
+             git-originalhost-no-ssh-github git-system-no-ssh-github)
 if [[ $# -gt 0 ]]; then
     MUTANTS=("$@")
 else
@@ -258,6 +269,27 @@ make_mutant() {
                 { print }
                 END { exit !done }' "$file" > "$new" || return 1
             ;;
+        git-originalhost-no-ssh-github)
+            # The same in the line "Match originalhost ..." only.
+            awk '
+                /^Match originalhost github\.com,github\.com\.,ssh\.github\.com,ssh\.github\.com\.$/ { sub(/,ssh\.github\.com,ssh\.github\.com\.$/, ""); done = 1 }
+                { print }
+                END { exit !done }' "$file" > "$new" || return 1
+            ;;
+        git-system-no-ssh-github)
+            # In ensure_github_keys, the line that puts the system-wide file together loses
+            # its last part, the keys under ssh.github.com and [ssh.github.com]:443. The line
+            # contains single quotes, which cannot appear inside the awk program between
+            # single quotes. The option -v q="'" (a single quote between double quotes)
+            # hands one to awk as the variable q. In the pattern, "." stands for that
+            # quote, "\\n" for the two characters \n and "\$" for a dollar sign.
+            awk -v q="'" '
+                /^        wanted="\$wanted"\$.\\n."\$GITHUB_ALIAS_KEYS"\$.\\n."\$SSH_GITHUB_KEYS"$/ {
+                    print "        wanted=\"$wanted\"$" q "\\n" q "\"$GITHUB_ALIAS_KEYS\""; done = 1; next
+                }
+                { print }
+                END { exit !done }' "$file" > "$new" || return 1
+            ;;
         *)
             # "${NAME[*]}" joins the entries of a list into one text; ">&2" sends the line
             # to the error channel.
@@ -286,7 +318,7 @@ groups_for() {
         home-mount-check|git-no-covering) echo '^home-mount$' ;;
         git-fixed-name)                   echo '^ssh-safety$' ;;
         around-mounts-path-only)          echo '^below-mount$' ;;
-        git-host-pattern|git-no-originalhost|git-no-ssh-github|git-host-no-ssh-github) echo '^git$' ;;
+        git-*)                            echo '^git$' ;;
         *)                                echo '^valid$' ;;
     esac
 }
@@ -326,14 +358,25 @@ expected_failures() {
             ;;
         git-no-ssh-github)
             echo "[git] no network: SSH looks up the host key of ssh.github.com under the name github.com-published (HostKeyAlias)"
-            echo "[git] stand-in server, before the GUI's set-up: the false ssh.github.com is refused (git, GIT_SSH_COMMAND)"
-            echo "[git] stand-in server, before the GUI's set-up: the false ssh.github.com on port 443 is refused (plain ssh with accept-new)"
-            echo "[git] after the GUI's set-up: the false server of ssh://git@ssh.github.com:443/~/standin/repo.git is refused (git, core.sshCommand)"
+            echo "[git] stand-in server, before the GUI's set-up: the false ssh.github.com. is refused (git, GIT_SSH_COMMAND)"
+            echo "[git] after the GUI's set-up: the false ssh.github.com. is refused (git, core.sshCommand)"
+            echo "[git] key stored under github.com-published: git reaches ssh://git@ssh.github.com:443/~/standin/repo.git, strict checking"
             ;;
         git-host-no-ssh-github)
             echo "[git] stand-in server, before the GUI's set-up, ~/.ssh/config sends its own name github-443 to ssh.github.com port 443: SSH looks up the key under github.com-published"
-            echo "[git] stand-in server, before the GUI's set-up, port 443 set-up: the false github-443 is refused (git, GIT_SSH_COMMAND)"
-            echo "[git] after the script ran again, port 443 set-up: the false github-443 is refused (git, core.sshCommand)"
+            echo "[git] after the script ran again, ~/.ssh/config sends its own name github-443 to ssh.github.com port 443: SSH looks up the key under github.com-published"
+            echo "[git] key stored under github.com-published: git reaches git@github-443:standin/repo.git with a name of the person's own for ssh.github.com port 443 in ~/.ssh/config, strict checking"
+            ;;
+        git-originalhost-no-ssh-github)
+            echo "[git] stand-in server, before the GUI's set-up, ~/.ssh/config sends ssh.github.com to an address in numbers: SSH looks up the key under github.com-published"
+            echo "[git] stand-in server, before the GUI's set-up, address set-up for ssh.github.com: the false ssh.github.com is refused (git, GIT_SSH_COMMAND)"
+            echo "[git] after the GUI's set-up, address set-up for ssh.github.com: the false ssh.github.com is refused (git, core.sshCommand)"
+            ;;
+        git-system-no-ssh-github)
+            echo "[git] stand-in server, before the GUI's set-up, ssh -F /dev/null: the false server of git@ssh.github.com:standin/repo.git is refused (git, GIT_SSH_COMMAND plus -F)"
+            echo "[git] after the GUI's set-up, ssh -F /dev/null: the false server of ssh://git@ssh.github.com:443/~/standin/repo.git is refused (git, GIT_SSH_COMMAND plus -F)"
+            echo "[git] stand-in server, before the GUI's set-up, own HostKeyAlias ssh.github.com in ~/.ssh/config: the false server of git@ssh.github.com:standin/repo.git is refused (git, GIT_SSH_COMMAND)"
+            echo "[git] after the script ran again, own HostKeyAlias ssh.github.com in ~/.ssh/config: the false server of ssh://git@ssh.github.com:443/~/standin/repo.git is refused (git, core.sshCommand)"
             ;;
     esac
 }
