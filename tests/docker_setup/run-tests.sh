@@ -1499,29 +1499,71 @@ group_session() {
 # ---------------------------------------------------------------------------
 # Group "git": known hosts without network, and git against a stand-in SSH server
 # ---------------------------------------------------------------------------
-# The ways of writing GitHub's server name that SSH treats as github.com: capital letters
-# and a final dot. A remote address such as git@GitHub.com:owner/repo.git is valid, and the
-# check of the host key must not depend on how it is written.
-GITHUB_SPELLINGS=(github.com GitHub.com GITHUB.COM github.com.)
+# The ways of writing GitHub's server names that SSH must check against GitHub's
+# published keys: github.com, and ssh.github.com (the server GitHub documents for networks
+# that block the usual SSH port 22), with capital letters and with a final dot. A remote
+# address such as git@GitHub.com:owner/repo.git is valid, and the check of the host key
+# must not depend on how it is written.
+GITHUB_SPELLINGS=(github.com GitHub.com GITHUB.COM github.com. ssh.github.com SSH.GitHub.com ssh.github.com.)
+
+# Remote addresses in the form "ssh://" with port 443, as GitHub documents them for
+# networks that block port 22. "~/" in such an address is the home folder of the user on
+# the server, where the stand-in server keeps its repository.
+GITHUB_443_URLS=("ssh://git@github.com:443/~/standin/repo.git" "ssh://git@ssh.github.com:443/~/standin/repo.git"
+                 "ssh://git@SSH.GitHub.com:443/~/standin/repo.git")
+
+# git_is_refused NAME REMOTE HOW: runs "git ls-remote REMOTE" as rstudio in the container
+# of the git tests and passes when SSH refuses the server for its host key. HOW is
+# GIT_SSH_COMMAND (the GUI's variable is in force, as in the GUI's "docker exec") or
+# core.sshCommand (the script's setting alone: "env -u NAME" runs a command without the
+# variable NAME).
+git_is_refused() {
+    local name="$1" remote="$2" how="$3" out code
+    case "$how" in
+        GIT_SSH_COMMAND) out="$(as_rstudio git git ls-remote "$remote" 2>&1)"; code=$? ;;
+        core.sshCommand) out="$(as_rstudio git env -u GIT_SSH_COMMAND git ls-remote "$remote" 2>&1)"; code=$? ;;
+    esac
+    if [[ "$code" != 0 && "$out" == *"Host key verification failed"* ]]; then
+        ok "$name"
+    else
+        bad "$name" "exit code $code" "$out"
+    fi
+}
+
+# write_ssh_config TEXT: writes TEXT as the person's /home/rstudio/.ssh/config, owned by
+# rstudio and readable by rstudio only (SSH refuses a settings file that others can change).
+# printf turns each "\n" in TEXT into a line break.
+write_ssh_config() {
+    in_container git /bin/bash -c "printf '$1' > /home/rstudio/.ssh/config && chown $PERSON_UID:$SHARED_GID /home/rstudio/.ssh/config && chmod 600 /home/rstudio/.ssh/config"
+}
+
+# alias_of NAME: what "ssh -G NAME" says about the server it would connect to: the lines
+# hostkeyalias, hostname and port, sorted and joined with "|". "ssh -G" prints the
+# settings SSH would use, without connecting.
+alias_of() {
+    as_rstudio git ssh -G "$1" 2>&1 | grep -i -E '^(hostname|port|hostkeyalias) ' | LC_ALL=C sort | paste -s -d '|'
+}
 
 # gui_refusal_checks WHEN: connections to the false github.com of the git tests, each of
-# which must be refused because the host key differs from GitHub's. For each spelling in
-# GITHUB_SPELLINGS: git with the GUI's GIT_SSH_COMMAND, and git with the script's
-# core.sshCommand alone ("env -u NAME" runs a command without the variable NAME). Then
-# plain ssh with github.com and GitHub.com.
+# which must be refused because the host key differs from GitHub's. WHEN names the moment
+# in the test lines.
+#   - git with each spelling in GITHUB_SPELLINGS (git@<name>:standin/repo.git) and with
+#     each address in GITHUB_443_URLS, once with the GUI's GIT_SSH_COMMAND and once with
+#     the script's core.sshCommand alone;
+#   - plain ssh with github.com and GitHub.com ("BatchMode=yes": never ask a question);
+#   - plain ssh to ssh.github.com on port 22 and on port 443, with
+#     "StrictHostKeyChecking=accept-new", which accepts a server SSH has never seen: the
+#     rule must make SSH check this name against GitHub's published keys.
 gui_refusal_checks() {
-    local when="$1" out code how host
+    local when="$1" out code how host url port
     for host in "${GITHUB_SPELLINGS[@]}"; do
         for how in GIT_SSH_COMMAND core.sshCommand; do
-            case "$how" in
-                GIT_SSH_COMMAND) out="$(as_rstudio git git ls-remote "git@$host:standin/repo.git" 2>&1)"; code=$? ;;
-                core.sshCommand) out="$(as_rstudio git env -u GIT_SSH_COMMAND git ls-remote "git@$host:standin/repo.git" 2>&1)"; code=$? ;;
-            esac
-            if [[ "$code" != 0 && "$out" == *"Host key verification failed"* ]]; then
-                ok "$when: the false $host is refused (git, $how)"
-            else
-                bad "$when: the false $host is refused (git, $how)" "exit code $code" "$out"
-            fi
+            git_is_refused "$when: the false $host is refused (git, $how)" "git@$host:standin/repo.git" "$how"
+        done
+    done
+    for url in "${GITHUB_443_URLS[@]}"; do
+        for how in GIT_SSH_COMMAND core.sshCommand; do
+            git_is_refused "$when: the false server of $url is refused (git, $how)" "$url" "$how"
         done
     done
     for host in github.com GitHub.com; do
@@ -1533,44 +1575,103 @@ gui_refusal_checks() {
             bad "$when: the false $host is refused (plain ssh)" "exit code $code" "$out"
         fi
     done
+    for port in 22 443; do
+        out="$(as_rstudio git ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i /home/rstudio/.ssh/id_ed25519_testuser \
+            -p "$port" git@ssh.github.com true 2>&1)"
+        code=$?
+        if [[ "$code" != 0 && "$out" == *"Host key verification failed"* ]]; then
+            ok "$when: the false ssh.github.com on port $port is refused (plain ssh with accept-new)"
+        else
+            bad "$when: the false ssh.github.com on port $port is refused (plain ssh with accept-new)" "exit code $code" "$out"
+        fi
+    done
 }
 
-# port443_checks WHEN: GitHub documents a set-up for networks that block the usual SSH
-# port 22: in ~/.ssh/config, "Host github.com" with "HostName ssh.github.com" and
-# "Port 443". SSH then connects to ssh.github.com on port 443 whenever github.com is
-# typed. The stand-in server answers under that name and port as well, with its own host
+# ssh_config_checks WHEN: settings in a person's ~/.ssh/config that send a typed name to
+# another server ("HostName"). The stand-in answers under each of them with its own host
 # key, so git must still refuse it: SSH must look up the key under the name
-# github.com-published although the name it connects to is ssh.github.com. The
-# settings file is written for these checks only and removed afterwards. WHEN names the
-# moment in the test lines. A positive check shows first that the stand-in really
-# answers as ssh.github.com on port 443 (a name without any rule, which "accept-new" lets
-# through; the key goes into a separate file in /tmp, which is thrown away), so that a
-# refusal below comes from the host key check.
-port443_checks() {
-    local when="$1" out code host how
-    out="$(as_rstudio git ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/known_hosts_443 \
-        -i /home/rstudio/.ssh/id_ed25519_testuser -p 443 git@ssh.github.com echo reached-port-443 2>&1)"
+# github.com-published also when the typed name, or the name it connects to, is no name
+# of GitHub. Two settings files, written one after the other for these checks only and
+# removed afterwards:
+#   port 443: the set-up GitHub documents for networks that block the usual SSH port 22,
+#             "Host github.com" with "HostName ssh.github.com" and "Port 443", and the
+#             same two lines under a name of the person's own, "Host github-443";
+#   address:  "Host github.com" with "HostName" set to the address in numbers of the
+#             stand-in (STANDIN_IP), so the name SSH connects to is no name of GitHub.
+# Two positive checks show first that the stand-in really answers as ssh.github.com on
+# port 443 and at its address, so that a refusal below comes from the host key check.
+# For ssh.github.com, "-o HostKeyAlias=standin-check" on the command line (which comes
+# before every settings file) makes this one connection look up the key under a name
+# nobody stored, and "accept-new" lets it through; the address is outside every rule.
+# Their keys go into a separate file in /tmp, which is thrown away. WHEN names the moment
+# in the test lines.
+ssh_config_checks() {
+    local when="$1" out host how
+    out="$(as_rstudio git ssh -o BatchMode=yes -o HostKeyAlias=standin-check -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile=/tmp/known_hosts_check -i /home/rstudio/.ssh/id_ed25519_testuser -p 443 git@ssh.github.com echo reached-port-443 2>&1)"
     expect_contains "$when: the stand-in answers as ssh.github.com on port 443" "$out" "reached-port-443"
-    in_container git rm -f /tmp/known_hosts_443
-    in_container git /bin/bash -c "printf 'Host github.com\n    HostName ssh.github.com\n    Port 443\n' > /home/rstudio/.ssh/config && chown $PERSON_UID:$SHARED_GID /home/rstudio/.ssh/config && chmod 600 /home/rstudio/.ssh/config"
-    # "ssh -G" prints where SSH would connect and under which name it looks up the key.
+    out="$(as_rstudio git ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/known_hosts_check \
+        -i /home/rstudio/.ssh/id_ed25519_testuser "git@$STANDIN_IP" echo reached-address 2>&1)"
+    expect_contains "$when: the stand-in answers at its address in numbers (outside the rule, so accept-new lets it through)" "$out" "reached-address"
+    in_container git rm -f /tmp/known_hosts_check
+
+    write_ssh_config 'Host github.com\n    HostName ssh.github.com\n    Port 443\nHost github-443\n    HostName ssh.github.com\n    Port 443\n'
     expect_equal "$when, ~/.ssh/config sends github.com to ssh.github.com port 443: SSH looks up the key under github.com-published" \
-        "hostkeyalias github.com-published|hostname ssh.github.com|port 443" \
-        "$(as_rstudio git ssh -G github.com 2>&1 | grep -i -E '^(hostname|port|hostkeyalias) ' | LC_ALL=C sort | paste -s -d '|')"
-    for host in github.com GitHub.com; do
+        "hostkeyalias github.com-published|hostname ssh.github.com|port 443" "$(alias_of github.com)"
+    expect_equal "$when, ~/.ssh/config sends its own name github-443 to ssh.github.com port 443: SSH looks up the key under github.com-published" \
+        "hostkeyalias github.com-published|hostname ssh.github.com|port 443" "$(alias_of github-443)"
+    for host in github.com GitHub.com github-443; do
         for how in GIT_SSH_COMMAND core.sshCommand; do
-            case "$how" in
-                GIT_SSH_COMMAND) out="$(as_rstudio git git ls-remote "git@$host:standin/repo.git" 2>&1)"; code=$? ;;
-                core.sshCommand) out="$(as_rstudio git env -u GIT_SSH_COMMAND git ls-remote "git@$host:standin/repo.git" 2>&1)"; code=$? ;;
-            esac
-            if [[ "$code" != 0 && "$out" == *"Host key verification failed"* ]]; then
-                ok "$when, port 443 set-up: the false $host is refused (git, $how)"
-            else
-                bad "$when, port 443 set-up: the false $host is refused (git, $how)" "exit code $code" "$out"
-            fi
+            git_is_refused "$when, port 443 set-up: the false $host is refused (git, $how)" "git@$host:standin/repo.git" "$how"
         done
     done
+
+    write_ssh_config "Host github.com\n    HostName $STANDIN_IP\n"
+    expect_equal "$when, ~/.ssh/config sends github.com to an address in numbers: SSH looks up the key under github.com-published" \
+        "hostkeyalias github.com-published|hostname $STANDIN_IP|port 22" "$(alias_of github.com)"
+    for how in GIT_SSH_COMMAND core.sshCommand; do
+        git_is_refused "$when, address set-up: the false github.com is refused (git, $how)" "git@github.com:standin/repo.git" "$how"
+    done
     in_container git rm -f /home/rstudio/.ssh/config
+}
+
+# known_gap_checks WHEN SCANNED: two set-ups in which SSH applies no rule of the image to
+# github.com and accepts any key stored under github.com, the GUI's scanned keys included
+# (docker_setup/README.md, section 3.4):
+#   own HostKeyAlias:  a person's ~/.ssh/config with "Host github.com" and "HostKeyAlias
+#                      github.com". SSH reads that file before the system-wide settings
+#                      and keeps the first value it finds;
+#   ssh -F:            the GUI's SSH command plus "-F /dev/null", which makes SSH read no
+#                      settings file at all, so it never sees the rule.
+# SCANNED is 1 when the GUI's key scan has just written the stand-in's keys into the
+# user's known hosts file, 0 when that file holds GitHub's published keys. With 0 the
+# false server must be refused. With 1 only a GUI without the key scan makes SSH refuse
+# it. While the GUI's command (read from the GUI code) still scans, an accepted
+# connection is therefore reported as "skip" with the reason: a known gap that only a
+# change of the GUI closes. Every other result that is not a refusal is a failure.
+known_gap_checks() {
+    local when="$1" scanned="$2" out code setup how name gui_scans=0
+    [[ "$(gui_ssh_setup_command "$PERSON_UID:$SHARED_GID")" == *ssh-keyscan* ]] && gui_scans=1
+    for setup in "own HostKeyAlias github.com in ~/.ssh/config" "ssh -F /dev/null"; do
+        [[ "$setup" == own* ]] && write_ssh_config 'Host github.com\n    HostKeyAlias github.com\n'
+        for how in GIT_SSH_COMMAND core.sshCommand; do
+            case "$setup:$how" in
+                own*:GIT_SSH_COMMAND) out="$(as_rstudio git git ls-remote git@github.com:standin/repo.git 2>&1)"; code=$? ;;
+                own*:core.sshCommand) out="$(as_rstudio git env -u GIT_SSH_COMMAND git ls-remote git@github.com:standin/repo.git 2>&1)"; code=$? ;;
+                ssh*:GIT_SSH_COMMAND) out="$(as_rstudio git env GIT_SSH_COMMAND="$GUI_SSH_COMMAND -F /dev/null" git ls-remote git@github.com:standin/repo.git 2>&1)"; code=$? ;;
+                *) continue ;;     # "-F" is a part of the GUI's command only
+            esac
+            name="$when, $setup: the false github.com is refused (git, $how)"
+            if [[ "$code" != 0 && "$out" == *"Host key verification failed"* ]]; then
+                ok "$name"
+            elif [[ "$code" == 0 && "$scanned" == 1 && "$gui_scans" == 1 ]]; then
+                skip "$name" "known gap of the GUI: its key scan stored the false keys under github.com, and this set-up uses them; only a GUI without the key scan closes it (docker_setup/README.md, section 3.4)"
+            else
+                bad "$name" "exit code $code" "$out"
+            fi
+        done
+        in_container git rm -f /home/rstudio/.ssh/config
+    done
 }
 
 group_git() {
@@ -1595,8 +1696,8 @@ group_git() {
             expect_equal "no network: SSH looks up the host key of $spelling under the name github.com-published (HostKeyAlias)" \
                 "hostkeyalias github.com-published" "$(as_rstudio nonet ssh -G "$spelling" 2>&1 | grep -i '^hostkeyalias')"
         done
-        expect_contains "no network: git-identity checked the spellings of github.com itself" "$(logs nonet)" \
-            "SSH uses the name github.com-published for the host key of github.com (checked for: github.com GitHub.com GITHUB.COM github.com.)"
+        expect_contains "no network: git-identity checked the spellings of github.com and ssh.github.com itself" "$(logs nonet)" \
+            "SSH uses the name github.com-published for the host key of github.com and ssh.github.com (checked for: ${GITHUB_SPELLINGS[*]})"
         expect_equal "no network: /home/rstudio/.ssh/known_hosts holds exactly GitHub's three published keys" "$expected_keys" \
             "$(in_container nonet cat /home/rstudio/.ssh/known_hosts 2>&1)"
         # ssh-keygen -l prints the fingerprint of every key in a file; awk takes the
@@ -1649,7 +1750,8 @@ group_git() {
     # network it answers to three names, on the usual SSH port 22 and on port 443:
     #   github.com        its host key is NOT GitHub's key, so every connection to this
     #                     name must be refused by the client;
-    #   ssh.github.com    the same, for the port 443 set-up of GitHub (see port443_checks);
+    #   ssh.github.com    the same, for GitHub's server for networks that block port 22
+    #                     (see gui_refusal_checks and ssh_config_checks);
     #   git.example.test  an unknown server, which "accept-new" lets git reach.
     docker network rm "$NETWORK" > /dev/null 2>&1
     docker network create --label "impact.test=$PREFIX" "$NETWORK" > /dev/null
@@ -1678,6 +1780,10 @@ group_git() {
         sleep 0.5
         tries=$((tries + 1))
     done
+    # The address in numbers of the stand-in on the private network, for ssh_config_checks.
+    # "docker inspect -f" prints the part of the container's description that the template
+    # between the quotes names.
+    STANDIN_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$(cname gitserver)")"
 
     # The container under test, on the same network, without the --add-host line: the
     # name github.com now leads to the stand-in server.
@@ -1718,7 +1824,8 @@ group_git() {
         # final dot is a name SSH has never seen, so without the rule of git-identity.sh
         # "accept-new" would accept any key for it.
         gui_refusal_checks "stand-in server, before the GUI's set-up"
-        port443_checks "stand-in server, before the GUI's set-up"
+        ssh_config_checks "stand-in server, before the GUI's set-up"
+        known_gap_checks "stand-in server, before the GUI's set-up" 0
         expect_equal "stand-in server: the refused connections added no key for github.com" "$(cat "$HERE/expected/github_known_hosts")" \
             "$(in_container git grep '^github.com ' /home/rstudio/.ssh/known_hosts 2>&1)"
 
@@ -1759,13 +1866,61 @@ group_git() {
         expect_contains "GUI set-up with the false github.com reachable: the scan wrote keys that are not GitHub's into known_hosts" \
             "$(in_container git /bin/bash -c "grep '^github.com ' /home/rstudio/.ssh/known_hosts | grep -c -v -x -F -f /etc/ssh/ssh_known_hosts") lines" "3 lines"
         gui_refusal_checks "after the GUI's set-up"
-        port443_checks "after the GUI's set-up"
+        ssh_config_checks "after the GUI's set-up"
+        known_gap_checks "after the GUI's set-up" 1
         # The other order: the script runs after the GUI (as at the next start).
         in_container git /etc/cont-init.d/git-identity > "$WORK/second-run.log" 2>&1
         gui_refusal_checks "after the script ran again"
-        port443_checks "after the script ran again"
+        ssh_config_checks "after the script ran again"
+        known_gap_checks "after the script ran again" 0
         expect_equal "after the script ran again: the github.com lines of known_hosts are GitHub's three published keys" "$expected_keys" \
             "$(in_container git grep -i 'github' /home/rstudio/.ssh/known_hosts 2>&1)"
+
+        # --- A server whose key is stored under github.com-published ---------------------
+        # The other side of the rule: a server whose host key is stored under the name
+        # github.com-published, as GitHub's real servers are, must be reached under every
+        # name the rule covers. For these checks the stand-in's own keys are added under
+        # that name to the system-wide file ("ssh-keyscan" prints the keys a server
+        # presents, sed renames them); the script, run once more afterwards, removes them
+        # again.
+        #   - First with strict checking against the system-wide file alone
+        #     ("UserKnownHostsFile=/dev/null", "StrictHostKeyChecking=yes"): such a
+        #     connection only gets through when SSH finds the key under
+        #     github.com-published, so it shows that the rule leads there.
+        #   - Then with the GUI's own SSH command, which must store no new line in
+        #     known_hosts ("wc -l" counts lines).
+        in_container git /bin/bash -c "ssh-keyscan git.example.test 2>/dev/null | sed 's/^git\.example\.test /github.com-published /' >> /etc/ssh/ssh_known_hosts"
+        local lines_before remote strict="ssh -i /home/rstudio/.ssh/id_ed25519_testuser -o IdentitiesOnly=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes"
+        lines_before="$(in_container git wc -l /home/rstudio/.ssh/known_hosts 2>&1)"
+        for remote in git@github.com:standin/repo.git git@ssh.github.com:standin/repo.git "ssh://git@ssh.github.com:443/~/standin/repo.git" \
+                      "ssh://git@SSH.GitHub.com:443/~/standin/repo.git" port-443-set-up gui-command; do
+            case "$remote" in
+                port-443-set-up)
+                    write_ssh_config 'Host github.com\n    HostName ssh.github.com\n    Port 443\n'
+                    out="$(as_rstudio git env GIT_SSH_COMMAND="$strict" git ls-remote git@github.com:standin/repo.git 2>&1)"
+                    code=$?
+                    in_container git rm -f /home/rstudio/.ssh/config
+                    remote="git@github.com:standin/repo.git with GitHub's port 443 set-up in ~/.ssh/config, strict checking" ;;
+                gui-command)
+                    out="$(as_rstudio git git ls-remote "ssh://git@ssh.github.com:443/~/standin/repo.git" 2>&1)"
+                    code=$?
+                    remote="ssh://git@ssh.github.com:443/~/standin/repo.git with the GUI's GIT_SSH_COMMAND" ;;
+                *)
+                    out="$(as_rstudio git env GIT_SSH_COMMAND="$strict" git ls-remote "$remote" 2>&1)"
+                    code=$?
+                    remote="$remote, strict checking" ;;
+            esac
+            if [[ "$code" == 0 && "$out" == *"refs/heads/main"* ]]; then
+                ok "key stored under github.com-published: git reaches $remote"
+            else
+                bad "key stored under github.com-published: git reaches $remote" "exit code $code" "$out"
+            fi
+        done
+        expect_equal "key stored under github.com-published: the GUI's SSH command added no line to known_hosts" "$lines_before" \
+            "$(in_container git wc -l /home/rstudio/.ssh/known_hosts 2>&1)"
+        in_container git /etc/cont-init.d/git-identity > "$WORK/third-run.log" 2>&1
+        expect_equal "after the script ran once more: /etc/ssh/ssh_known_hosts holds exactly GitHub's published keys again" \
+            "$(expected_system_known_hosts)" "$(in_container git cat /etc/ssh/ssh_known_hosts 2>&1)"
 
         # --- Wrong github.com keys in the user's file -------------------------------------
         # The script rebuilds the github.com part of known_hosts at every start: it drops

@@ -24,8 +24,12 @@ How the copies are kept in step:
 
 1. A change is made here first, on a branch, and must pass the tests:
    `bash tests/docker_setup/run-tests.sh`, then `bash tests/docker_setup/check-the-tests.sh`.
-   When the workflow `.github/workflows/docker-setup.yml` is installed in this repository,
-   GitHub runs both for every push that changes `docker_setup/` or `tests/docker_setup/`.
+   GitHub runs both in the job `docker-setup-tests` of `.github/workflows/test.yml`: for
+   every push to `main` or `dev-v2.1` and every pull request into one of them that changes
+   `docker_setup/` or `tests/docker_setup/`, at every manual start of the workflow, and
+   once a week. A change of the GUI code alone does not start them, although the tests run
+   the GUI's SSH set-up (`current_version/IMPACT_Docker_GUI.psm1`); after such a change,
+   run them by hand or start the workflow by hand.
 2. Then the change goes into every model repository and every branch used with the GUI:
    the changed files of this folder, except the two files above, and
    `dockerignore_for_repository_root` as `.dockerignore` at the top of the repository. The

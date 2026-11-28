@@ -19,6 +19,12 @@ on:
       # Already covered by 'tests/**'. Listed on its own line because the
       # temporary probe jobs at the end of this file react to this folder.
       - 'tests/Probes/**'
+      # The reference copy of the folder docker_setup that every model
+      # repository carries, and its tests. The second line is already
+      # covered by 'tests/**'. Both are listed because the job
+      # docker-setup-tests reacts to exactly these two folders.
+      - 'docker_setup/**'
+      - 'tests/docker_setup/**'
       - '.github/workflows/test.yml'
   pull_request:
     # Pull requests INTO one of these branches (any changed file).
@@ -69,11 +75,21 @@ permissions:
 #    4. ImageValidation (Ubuntu) - builds real IMPACT image, validates container
 #    5. RemoteE2E (Ubuntu)       - full SSH -> Docker build -> container lifecycle
 #
+#  Beside the tiers (not Pester, no PowerShell):
+#    docker_setup (Ubuntu)       - the start-up scripts of the model images in
+#                                  docker_setup/, with real containers
+#                                  (tests/docker_setup/run-tests.sh)
+#
 #  When does which job run:
 #    Tiers 1 to 3   every push to main or dev-v2.1 that changes one of the
 #                   paths listed above, every pull request into main or
 #                   dev-v2.1, every manual start, and the weekly schedule.
 #    Tiers 4 and 5  manual start with run_e2e ticked, and the weekly schedule.
+#    docker_setup   every push to main or dev-v2.1 and every pull request
+#                   into main or dev-v2.1 that changes a file below
+#                   docker_setup/ or tests/docker_setup/ (the job
+#                   docker-setup-gate looks this up), every manual start, and
+#                   the weekly schedule.
 #
 #  TEMPORARY feasibility probes (the last three jobs in this file):
 #    They are not tests of the GUI. They find out whether GitHub's runners can
@@ -244,6 +260,14 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────
   #  Image validation - Ubuntu (builds real IMPACT image, validates container)
   #  Only on manual dispatch (with run_e2e=true) or weekly schedule.
+  #  It clones the model repository IMPACT-NCD-Germany_Base and builds its
+  #  image. Before the build, it lays the start-up files of this
+  #  repository's reference copy docker_setup/ over the clone (the variable
+  #  IMPACT_E2E_DOCKER_SETUP_DIR in the test step below; see the section
+  #  "1b" in tests/ImageValidation.Tests.ps1). So the real model image is
+  #  tested with the start-up scripts of this repository, also while the
+  #  model repository still holds an older version of them. Remove the
+  #  variable to test exactly what the model repository holds.
   # ─────────────────────────────────────────────────────────────────────────
   image-validation:
     name: Image Validation (Ubuntu)
@@ -284,6 +308,8 @@ jobs:
         shell: pwsh
         env:
           IMPACT_E2E_GITHUB_TOKEN: ${{ secrets.IMPACT_E2E_GITHUB_TOKEN }}
+          # Build the model image with the reference docker_setup of this repository.
+          IMPACT_E2E_DOCKER_SETUP_DIR: ${{ github.workspace }}/docker_setup
         run: |
           Import-Module Pester -RequiredVersion $env:PESTER_VERSION
           $config = New-PesterConfiguration
@@ -470,6 +496,219 @@ jobs:
         with:
           name: test-results-remote-e2e
           path: tests/TestResults-RemoteE2E.xml
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  docker_setup gate - decides whether the docker_setup tests run.
+  #  The folder docker_setup/ is the reference copy of the folder that every
+  #  model repository carries (the Dockerfiles and the start-up scripts of
+  #  the model images); tests/docker_setup/ holds its tests. These tests
+  #  take about 20 minutes, so a push or a pull request runs them only when
+  #  it changes a file below one of these two folders.
+  #  A push starts this workflow when it changes any path of the list under
+  #  "on: push", and a pull request starts it for any change. A job
+  #  condition ("if:") cannot see which files changed. So this small job
+  #  looks it up with git, as the probe gate further down does, and hands
+  #  the answer ("true" or "false") to the job docker-setup-tests as its
+  #  output "run_docker_setup". On a manual start and on the weekly
+  #  schedule the answer is always "true".
+  # ─────────────────────────────────────────────────────────────────────────
+  docker-setup-gate:
+    name: 'docker_setup gate: should the docker_setup tests run?'
+    runs-on: ubuntu-latest
+    outputs:
+      run_docker_setup: ${{ steps.decide.outputs.run_docker_setup }}
+    steps:
+      # Only a push and a pull request need the history.
+      - uses: actions/checkout@v4
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        with:
+          # 0 = fetch the whole history. The step below compares two commits,
+          # and both must be present in the checkout.
+          fetch-depth: 0
+
+      - name: Decide
+        id: decide
+        shell: bash
+        # The values from GitHub are handed over as environment variables and
+        # not pasted into the script text. That is the safe way to use them.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # When in doubt, the tests run: a run too many costs a few minutes,
+          # a run too few can let a broken start-up script through.
+          run_docker_setup=true
+          base=""
+          if [ "$EVENT_NAME" = "push" ]; then
+            # PUSH_BEFORE is the commit the branch pointed to before the push,
+            # PUSH_AFTER the commit it points to now. "A..B" (two dots) compares
+            # the two commits directly.
+            base="$PUSH_BEFORE"; head="$PUSH_AFTER"; range="$PUSH_BEFORE..$PUSH_AFTER"
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            # PR_BASE is a commit of the target branch, PR_HEAD the newest
+            # commit of the pull request. "A...B" (three dots) compares B with
+            # the commit where the pull request branched off from A, so it
+            # shows exactly the changes of the pull request.
+            base="$PR_BASE"; head="$PR_HEAD"; range="$PR_BASE...$PR_HEAD"
+          fi
+          if [ -z "$base" ]; then
+            echo "Manual start or weekly schedule ($EVENT_NAME): the docker_setup tests run."
+          # "git cat-file -e X^{commit}" succeeds when commit X is in the checkout.
+          elif ! git cat-file -e "${base}^{commit}" 2>/dev/null || ! git cat-file -e "${head}^{commit}" 2>/dev/null; then
+            # After a forced push, or for the first push of a branch, the old
+            # commit is not available.
+            echo "A commit to compare with is not available ($base, $head). To be safe, the docker_setup tests run."
+          # The "--" ends the options; the two folder names after it limit the
+          # comparison to these folders. "if x=$(command)" takes the branch
+          # when the command succeeded.
+          elif changed="$(git diff --name-only "$range" -- docker_setup/ tests/docker_setup/)"; then
+            if [ -n "$changed" ]; then
+              echo "These files below docker_setup/ or tests/docker_setup/ changed, so the docker_setup tests run:"
+              echo "$changed"
+            else
+              run_docker_setup=false
+              echo "Nothing below docker_setup/ or tests/docker_setup/ changed: the docker_setup tests do not run."
+            fi
+          else
+            echo "git diff failed. To be safe, the docker_setup tests run."
+          fi
+          # Lines written to the file named in GITHUB_OUTPUT become outputs of this step.
+          echo "run_docker_setup=$run_docker_setup" >> "$GITHUB_OUTPUT"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  #  docker_setup tests - Ubuntu (real containers; bash and Docker, no Pester)
+  #  tests/docker_setup/run-tests.sh builds a test image with the real
+  #  docker_setup/Dockerfile.IMPACTncdGER, on a stand-in for the large
+  #  prerequisite image of the models (the Rocker image named in
+  #  docker_setup/Dockerfile.prerequisite.IMPACTncdGER plus a few packages)
+  #  and with a tiny stand-in repository. It starts containers with the
+  #  options the GUI uses and checks about 490 things: user and group
+  #  numbers, that nothing in a mounted folder changes, the ready marker,
+  #  the RStudio sign-in, R sessions, git against a stand-in SSH server, and
+  #  GitHub's host keys against the real github.com.
+  #  Runs when the gate above says "true". Needs no token: the test key is
+  #  made during the run, and against the real github.com the tests only
+  #  check the host key.
+  # ─────────────────────────────────────────────────────────────────────────
+  docker-setup-tests:
+    name: docker_setup Tests (Ubuntu)
+    runs-on: ubuntu-latest
+    needs: [docker-setup-gate]
+    if: needs.docker-setup-gate.outputs.run_docker_setup == 'true'
+    timeout-minutes: 60
+    # IMPACT_TEST_TMP in the steps below: where the two test scripts create
+    # their work folders, with the folders they mount into the test
+    # containers. runner.temp is the runner's own temporary folder, emptied
+    # at the start and at the end of every job. (The runner context exists
+    # only inside steps, so each step sets the variable itself.)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the Docker version
+        run: docker version
+
+      # The build group of run-tests.sh alone: it downloads the Rocker image
+      # (about 760 MB), builds the stand-in prerequisite image (with apt-get)
+      # and the test image, and checks the images. "--only" takes a pattern
+      # for the names of the test groups. No test group is called "build",
+      # so only the build runs, which always runs first. Exit code 2 means
+      # that the images could not be built, 1 that a check of them failed.
+      - name: Build the test images
+        timeout-minutes: 20
+        env:
+          IMPACT_TEST_TMP: ${{ runner.temp }}
+        run: bash tests/docker_setup/run-tests.sh --only '^build$'
+
+      # All test groups. The images of the step above are reused (the build
+      # runs again, from Docker's build cache). The script prints one line
+      # per test ("ok", "FAIL" with the reason, or "skip" with the reason)
+      # and a summary. Exit code 1 (a test failed) or 2 (the tests could not
+      # run) fails the job.
+      - name: Run the docker_setup tests
+        timeout-minutes: 25
+        env:
+          IMPACT_TEST_TMP: ${{ runner.temp }}
+        run: bash tests/docker_setup/run-tests.sh
+
+      # Twelve deliberate mistakes ("mutants") in entrypoint.sh and
+      # git-identity.sh, each of which would re-own other people's files or
+      # let git accept a false github.com. For each mutant the script runs
+      # the matching test groups and checks that the tests named for it fail.
+      # About 11 minutes. Runs only when every step above passed (the default
+      # for a step): on top of failing tests, a mutant run says nothing.
+      # It runs every time this job runs, on purpose:
+      #   - It can only find something new when the scripts or the tests
+      #     change, and exactly then this job runs. A check once a week would
+      #     report a weakened test days after it was merged.
+      #   - A change to entrypoint.sh or git-identity.sh can remove a line that
+      #     a mutant changes. The script then ends with exit code 2, and that
+      #     belongs to the push that made the change.
+      #   - A mutant counts as caught when the tests named for it fail. A
+      #     test that fails by chance elsewhere cannot make this step red.
+      #   - This repository is public, so the minutes on GitHub's runners
+      #     cost nothing, and pushes that change these folders are rare.
+      - name: Check that the tests notice deliberate mistakes
+        timeout-minutes: 25
+        env:
+          IMPACT_TEST_TMP: ${{ runner.temp }}
+        run: bash tests/docker_setup/check-the-tests.sh
+
+      # The test image above is built with the reference .dockerignore, but
+      # the stand-in repository holds none of the files it excludes. This
+      # step copies the stand-in repository, adds files that must stay out of
+      # an image and the reference .dockerignore, builds a throw-away image
+      # that copies the whole build context (as Dockerfile.IMPACTncdGER does)
+      # and lists what arrived. It runs also when an earlier step failed
+      # ("!cancelled()": unless the run was cancelled), because its result
+      # does not depend on theirs.
+      # BUILDX_GIT_INFO=false keeps Docker from reading the dummy .git folder.
+      - name: Check the reference .dockerignore with a real build
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: |
+          set -eu
+          ctx="$(mktemp -d)"
+          cp -r tests/docker_setup/standin/repository/. "$ctx/"
+          mkdir -p "$ctx/docker_setup"
+          cp -r docker_setup/. "$ctx/docker_setup/"
+          cp docker_setup/dockerignore_for_repository_root "$ctx/.dockerignore"
+          # Files that must stay out of the image, at the top and in a subfolder.
+          mkdir -p "$ctx/.git" "$ctx/.Rproj.user" "$ctx/outputs/run1" "$ctx/inputs/synthpop" "$ctx/Rpackage/.Rproj.user"
+          for f in .git/HEAD .Rproj.user/state outputs/run1/result.csv inputs/synthpop/pop.fst .Rhistory .RData \
+                   docker_setup/.env Rpackage/.Rproj.user/state Rpackage/.Rhistory; do
+            echo x > "$ctx/$f"
+          done
+          # The throw-away image uses the Rocker image of the prerequisite Dockerfile, which
+          # the steps above have downloaded already.
+          base="$(sed -n 's/^FROM[[:space:]]\{1,\}\([^[:space:]]\{1,\}\).*/\1/p' docker_setup/Dockerfile.prerequisite.IMPACTncdGER | head -n 1)"
+          printf 'FROM %s\nCOPY . /context/\nRUN cd /context && find . | LC_ALL=C sort > /context-list.txt\n' "$base" > "$ctx.Dockerfile"
+          BUILDX_GIT_INFO=false docker build --no-cache -q -f "$ctx.Dockerfile" -t dockerignore-check "$ctx" > /dev/null
+          docker run --rm --entrypoint cat dockerignore-check /context-list.txt > "$ctx.list"
+          fail=0
+          for p in ./.git ./.Rproj.user ./outputs/run1 ./inputs/synthpop/pop.fst ./.Rhistory ./.RData \
+                   ./docker_setup/.env ./Rpackage/.Rproj.user ./Rpackage/.Rhistory; do
+            if grep -qx -- "$p" "$ctx.list"; then echo "FAIL $p reached the image"; fail=1; else echo "ok   $p stays out of the image"; fi
+          done
+          for p in ./outputs ./inputs/synthpop ./docker_setup/entrypoint.sh ./docker_setup/git-identity.sh \
+                   ./docker_setup/impact-ready.sh ./Rpackage/IMPACTncd_Ger_model_pkg/DESCRIPTION; do
+            if grep -qx -- "$p" "$ctx.list"; then echo "ok   $p is in the image"; else echo "FAIL $p is missing from the image"; fail=1; fi
+          done
+          docker image rm dockerignore-check > /dev/null
+          rm -rf "$ctx" "$ctx.Dockerfile" "$ctx.list"
+          exit "$fail"
+
+      # check-the-tests.sh keeps the full output of a mutant that was not
+      # caught as check-the-tests.<mutant>.log in its work folder.
+      - name: Upload the logs of mutants that were not caught
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-setup-mutant-logs
+          path: ${{ runner.temp }}/check-the-tests.*.log
+          if-no-files-found: ignore
 
   # ═════════════════════════════════════════════════════════════════════════
   #  TEMPORARY FEASIBILITY PROBES (work package 0 of the remote-mode redesign)

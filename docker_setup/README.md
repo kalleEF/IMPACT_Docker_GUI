@@ -228,17 +228,22 @@ once per start, as root, sorted by name. These scripts receive the variables of 
    other line for `github.com` from these files (also lines with capital letters, several
    names, patterns or in coded form). It also stores the three keys under the name
    `github.com-published` and writes `/etc/ssh/ssh_config.d/impact-github.conf`, which
-   makes SSH look up the key of `github.com` under that name (`HostKeyAlias`). The rule
-   applies to the name in any mix of capital and small letters (`GitHub.com`,
-   `GITHUB.COM`) and with a final dot (`github.com.`), so a remote address such as
-   `git@GitHub.com:owner/repo.git` is checked in the same way. It applies to the name as
-   it was typed and also to the server an SSH settings file sends it to. So it also holds
-   for the set-up GitHub documents for networks that block port 22: a person's
-   `~/.ssh/config` with `Host github.com`, `HostName ssh.github.com` and `Port 443`.
-   Keys that another program writes for `github.com`, for example the GUI's key scan, are
-   therefore never used. The log line
-   `SSH uses the name github.com-published for the host key of github.com` confirms that
-   SSH follows the rule; a `WARNING` line appears when it does not. It copies the
+   makes SSH look up the key of `github.com` and of `ssh.github.com` under that name
+   (`HostKeyAlias`). `ssh.github.com` is the server GitHub documents for networks that
+   block port 22; it answers on port 443 with the same published keys. The rule applies
+   to each name in any mix of capital and small letters (`GitHub.com`, `GITHUB.COM`,
+   `SSH.GitHub.com`) and with a final dot (`github.com.`), so a remote address such as
+   `git@GitHub.com:owner/repo.git` or `ssh://git@ssh.github.com:443/owner/repo.git` is
+   checked in the same way. It applies to the name as it was typed and also to the server
+   an SSH settings file sends it to. So it also holds for GitHub's port 443 set-up in a
+   person's `~/.ssh/config` (`Host github.com`, `HostName ssh.github.com` and
+   `Port 443`), and for a name of the person's own with `HostName ssh.github.com`. With
+   the usual settings, keys that another program writes for `github.com`, for example the
+   GUI's key scan, are therefore not used; section 3.4 names the three cases in which they
+   are. The log line that starts with
+   `SSH uses the name github.com-published for the host key of github.com`
+   confirms that SSH follows the rule; a `WARNING` line appears when it does not.
+   `git-identity` also copies the
    person's private key from `/keys/` into `/home/rstudio/.ssh/` with access mode 600,
    sets git's `core.sshCommand` to the same SSH options the GUI uses, and sets the git
    user name and e-mail address when none is set.
@@ -275,17 +280,31 @@ password and configures git inside the container.
 - **LOCAL:** the GUI passes the password with `PASSWORD`, as in earlier versions.
 - In both modes the GUI then copies the SSH key, writes the same `core.sshCommand` as
   `git-identity`, and rewrites `/home/rstudio/.ssh/known_hosts` with the keys its own key
-  scan of `github.com` receives. Nobody checks those keys. Whichever of the two runs
-  last, SSH accepts a server under the name `github.com` (in any spelling of section 3.2,
-  also when `~/.ssh/config` sends it to `ssh.github.com` on port 443) only with one of
+  scan of `github.com` receives. Nobody checks those keys. With the usual settings,
+  whichever of the two runs last, SSH accepts a server under the name `github.com` or
+  `ssh.github.com` (in any spelling of section 3.2, also when `~/.ssh/config` sends
+  `github.com` or a name of its own to `ssh.github.com` on port 443) only with one of
   GitHub's published keys (`HostKeyAlias`, section 3.2). The tests run the GUI's own
   command while a false `github.com` can be reached, also under `ssh.github.com` on port
   443, and git refuses it afterwards. The content of `known_hosts` differs with the order:
-  after the GUI's step it holds the scanned lines, which SSH no longer uses for
-  `github.com`, and the next start of the container replaces them with the published
-  keys. A remote address that names another of GitHub's servers directly, such as
-  `git@ssh.github.com`, is outside this rule and is checked like any other server. The
-  image itself needs no key scan.
+  after the GUI's step it holds the scanned lines, which SSH then does not use for these
+  names, and the next start of the container replaces them with the published keys.
+- In three cases SSH does use the scanned lines after the GUI's step, so a false
+  `github.com` that the scan reached is accepted. The image cannot prevent this, because
+  the GUI's step runs last; only a GUI without the key scan closes these cases:
+  - a person's `~/.ssh/config` sets a `HostKeyAlias` of its own for `github.com` (for
+    example `HostKeyAlias github.com`). SSH reads that file first and keeps the first
+    value it finds. **Do not set `HostKeyAlias` for `github.com` in `~/.ssh/config`.**
+  - `ssh` is started with `-F` and another settings file. SSH then skips the
+    system-wide settings, and the rule of section 3.2 with them.
+  - `/home/rstudio/.ssh` is a mount, for example the person's own `.ssh` folder mounted
+    with custom parameters. `git-identity` writes nothing there. The GUI's step replaces
+    GitHub's keys in that `known_hosts` with the scanned ones and changes the owner of
+    the folder and its files to `rstudio`, and an SSH outside the container that reads
+    the file then trusts the scanned keys. Do not mount a `.ssh` folder into the
+    container.
+- A remote address in numbers (an IP address) is outside the rule and is checked like any
+  other server: SSH accepts its key on first contact. The image itself needs no key scan.
 
 ## 4. Environment variables the image understands
 

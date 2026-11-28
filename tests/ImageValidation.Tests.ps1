@@ -23,6 +23,13 @@
       IMPACT_E2E_GITHUB_TOKEN   - Fine-grained PAT with SSH keys Read/Write.
       IMPACT_E2E_SKIP_BUILD     - Set to '1' to skip image build (reuse existing).
       IMPACT_E2E_KEEP_ARTIFACTS - Set to '1' to keep repo clone + image after tests.
+      IMPACT_E2E_DOCKER_SETUP_DIR - Full path of a docker_setup folder, normally the
+                                  reference copy docker_setup/ of this repository. Before
+                                  the build, its Dockerfile.IMPACTncdGER, entrypoint.sh,
+                                  git-identity.sh and impact-ready.sh replace those of the
+                                  clone, and its dockerignore_for_repository_root becomes
+                                  the clone's .dockerignore. Not set: the clone is built
+                                  as it is.
 
     Tag: ImageValidation
 #>
@@ -86,6 +93,48 @@ Describe 'ImageValidation: IMPACT Docker container from real repo' -Tag ImageVal
             $script:PreflightMessages += "git clone failed (exit $LASTEXITCODE)"
             Write-Host "[ImageVal][Preflight] git clone failed (exit $LASTEXITCODE)" -ForegroundColor Red
             return
+        }
+
+        # ── 1b. Optional: build with a docker_setup that is not yet in the model repository ──
+        # IMPACT_E2E_DOCKER_SETUP_DIR names a folder with the reference docker_setup (the CI
+        # job passes the copy in the GUI repository). Only the files that make up the start of
+        # the container are copied, plus the .dockerignore of the repository root: the model
+        # repository keeps its own package lists and its own prerequisite Dockerfile.
+        # Without the variable this block does nothing, and the image is built from the clone
+        # exactly as it is.
+        if ($env:IMPACT_E2E_DOCKER_SETUP_DIR) {
+            $overlayDir = $env:IMPACT_E2E_DOCKER_SETUP_DIR
+            $targetDir  = Join-Path $script:repoDir 'docker_setup'
+            # [ordered] keeps the entries in the order written here: file name in the
+            # reference folder = where the copy goes in the clone.
+            $overlay = [ordered]@{
+                'Dockerfile.IMPACTncdGER'          = (Join-Path $targetDir 'Dockerfile.IMPACTncdGER')
+                'entrypoint.sh'                    = (Join-Path $targetDir 'entrypoint.sh')
+                'git-identity.sh'                  = (Join-Path $targetDir 'git-identity.sh')
+                'impact-ready.sh'                  = (Join-Path $targetDir 'impact-ready.sh')
+                'dockerignore_for_repository_root' = (Join-Path $script:repoDir '.dockerignore')
+            }
+            foreach ($name in $overlay.Keys) {
+                $source = Join-Path $overlayDir $name
+                if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                    $script:PreflightFailed = $true
+                    $script:PreflightMessages += "docker_setup overlay: $source is missing"
+                    Write-Host "[ImageVal][Preflight] docker_setup overlay: $source is missing" -ForegroundColor Red
+                    return
+                }
+                # -ErrorAction Stop hands a failed copy to "catch". Without it the copy would
+                # only print an error, and the image would be built from a folder in which
+                # only some of the files were replaced.
+                try {
+                    Copy-Item -LiteralPath $source -Destination $overlay[$name] -Force -ErrorAction Stop
+                } catch {
+                    $script:PreflightFailed = $true
+                    $script:PreflightMessages += "docker_setup overlay: copying $source failed: $($_.Exception.Message)"
+                    Write-Host "[ImageVal][Preflight] docker_setup overlay: copying $source failed" -ForegroundColor Red
+                    return
+                }
+            }
+            Write-Host "[ImageVal] docker_setup overlay applied from $overlayDir" -ForegroundColor Cyan
         }
 
         # ── 2. Create output & synthpop dirs ────────────────────────────────
