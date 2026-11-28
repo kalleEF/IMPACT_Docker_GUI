@@ -154,6 +154,7 @@ run_printed_line() {
 # Refusals and the read-only parts
 # ----------------------------------------------------------------------------
 
+# Help and root check.
 test_help_and_root_check() {
     run_cmd runuser -u "$SYS_ADMIN" -- "$KEY" --help
     assert_status 0
@@ -165,6 +166,7 @@ test_help_and_root_check() {
     assert_output_contains 'must run with administrator rights'
 }
 
+# Wrong and hostile input is refused before any change.
 test_wrong_and_hostile_input_is_refused_before_any_change() {
     local value
     rm -f /tmp/impact-test-hostile
@@ -201,6 +203,7 @@ test_wrong_and_hostile_input_is_refused_before_any_change() {
     assert_missing /tmp/impact-test-hostile
 }
 
+# List shows the keys and changes nothing.
 test_list_shows_the_keys_and_changes_nothing() {
     refused_without_change 0 sys_as_admin "$KEY" list "$ACC"
     assert_output_contains "key 1: $(print_of k1)  (k1@example-pc)"
@@ -214,17 +217,20 @@ test_list_shows_the_keys_and_changes_nothing() {
 # add
 # ----------------------------------------------------------------------------
 
+# Add dry run changes nothing.
 test_add_dry_run_changes_nothing() {
     refused_without_change 0 sys_as_admin "$KEY" add "$ACC" --key-file "$(pub k2)" --fingerprint "$(print_of k2)" --dry-run
     assert_output_contains "[dry run] Add the key $(print_of k2)"
 }
 
+# Add needs a confirmed fingerprint.
 test_add_needs_a_confirmed_fingerprint() {
     refused_without_change 1 sys_as_admin "$KEY" add "$ACC" --key-file "$(pub k2)" --yes
     assert_output_contains 'not confirmed'
     refused_without_change 1 sys_as_admin "$KEY" add "$ACC" --key-file "$(pub k2)" --fingerprint "$(print_of k3)"
 }
 
+# Add a second key.
 test_add_a_second_key() {
     run_cmd sys_as_admin "$KEY" add "$ACC" --key-file "$(pub k2)" --fingerprint "$(print_of k2)"
     assert_status 0
@@ -236,6 +242,7 @@ test_add_a_second_key() {
     login_refused k3
 }
 
+# Add second run changes nothing.
 test_add_second_run_changes_nothing() {
     snapshot_unchanged_by --content --exclude /opt/impact/admin/log "${WATCHED[@]}" -- \
         sys_as_admin "$KEY" add "$ACC" --key-file "$(pub k2)" --fingerprint "$(print_of k2)"
@@ -247,12 +254,14 @@ test_add_second_run_changes_nothing() {
 # replace
 # ----------------------------------------------------------------------------
 
+# Replace needs the old key when there are several.
 test_replace_needs_the_old_key_when_there_are_several() {
     refused_without_change 2 sys_as_admin "$KEY" replace "$ACC" --key-file "$(pub k3)" --fingerprint "$(print_of k3)"
     assert_output_contains '--old-fingerprint'
     refused_without_change 4 sys_as_admin "$KEY" replace "$ACC" --old-fingerprint "$(print_of k4)" --key-file "$(pub k3)" --fingerprint "$(print_of k3)"
 }
 
+# Replace dry run changes nothing.
 test_replace_dry_run_changes_nothing() {
     place_key_copy k1
     refused_without_change 0 sys_as_admin "$KEY" replace "$ACC" --old-fingerprint "$(print_of k1)" --key-file "$(pub k3)" --fingerprint "$(print_of k3)" --dry-run
@@ -260,6 +269,7 @@ test_replace_dry_run_changes_nothing() {
     assert_output_contains "[dry run] Delete the key copy for git $COPY"
 }
 
+# Replace swaps the key and deletes the old key copy.
 test_replace_swaps_the_key_and_deletes_the_old_key_copy() {
     run_cmd sys_as_admin "$KEY" replace "$ACC" --old-fingerprint "$(print_of k1)" --key-file "$(pub k3)" --fingerprint "$(print_of k3)"
     assert_status 0
@@ -278,6 +288,7 @@ test_replace_swaps_the_key_and_deletes_the_old_key_copy() {
     assert_file_facts "$saved" 600 root root
 }
 
+# Replace second run changes nothing.
 test_replace_second_run_changes_nothing() {
     place_key_copy k3
     snapshot_unchanged_by --content --exclude /opt/impact/admin/log "${WATCHED[@]}" -- \
@@ -305,6 +316,7 @@ test_replace_rerun_finishes_an_interrupted_replacement() {
     login_works k3
 }
 
+# The printed undo line of replace works.
 test_the_printed_undo_line_of_replace_works() {
     # The undo line of the replacement, typed as printed: k1 comes back in
     # the place of k3. The key copy of k3 goes with its key.
@@ -322,6 +334,7 @@ test_the_printed_undo_line_of_replace_works() {
     login_works k3
 }
 
+# A key copy of a key that stays is kept.
 test_a_key_copy_of_a_key_that_stays_is_kept() {
     place_key_copy k2
     run_cmd sys_as_admin "$KEY" replace "$ACC" --old-fingerprint "$(print_of k3)" --key-file "$(pub k4)" --fingerprint "$(print_of k4)"
@@ -336,6 +349,7 @@ test_a_key_copy_of_a_key_that_stays_is_kept() {
 # remove
 # ----------------------------------------------------------------------------
 
+# Remove asks before it removes.
 test_remove_asks_before_it_removes() {
     refused_without_change 1 sys_as_admin "$KEY" remove "$ACC" --fingerprint "$(print_of k4)"
     assert_output_contains 'not confirmed'
@@ -343,6 +357,7 @@ test_remove_asks_before_it_removes() {
     assert_output_contains "[dry run] Remove the key $(print_of k4)"
 }
 
+# Remove takes the key away and the undo line brings it back.
 test_remove_takes_the_key_away_and_the_undo_line_brings_it_back() {
     local line
     run_cmd sys_as_admin "$KEY" remove "$ACC" --fingerprint "$(print_of k4)" --yes
@@ -358,6 +373,7 @@ test_remove_takes_the_key_away_and_the_undo_line_brings_it_back() {
     login_works k4
 }
 
+# Remove second run changes nothing.
 test_remove_second_run_changes_nothing() {
     run_cmd sys_as_admin "$KEY" remove "$ACC" --fingerprint "$(print_of k4)" --yes
     assert_status 0
@@ -367,6 +383,7 @@ test_remove_second_run_changes_nothing() {
     assert_output_contains "No login key of '$ACC' has the fingerprint $(print_of k4)"
 }
 
+# Removing the last key warns.
 test_removing_the_last_key_warns() {
     run_cmd sys_as_admin "$KEY" remove "$ACC" --fingerprint "$(print_of k2)" --yes
     assert_status 0
@@ -382,6 +399,7 @@ test_removing_the_last_key_warns() {
     login_works k1
 }
 
+# Links in the home folder are refused.
 test_links_in_the_home_folder_are_refused() {
     mkdir -p /srv/impact-test-target
     printf 'original content\n' >/srv/impact-test-target/authorized_keys
@@ -400,6 +418,7 @@ test_links_in_the_home_folder_are_refused() {
 # impact-list-users
 # ----------------------------------------------------------------------------
 
+# List users shows the people and changes nothing.
 test_list_users_shows_the_people_and_changes_nothing() {
     # A terminal login, which lastlog records.
     local -a SYS_SSH_OPTIONS=()

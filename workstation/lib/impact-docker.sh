@@ -53,6 +53,8 @@
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
 #   command || true      accept a failure of this command ("set -e" would
 #                        otherwise stop the script there)
+#   BASH_REMATCH         after [[ text =~ pattern ]]: the matched text (entry 0)
+#                        and the parts in round brackets (entries 1, 2, ...)
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 

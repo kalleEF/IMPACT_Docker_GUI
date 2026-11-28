@@ -101,6 +101,8 @@ set -euo pipefail
 export LC_ALL=C
 
 # The folder of this script is the folder "workstation" of the repository.
+# "${BASH_SOURCE[0]}" is the path of this file; "pwd -P" prints the folder
+# with every symbolic link resolved.
 SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 # die TEXT

@@ -89,6 +89,7 @@ archives() {
     find "$STATE" -maxdepth 1 -type f -name 'impact-state-*.tar.gz' 2>/dev/null | LC_ALL=C sort
 }
 
+# Wrong input is refused.
 test_wrong_input_is_refused() {
     snapshot_unchanged_by --content /opt/impact /etc/impact /srv/impact -- sys_as_admin "$EXPORT" extra
     assert_status 2
@@ -101,6 +102,7 @@ test_wrong_input_is_refused() {
     assert_output_contains 'must run with administrator rights'
 }
 
+# An unsafe state folder is refused.
 test_an_unsafe_state_folder_is_refused() {
     chmod 755 -- "$STATE"
     snapshot_unchanged_by --content --exclude /opt/impact/admin/log /opt/impact -- sys_as_admin "$EXPORT"
@@ -116,6 +118,7 @@ test_an_unsafe_state_folder_is_refused() {
     assert_output_contains 'is no real folder'
 }
 
+# Dry run writes nothing and lists the content.
 test_dry_run_writes_nothing_and_lists_the_content() {
     snapshot_unchanged_by --content /opt/impact /etc/impact /etc/ssh /srv/impact /home -- sys_as_admin "$EXPORT" --dry-run
     assert_status 0
@@ -131,6 +134,7 @@ test_dry_run_writes_nothing_and_lists_the_content() {
     assert_eq '' "$(archives)" "archives after a dry run"
 }
 
+# Archive has mode 600 and holds the state.
 test_archive_has_mode_600_and_holds_the_state() {
     run_cmd sys_as_admin "$EXPORT"
     assert_status 0
@@ -173,6 +177,7 @@ test_archive_has_mode_600_and_holds_the_state() {
     fi
 }
 
+# Second run writes nothing.
 test_second_run_writes_nothing() {
     snapshot_unchanged_by --content --exclude /opt/impact/admin/log /opt/impact /etc/impact /srv/impact -- sys_as_admin "$EXPORT"
     assert_status 0
@@ -182,6 +187,7 @@ test_second_run_writes_nothing() {
     assert_eq 1 "$(archives | wc -l)" "number of archives"
 }
 
+# A change gives a new archive.
 test_a_change_gives_a_new_archive() {
     sleep 1   # the archive name holds the time in seconds
     printf 'more\n' >"$TEST_TMP/more.csv"

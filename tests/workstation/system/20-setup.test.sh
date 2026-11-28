@@ -93,6 +93,8 @@ conf_value() {
 # Before the first run
 # ----------------------------------------------------------------------------
 
+# Without root the setup stops with exit code 2 and names sudo; --help works
+# without root.
 test_needs_root() {
     run_cmd runuser -u "$SYS_ADMIN" -- "$SETUP" --dry-run
     assert_status 2
@@ -103,6 +105,7 @@ test_needs_root() {
     assert_output_contains 'Usage'
 }
 
+# First run needs roots and contact.
 test_first_run_needs_roots_and_contact() {
     snapshot_unchanged_by --content "${WATCHED[@]}" -- sys_as_admin "$SETUP"
     assert_status 2
@@ -113,6 +116,7 @@ test_first_run_needs_roots_and_contact() {
     assert_status 2
 }
 
+# Wrong and hostile input is refused before any change.
 test_wrong_and_hostile_input_is_refused_before_any_change() {
     local before="$TEST_TMP/before" after="$TEST_TMP/after" index
     local -a FIRST_RUN=()
@@ -204,6 +208,7 @@ test_wrong_and_hostile_input_is_refused_before_any_change() {
     assert_fails getent group "$SYS_GROUP"
 }
 
+# Unusable storage root is refused before any change.
 test_unusable_storage_root_is_refused_before_any_change() {
     # The parent folder of a root must exist (a disk that is not mounted).
     snapshot_unchanged_by --content "${WATCHED[@]}" -- \
@@ -226,6 +231,7 @@ test_unusable_storage_root_is_refused_before_any_change() {
     assert_fails getent group "$SYS_GROUP"
 }
 
+# Dry run of the first run changes nothing.
 test_dry_run_of_the_first_run_changes_nothing() {
     local -a FIRST_RUN=()
     first_run_options
@@ -250,6 +256,8 @@ test_dry_run_of_the_first_run_changes_nothing() {
 # The first run
 # ----------------------------------------------------------------------------
 
+# The first run creates everything and prints "What changed" and "How to
+# undo" with the line that removes the SSH rules.
 test_first_run_succeeds() {
     local -a FIRST_RUN=()
     first_run_options
@@ -266,6 +274,7 @@ test_first_run_succeeds() {
     assert_output_contains 'The SSH server answers new connections.'
 }
 
+# First run created the group.
 test_first_run_created_the_group() {
     local gid
     gid="$(getent group "$SYS_GROUP" | cut -d: -f3)"
@@ -276,6 +285,7 @@ test_first_run_created_the_group() {
     assert_file_contains "$TEST_SUITE_TMP/first-run-output" "The group 'impact' has the number $gid."
 }
 
+# First run created folders and files.
 test_first_run_created_folders_and_files() {
     assert_file_facts /etc/impact 755 root root
     assert_file_facts "$CONF" 644 root root
@@ -295,6 +305,7 @@ test_first_run_created_folders_and_files() {
     assert_eq '' "$(ls -A "$SYS_ROOT_B")"
 }
 
+# First run wrote valid settings.
 test_first_run_wrote_valid_settings() {
     load_library
     assert_success impact_conf_load
@@ -321,6 +332,7 @@ test_first_run_wrote_valid_settings() {
     rmdir "$SYS_ROOT_A/probe"
 }
 
+# First run wrote the ssh rules.
 test_first_run_wrote_the_ssh_rules() {
     load_library
     assert_file_facts "$RULES" 644 root root
@@ -332,6 +344,7 @@ test_first_run_wrote_the_ssh_rules() {
     assert_success /usr/sbin/sshd -t
 }
 
+# First run wrote one log block.
 test_first_run_wrote_one_log_block() {
     assert_file_facts "$LOG_FILE" 600 root root
     local block
@@ -347,6 +360,7 @@ test_first_run_wrote_one_log_block() {
     assert_not_contains "$block" 'Test that'
 }
 
+# Non member settings are identical before and after.
 test_non_member_settings_are_identical_before_and_after() {
     sys_effective_ssh "$SYS_ADMIN" >"$TEST_TMP/admin-after"
     sys_effective_ssh root >"$TEST_TMP/root-after"
@@ -362,6 +376,7 @@ test_non_member_settings_are_identical_before_and_after() {
     assert_success cmp -s "$TEST_SUITE_TMP/member-before" "$TEST_TMP/member-after"
 }
 
+# Second run changes nothing.
 test_second_run_changes_nothing() {
     local -a FIRST_RUN=()
     first_run_options
@@ -388,6 +403,7 @@ test_second_run_changes_nothing() {
 # A member of the group
 # ----------------------------------------------------------------------------
 
+# Member gets the restricted values.
 test_member_gets_the_restricted_values() {
     load_library
     usermod --append --groups "$SYS_GROUP" "$MEMBER"
@@ -408,6 +424,7 @@ test_member_gets_the_restricted_values() {
     assert_success cmp -s "$TEST_SUITE_TMP/admin-before" "$TEST_TMP/admin-after"
 }
 
+# Password login is refused for a member.
 test_password_login_is_refused_for_a_member() {
     assert_eq 'publickey' "$(sys_ssh_offered_methods "$MEMBER")" "login methods offered to a member"
     run_cmd sys_ssh_password "$MEMBER" "$MEMBER_PASSWORD" id -un
@@ -419,6 +436,7 @@ test_password_login_is_refused_for_a_member() {
     assert_eq "$MEMBER" "$RUN_OUTPUT"
 }
 
+# Password login still works outside the group.
 test_password_login_still_works_outside_the_group() {
     assert_contains "$(sys_ssh_offered_methods "$SYS_ADMIN")" 'password' "login methods offered to the administrator"
     run_cmd sys_ssh_password "$SYS_ADMIN" "$SYS_ADMIN_PASSWORD" id -un
@@ -429,6 +447,7 @@ test_password_login_still_works_outside_the_group() {
     assert_status 255
 }
 
+# Member forwarding is limited to the port range.
 test_member_forwarding_is_limited_to_the_port_range() {
     if ! command -v python3 >/dev/null 2>&1; then
         skip "python3 is needed for the small web servers of this test"
@@ -463,6 +482,7 @@ test_member_forwarding_is_limited_to_the_port_range() {
 # Later runs
 # ----------------------------------------------------------------------------
 
+# Dry run of a change changes nothing.
 test_dry_run_of_a_change_changes_nothing() {
     snapshot_unchanged_by --content "${WATCHED[@]}" -- sys_as_admin "$SETUP" --dry-run --port-max 8800 --min-free-gb 300
     assert_status 0
@@ -473,6 +493,7 @@ test_dry_run_of_a_change_changes_nothing() {
     assert_eq '8830' "$(conf_value PORT_MAX)"
 }
 
+# Changed port range rewrites the permitopen line.
 test_changed_port_range_rewrites_the_permitopen_line() {
     load_library
     local hups_before
@@ -542,6 +563,7 @@ test_undo_of_a_port_change_restores_rules_and_settings() {
     assert_eq '127.0.0.1:8790' "$(sys_effective_ssh "$MEMBER" | grep '^permitopen ' | awk '{ print $NF }')"
 }
 
+# Administrator inside the group is refused before any change.
 test_administrator_inside_the_group_is_refused_before_any_change() {
     # If the account that runs the command were a member, the rules would
     # restrict its own login. The command must stop before it changes
@@ -554,6 +576,7 @@ test_administrator_inside_the_group_is_refused_before_any_change() {
     assert_eq '8790' "$(conf_value PORT_MAX)"
 }
 
+# Conflicts with the current state are refused.
 test_conflicts_with_the_current_state_are_refused() {
     local before="$TEST_TMP/before" after="$TEST_TMP/after"
     snapshot_take "$before" --content "${WATCHED[@]}"
@@ -574,6 +597,7 @@ test_conflicts_with_the_current_state_are_refused() {
     snapshot_assert_same "$before" "$after" "a refused call changed the system"
 }
 
+# Storage root in use and model dir in use cannot be dropped.
 test_storage_root_in_use_and_model_dir_in_use_cannot_be_dropped() {
     # A model that uses the second root.
     mkdir -p /srv/impact/models/Example-Model
@@ -588,6 +612,7 @@ test_storage_root_in_use_and_model_dir_in_use_cannot_be_dropped() {
     rm -rf /srv/impact/models/Example-Model
 }
 
+# Invalid settings file stops with exit code 3.
 test_invalid_settings_file_stops_with_exit_code_3() {
     cp -p "$CONF" "$TEST_TMP/conf-copy"
     printf 'PORT_MIN=8787\n' >>"$CONF"
@@ -647,6 +672,7 @@ assert_previous_state_is_back() {
     assert_eq 'publickey' "$(sys_ssh_offered_methods "$MEMBER")"
 }
 
+# Broken rules file is detected and the previous state restored.
 test_broken_rules_file_is_detected_and_the_previous_state_restored() {
     rules_command
     snapshot_take "$TEST_TMP/before" --content "${WATCHED[@]}"
@@ -664,6 +690,7 @@ test_broken_rules_file_is_detected_and_the_previous_state_restored() {
     assert_previous_state_is_back "$TEST_TMP/before"
 }
 
+# Rules that touch the administrator are detected and restored.
 test_rules_that_touch_the_administrator_are_detected_and_restored() {
     rules_command
     snapshot_take "$TEST_TMP/before" --content "${WATCHED[@]}"
@@ -682,6 +709,7 @@ test_rules_that_touch_the_administrator_are_detected_and_restored() {
     assert_status 0
 }
 
+# Rules without effect for members are detected and restored.
 test_rules_without_effect_for_members_are_detected_and_restored() {
     # Another rules file, read earlier by sshd, gives the member a value
     # first. The member would then not get the restricted values; the
@@ -704,6 +732,7 @@ test_rules_without_effect_for_members_are_detected_and_restored() {
     assert_status 0
 }
 
+# Already broken configuration is reported and nothing changes.
 test_already_broken_configuration_is_reported_and_nothing_changes() {
     # A broken file of another origin: the command must not touch anything.
     printf 'NoSuchOptionOfSshd yes\n' >/etc/ssh/sshd_config.d/70-impact-test-broken.conf
@@ -716,6 +745,7 @@ test_already_broken_configuration_is_reported_and_nothing_changes() {
     assert_success /usr/sbin/sshd -t
 }
 
+# Missing include line is explained.
 test_missing_include_line_is_explained() {
     cp -p /etc/ssh/sshd_config "$TEST_TMP/sshd_config-copy"
     sed -i -e 's/^Include /#Include /' /etc/ssh/sshd_config
@@ -731,6 +761,7 @@ test_missing_include_line_is_explained() {
 # The reload through systemd (with a stand-in for systemctl)
 # ----------------------------------------------------------------------------
 
+# Reload uses systemctl when systemd runs.
 test_reload_uses_systemctl_when_systemd_runs() {
     sys_fake_systemd_install ssh.service
     run_cmd sys_as_admin "$SETUP" --port-max 8791
@@ -745,6 +776,7 @@ test_reload_uses_systemctl_when_systemd_runs() {
     assert_file_contains "$RULES" '127.0.0.1:8791'
 }
 
+# Socket activated service needs no reload.
 test_socket_activated_service_needs_no_reload() {
     # Ubuntu 24.04 before the first connection: only ssh.socket is active.
     sys_fake_systemd_install ssh.socket
@@ -763,6 +795,7 @@ test_socket_activated_service_needs_no_reload() {
     assert_eq '8792' "$(conf_value PORT_MAX)"
 }
 
+# Failed reload puts rules and settings back.
 test_failed_reload_puts_rules_and_settings_back() {
     sys_fake_systemd_install ssh.service
     : >/run/impact-test-reload-fails
@@ -807,6 +840,7 @@ fake_dockerd() {
     chmod 755 /usr/local/bin/dockerd
 }
 
+# Old docker refuses tunnel mode and warns in direct mode.
 test_old_docker_refuses_tunnel_mode_and_warns_in_direct_mode() {
     fake_dockerd 28.3.2
     snapshot_unchanged_by --content "${WATCHED[@]}" -- sys_as_admin "$SETUP" --min-free-gb 250
@@ -826,6 +860,7 @@ test_old_docker_refuses_tunnel_mode_and_warns_in_direct_mode() {
     assert_output_contains 'Docker Engine 28.3.3 is installed'
 }
 
+# Snap docker is a clear fail.
 test_snap_docker_is_a_clear_fail() {
     # A docker program that lives in /snap, reached through the PATH.
     mkdir -p /snap/bin
@@ -844,6 +879,7 @@ test_snap_docker_is_a_clear_fail() {
 # Removing the SSH rules
 # ----------------------------------------------------------------------------
 
+# Remove ssh rules stands alone.
 test_remove_ssh_rules_stands_alone() {
     snapshot_unchanged_by --content "${WATCHED[@]}" -- sys_as_admin "$SETUP" --remove-ssh-rules --port-max 8800
     assert_status 2
@@ -854,6 +890,7 @@ test_remove_ssh_rules_stands_alone() {
     assert_exists "$RULES"
 }
 
+# Remove ssh rules restores the state before.
 test_remove_ssh_rules_restores_the_state_before() {
     run_cmd sys_as_admin "$SETUP" --remove-ssh-rules
     assert_status 0
@@ -889,6 +926,56 @@ test_remove_ssh_rules_restores_the_state_before() {
     assert_output_contains 'Nothing to do'
 }
 
+# A change of a value while there are no SSH rules (removed just above):
+# the run writes the rules again. "How to undo" names first the command
+# that sets the previous value (it writes the rules for that value as
+# well), then the removal of the rules. Followed from top to bottom, the
+# lines lead back to the state before the run: the previous settings file
+# and no rules file. (The other order left a rules file that did not exist
+# before.)
+test_undo_of_a_change_after_removed_rules_leaves_no_rules() {
+    local old_max command change_output rules_after conf_after
+    local -a commands=() statuses=()
+    assert_missing "$RULES"
+    old_max="$(conf_value PORT_MAX)"
+    cp -p "$CONF" "$TEST_TMP/conf-before"
+    run_cmd sys_as_admin "$SETUP" --port-max 8800
+    assert_status 0
+    assert_exists "$RULES"
+    change_output="$RUN_OUTPUT"
+    printf '%s\n' "$RUN_OUTPUT" >"$TEST_TMP/change-output"
+    mapfile -t commands < <(undo_commands "$TEST_TMP/change-output")
+    # The lines are typed by the administrator, in the printed order.
+    for command in "${commands[@]}"; do
+        run_cmd runuser -u "$SYS_ADMIN" -- bash -c "cd / && $command"
+        statuses+=("$RUN_STATUS")
+    done
+    rules_after='missing'
+    if [[ -e "$RULES" ]]; then
+        rules_after='present'
+    fi
+    conf_after='same'
+    if ! cmp -s "$TEST_TMP/conf-before" "$CONF"; then
+        conf_after='differs'
+    fi
+    # The next tests start from the state before this test (the previous
+    # settings, no rules file), whatever the printed lines did.
+    if [[ "$conf_after" != 'same' ]]; then
+        run_cmd sys_as_admin "$SETUP" --port-max "$old_max"
+    fi
+    if [[ -e "$RULES" ]]; then
+        run_cmd sys_as_admin "$SETUP" --remove-ssh-rules
+    fi
+    assert_eq 2 "${#commands[@]}" "number of undo commands"
+    assert_eq "sudo impact-workstation-setup --port-max $old_max" "${commands[0]}"
+    assert_eq 'sudo impact-workstation-setup --remove-ssh-rules' "${commands[1]}"
+    assert_contains "$change_output" 'Then remove the SSH rules again (there were none before this run): sudo impact-workstation-setup --remove-ssh-rules'
+    assert_eq '0 0' "${statuses[*]}" "exit codes of the undo lines"
+    assert_eq 'missing' "$rules_after" "the rules file after the undo lines"
+    assert_eq 'same' "$conf_after" "the settings file after the undo lines"
+}
+
+# Plain run writes the rules again.
 test_plain_run_writes_the_rules_again() {
     load_library
     run_cmd sys_as_admin "$SETUP"
@@ -901,6 +988,7 @@ test_plain_run_writes_the_rules_again() {
     assert_status 255
 }
 
+# Interrupted ssh step puts the previous rules back.
 test_interrupted_ssh_step_puts_the_previous_rules_back() {
     # Start a change and interrupt the command while its SSH step runs. The
     # stand-in for systemctl is made to wait during the reload, which gives

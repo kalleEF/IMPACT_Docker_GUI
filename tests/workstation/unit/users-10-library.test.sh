@@ -108,12 +108,14 @@ END
 # Texts of authorized_keys
 # ----------------------------------------------------------------------------
 
+# Count keys ignores comments and blank lines.
 test_count_keys_ignores_comments_and_blank_lines() {
     assert_eq 0 "$(impact_users_count_keys '')"
     assert_eq 0 "$(impact_users_count_keys $'# a comment\n\n   \n')"
     assert_eq 2 "$(impact_users_count_keys $'ssh-ed25519 AAAA x\n# note\n\nno-pty ssh-rsa AAAA y\n')"
 }
 
+# Text with line adds one line and drops trailing blank lines.
 test_text_with_line_adds_one_line_and_drops_trailing_blank_lines() {
     assert_eq 'new' "$(impact_users_text_with_line '' 'new')"
     assert_eq $'old\nnew' "$(impact_users_text_with_line $'old\n\n\n' 'new')"
@@ -123,6 +125,7 @@ test_text_with_line_adds_one_line_and_drops_trailing_blank_lines() {
     assert_eq 2 "$(wc -l <"$TEST_TMP/out")" "number of lines"
 }
 
+# Text has blob finds the key also after options.
 test_text_has_blob_finds_the_key_also_after_options() {
     local blob='AAAAC3NzaC1lZDI1NTE5AAAAIOnly-for-a-text-test'
     assert_success impact_users_text_has_blob "ssh-ed25519 $blob a@pc" "$blob"
@@ -132,6 +135,7 @@ test_text_has_blob_finds_the_key_also_after_options() {
     assert_fails impact_users_text_has_blob '' "$blob"
 }
 
+# Key entries describe every line.
 test_key_entries_describe_every_line() {
     need_ssh_keygen
     make_key alice
@@ -149,6 +153,7 @@ test_key_entries_describe_every_line() {
     assert_fails impact_users_text_has_fingerprint "$(line_of alice)" "$(print_of bob)"
 }
 
+# Removing by fingerprint keeps everything else.
 test_removing_by_fingerprint_keeps_everything_else() {
     need_ssh_keygen
     make_key alice
@@ -171,6 +176,7 @@ test_removing_by_fingerprint_keeps_everything_else() {
 # The key archive and the way back
 # ----------------------------------------------------------------------------
 
+# Fingerprint file name uses safe letters only.
 test_fingerprint_file_name_uses_safe_letters_only() {
     assert_eq 'SHA256_ab_cd-ef' "$(impact_users_fingerprint_file_name 'SHA256:ab/cd+ef')"
     assert_eq '/opt/impact/admin/keys/alice/received/SHA256_x_y-z.pub' "$(impact_users_received_path alice 'SHA256:x/y+z')"
@@ -178,6 +184,7 @@ test_fingerprint_file_name_uses_safe_letters_only() {
     assert_matches "$(impact_users_new_archive_name alice key)" '^/opt/impact/admin/keys/alice/key-removed-[0-9]{8}T[0-9]{6}Z$'
 }
 
+# Archived keys are listed in the order of their numbers.
 test_archived_keys_are_listed_in_the_order_of_their_numbers() {
     need_ssh_keygen
     local number
@@ -196,6 +203,8 @@ test_archived_keys_are_listed_in_the_order_of_their_numbers() {
     assert_eq '' "$(impact_users_archived_keys "$TEST_TMP/nothing-here")"
 }
 
+# The text that brings a removed person back names the exact commands with the
+# saved keys.
 test_way_back_text() {
     need_ssh_keygen
     make_key k1
@@ -219,6 +228,7 @@ test_way_back_text() {
 # Last login, processes, texts
 # ----------------------------------------------------------------------------
 
+# Lastlog output is read.
 test_lastlog_output_is_read() {
     local header='Username         Port     From                                       Latest'
     assert_eq 'never' "$(impact_users_parse_lastlog "$header"$'\n''alice                                                              **Never logged in**')"
@@ -230,6 +240,7 @@ test_lastlog_output_is_read() {
     assert_eq 'never' "$(impact_users_parse_lastlog '')"
 }
 
+# Ssh log lines are read in both formats.
 test_ssh_log_lines_are_read_in_both_formats() {
     # Ubuntu 24.04 writes the time in ISO form, Ubuntu 22.04 the classic form.
     assert_eq '2026-11-24T10:00:00 from 192.0.2.10' \
@@ -242,6 +253,7 @@ test_ssh_log_lines_are_read_in_both_formats() {
     assert_fails impact_users_parse_auth_line 'Nov 24 10:00:00 workstation sshd[1]: Connection closed by 192.0.2.10'
 }
 
+# Processes of one user number are found.
 test_processes_of_one_user_number_are_found() {
     local ps_output
     ps_output="$(printf '%s\n' \
@@ -258,6 +270,7 @@ test_processes_of_one_user_number_are_found() {
     assert_fails impact_users_processes 'abc'
 }
 
+# Texts for the colleague and the administrator.
 test_texts_for_the_colleague_and_the_administrator() {
     declare -gA IMPACT_CONF=([ADMIN_CONTACT]='Alice Example (alice@example.org)' [DEPUTY_CONTACT]='')
     local text
@@ -271,6 +284,7 @@ test_texts_for_the_colleague_and_the_administrator() {
     assert_contains "$(impact_users_docker_statement)" 'same power as root'
 }
 
+# Default home and protected accounts.
 test_default_home_and_protected_accounts() {
     assert_matches "$(impact_users_default_home alice)" '^/[A-Za-z0-9._/-]+/alice$'
     assert_fails impact_users_check_changeable root
@@ -283,6 +297,7 @@ test_default_home_and_protected_accounts() {
 # Getting and choosing a key (small commands)
 # ----------------------------------------------------------------------------
 
+# One key from a file or from standard input.
 test_one_key_from_a_file_or_from_standard_input() {
     need_ssh_keygen
     make_key alice
@@ -300,6 +315,7 @@ test_one_key_from_a_file_or_from_standard_input() {
     assert_output_contains 'Nothing was changed'
 }
 
+# Unaccepted keys end with exit code 2.
 test_unaccepted_keys_end_with_exit_code_2() {
     need_ssh_keygen
     make_key alice
@@ -316,6 +332,7 @@ test_unaccepted_keys_end_with_exit_code_2() {
     assert_status 2
 }
 
+# Several keys need the fingerprint.
 test_several_keys_need_the_fingerprint() {
     need_ssh_keygen
     make_key k1

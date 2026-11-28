@@ -238,12 +238,14 @@ copy_state() {
 # impact-get-repo: refusals
 # ----------------------------------------------------------------------------
 
+# Get repo refuses root.
 test_get_repo_refuses_root() {
     run_cmd "$GET" "$MODEL"
     assert_result error 2 run_as_root
     assert_output_contains 'impact-give-repo'
 }
 
+# Get repo refuses wrong and hostile input before any change.
 test_get_repo_refuses_wrong_and_hostile_input_before_any_change() {
     local before="$TEST_TMP/before" after="$TEST_TMP/after" index
     snapshot_take "$before" --content /home/alice /srv/impact /mnt/disk_a
@@ -280,6 +282,7 @@ test_get_repo_refuses_wrong_and_hostile_input_before_any_change() {
     assert_missing "$HOSTILE_MARK"
 }
 
+# Get repo dry run changes nothing.
 test_get_repo_dry_run_changes_nothing() {
     snapshot_unchanged_by --content /home/alice /srv/impact -- as_person alice "$GET" "$MODEL" --dry-run
     assert_result ok 0 dry_run
@@ -292,6 +295,7 @@ test_get_repo_dry_run_changes_nothing() {
 # impact-get-repo: the copy
 # ----------------------------------------------------------------------------
 
+# Get repo makes the copy with extras that git ignores.
 test_get_repo_makes_the_copy_with_extras_that_git_ignores() {
     run_cmd as_person alice "$GET" "$MODEL"
     assert_result ok 0 cloned
@@ -312,12 +316,14 @@ test_get_repo_makes_the_copy_with_extras_that_git_ignores() {
     assert_output_contains "rm -rf $ALICE_COPY"
 }
 
+# Get repo second run changes nothing and says the copy exists.
 test_get_repo_second_run_changes_nothing_and_says_the_copy_exists() {
     snapshot_unchanged_by --content /home/alice /srv/impact -- as_person alice "$GET" "$MODEL"
     assert_result error 4 exists
     assert_output_contains 'You have a working copy of Example-Model already'
 }
 
+# Existing target is never touched.
 test_existing_target_is_never_touched() {
     # A plain folder with the model's name, and a symbolic link.
     as_person alice mkdir /home/alice/Repositories/Closed-Model
@@ -330,6 +336,7 @@ test_existing_target_is_never_touched() {
     rm -rf /home/alice/Repositories/Closed-Model /home/alice/Repositories/Net-Model
 }
 
+# Leftover partial is removed first.
 test_leftover_partial_is_removed_first() {
     rm -rf -- "$ALICE_COPY"
     as_person alice mkdir -p "$ALICE_COPY.partial/half"
@@ -341,6 +348,7 @@ test_leftover_partial_is_removed_first() {
     assert_exists "$ALICE_COPY/.git"
 }
 
+# Extra in the way of a repository file stops everything.
 test_extra_in_the_way_of_a_repository_file_stops_everything() {
     # One extra with the path of a tracked file, one below a tracked file.
     install -m 640 -o root -g "$SYS_GROUP" /dev/null "$EXTRAS/inputs/tracked.csv"
@@ -359,6 +367,7 @@ test_extra_in_the_way_of_a_repository_file_stops_everything() {
     rm -f -- /home/bob/.ssh/id_ed25519_bob-example
 }
 
+# Invalid extras are refused before the clone.
 test_invalid_extras_are_refused_before_the_clone() {
     ln -s /etc/passwd "$EXTRAS/inputs/link.csv"
     run_cmd as_person carol "$GET" "$MODEL"
@@ -369,10 +378,36 @@ test_invalid_extras_are_refused_before_the_clone() {
     rm -f -- "$EXTRAS/inputs/link.csv"
 }
 
+# A repository whose own .gitignore takes an extra back in: the line
+# "!inputs/extra.csv" outranks the copy's ignore list (.git/info/exclude),
+# so "git add -A" would send the extra to GitHub. impact-get-repo proves
+# that git ignores every extra and stops before the copy gets its name.
+test_extra_that_the_repository_takes_back_in_stops_the_copy() {
+    local work="$TEST_SUITE_TMP/work-ignore" extras=/srv/impact/models/Ignore-Model/extras
+    root_git init -q -b main "$work"
+    root_git -C "$work" config user.name 'Test Example'
+    root_git -C "$work" config user.email 'test@example.org'
+    printf 'Ignore model\n' >"$work/README.md"
+    printf '!inputs/extra.csv\n' >"$work/.gitignore"
+    root_git -C "$work" add -A
+    root_git -C "$work" commit -q -m 'takes an extra back in'
+    root_git clone -q --bare "$work" "$GIT_BASE/example-org/Ignore-Model.git"
+    chmod -R a+rX "$GIT_BASE"
+    add_model Ignore-Model git@github.com:example-org/Ignore-Model.git Ignore
+    install -d -m 2750 -o root -g "$SYS_GROUP" "$extras/inputs"
+    install -m 640 -o root -g "$SYS_GROUP" /dev/null "$extras/inputs/extra.csv"
+    run_cmd as_person alice "$GET" Ignore-Model
+    assert_result error 1 extras_not_ignored
+    assert_output_contains 'git does not ignore every extra file'
+    assert_missing /home/alice/Repositories/Ignore-Model
+    assert_missing /home/alice/Repositories/Ignore-Model.partial
+}
+
 # ----------------------------------------------------------------------------
 # impact-get-repo: the way to GitHub
 # ----------------------------------------------------------------------------
 
+# No access and network problem have their own exit codes.
 test_no_access_and_network_problem_have_their_own_exit_codes() {
     run_cmd as_person alice "$GET" Closed-Model
     assert_result error 5 no_access
@@ -384,6 +419,7 @@ test_no_access_and_network_problem_have_their_own_exit_codes() {
     assert_missing /home/alice/Repositories/Net-Model.partial
 }
 
+# Server without a github host key is refused.
 test_server_without_a_github_host_key_is_refused() {
     # The SSH server of the tests shows its own host key, which is not one
     # of GitHub's keys in /etc/impact/github_known_hosts.
@@ -394,6 +430,7 @@ test_server_without_a_github_host_key_is_refused() {
     assert_missing /home/alice/Repositories/Ssh-Model.partial
 }
 
+# Real ssh with the key copy and a refused key.
 test_real_ssh_with_the_key_copy_and_a_refused_key() {
     # For this test only, the host key of the test server counts as known.
     cp -p -- "$KNOWN_HOSTS" "$TEST_TMP/known_hosts.saved"
@@ -417,6 +454,8 @@ test_real_ssh_with_the_key_copy_and_a_refused_key() {
     assert_missing /home/bob/Repositories/Ssh-Model.partial
 }
 
+# impact-get-repo needs exactly one key copy, or --github-name when there are
+# several.
 test_key_copy_rules() {
     # No key copy at all.
     run_cmd as_person bob "$GET" "$MODEL"
@@ -445,6 +484,7 @@ test_key_copy_rules() {
     rm -f /home/carol/.ssh/id_ed25519_link-example
 }
 
+# Model branch is cloned.
 test_model_branch_is_cloned() {
     run_cmd as_person alice "$GET" Dev-Model
     assert_result ok 0 cloned
@@ -453,6 +493,7 @@ test_model_branch_is_cloned() {
     assert_eq 'FROM example:dev' "$(cat /home/alice/Repositories/Dev-Model/docker_setup/Dockerfile)" "Dockerfile of the branch"
 }
 
+# Symbolic link as repository folder is refused.
 test_symbolic_link_as_repository_folder_is_refused() {
     mkdir -p "$TEST_TMP/elsewhere"
     chmod 777 "$TEST_TMP/elsewhere"
@@ -467,6 +508,7 @@ test_symbolic_link_as_repository_folder_is_refused() {
 # impact-give-repo
 # ----------------------------------------------------------------------------
 
+# Give repo needs root and refuses wrong input.
 test_give_repo_needs_root_and_refuses_wrong_input() {
     local before="$TEST_TMP/before" after="$TEST_TMP/after" index
     run_cmd runuser -u "$SYS_ADMIN" -- "$GIVE" carol "$MODEL"
@@ -513,6 +555,7 @@ test_give_repo_needs_root_and_refuses_wrong_input() {
     assert_missing "$HOSTILE_MARK"
 }
 
+# Give repo dry run changes nothing.
 test_give_repo_dry_run_changes_nothing() {
     snapshot_unchanged_by --content /home/carol /srv/impact /opt/impact -- \
         sys_as_admin "$GIVE" carol "$MODEL" --github-name carol-example --dry-run
@@ -520,6 +563,7 @@ test_give_repo_dry_run_changes_nothing() {
     assert_output_contains '[dry run] Make the working copy /home/carol/Repositories/Example-Model for carol with the key copy /home/carol/.ssh/id_ed25519_carol-example'
 }
 
+# Give repo with the key copy.
 test_give_repo_with_the_key_copy() {
     run_cmd sys_as_admin "$GIVE" carol "$MODEL" --github-name carol-example
     assert_status 0
@@ -531,6 +575,7 @@ test_give_repo_with_the_key_copy() {
     assert_file_contains /opt/impact/admin/log/impact-admin.log "command: impact-give-repo carol $MODEL"
 }
 
+# Give repo second run changes nothing.
 test_give_repo_second_run_changes_nothing() {
     snapshot_unchanged_by --content --exclude /opt/impact/admin/log /home/carol /srv/impact /opt/impact -- \
         sys_as_admin "$GIVE" carol "$MODEL" --github-name carol-example
@@ -539,6 +584,7 @@ test_give_repo_second_run_changes_nothing() {
     assert_output_contains 'Nothing to do'
 }
 
+# Give repo refuses a symbolic link as key copy.
 test_give_repo_refuses_a_symbolic_link_as_key_copy() {
     install -d -m 700 -o dave -g dave /home/dave/.ssh
     as_person dave ln -s /etc/hostname /home/dave/.ssh/id_ed25519_dave-example
@@ -549,6 +595,7 @@ test_give_repo_refuses_a_symbolic_link_as_key_copy() {
     rm -f /home/dave/.ssh/id_ed25519_dave-example
 }
 
+# Give repo without a key copy uses anonymous https.
 test_give_repo_without_a_key_copy_uses_anonymous_https() {
     run_cmd sys_as_admin "$GIVE" dave "$MODEL" --github-name dave-example
     assert_status 0
@@ -558,6 +605,25 @@ test_give_repo_without_a_key_copy_uses_anonymous_https() {
     assert_eq '' "$(as_person dave git -C /home/dave/Repositories/Example-Model status --porcelain --untracked-files=all)" "git status"
 }
 
+# Over anonymous HTTPS only public repositories can be copied. When GitHub
+# refuses such a copy, the message names the likely cause (a private
+# repository and no key copy yet) and the step for the administrator, with
+# no "contact the administrator". The messages of impact-get-repo stand in
+# a frame, each line marked with "|".
+test_give_repo_anonymous_refusal_names_the_missing_key_copy() {
+    run_cmd sys_as_admin "$GIVE" dave Closed-Model --github-name dave-example
+    assert_status 5
+    assert_output_contains '--- messages of impact-get-repo, run as dave ---'
+    assert_output_contains '    | '
+    assert_output_contains '--- end of the messages of impact-get-repo ---'
+    assert_output_contains 'Over anonymous HTTPS only public repositories can be copied'
+    assert_output_contains 'let the person start the GUI once (it places the key copy for git), then run this again'
+    assert_output_contains 'its messages are in the frame above'
+    assert_missing /home/dave/Repositories/Closed-Model
+    assert_missing /home/dave/Repositories/Closed-Model.partial
+}
+
+# Give repo takes the github name from the account record.
 test_give_repo_takes_the_github_name_from_the_account_record() {
     # The record that impact-add-user writes for every enrolled account.
     load_library
@@ -570,6 +636,7 @@ test_give_repo_takes_the_github_name_from_the_account_record() {
     assert_exists /home/erin/Repositories/Example-Model/.git
 }
 
+# Give repo passes the exit codes of get repo on.
 test_give_repo_passes_the_exit_codes_of_get_repo_on() {
     run_cmd sys_as_admin "$GIVE" erin Closed-Model
     assert_status 5
@@ -587,6 +654,7 @@ test_give_repo_passes_the_exit_codes_of_get_repo_on() {
 # impact-check-model: the extras rule in the working copies
 # ----------------------------------------------------------------------------
 
+# Check model checks the working copies.
 test_check_model_checks_the_working_copies() {
     run_cmd sys_as_admin "$CHECK" "$MODEL"
     assert_status 0
@@ -616,6 +684,7 @@ test_check_model_checks_the_working_copies() {
 # impact-update-setup
 # ----------------------------------------------------------------------------
 
+# Update setup refuses root and wrong input.
 test_update_setup_refuses_root_and_wrong_input() {
     local before="$TEST_TMP/before" after="$TEST_TMP/after"
     run_cmd "$UPDATE" "$MODEL"
@@ -638,12 +707,14 @@ test_update_setup_refuses_root_and_wrong_input() {
     assert_missing "$HOSTILE_MARK"
 }
 
+# Update setup with nothing new changes nothing.
 test_update_setup_with_nothing_new_changes_nothing() {
     snapshot_unchanged_by --content "$ALICE_COPY" -- as_person alice "$UPDATE" "$MODEL"
     assert_result ok 0 up_to_date
     assert_output_contains 'docker_setup of your copy equals the state on GitHub'
 }
 
+# Update setup dry run changes nothing.
 test_update_setup_dry_run_changes_nothing() {
     # A new state on GitHub: docker_setup and README.md change.
     printf 'FROM example:2\n' >"$WORK/docker_setup/Dockerfile"
@@ -656,6 +727,7 @@ test_update_setup_dry_run_changes_nothing() {
     assert_output_contains '[dry run] Copy docker_setup from the default branch'
 }
 
+# Update setup copies docker setup and nothing else.
 test_update_setup_copies_docker_setup_and_nothing_else() {
     run_cmd as_person alice "$UPDATE" "$MODEL"
     assert_result ok 0 updated
@@ -674,11 +746,13 @@ test_update_setup_copies_docker_setup_and_nothing_else() {
     assert_output_contains "git -C $ALICE_COPY restore --source=HEAD --staged --worktree -- docker_setup"
 }
 
+# Update setup second run changes nothing.
 test_update_setup_second_run_changes_nothing() {
     snapshot_unchanged_by --content "$ALICE_COPY" -- as_person alice "$UPDATE" "$MODEL"
     assert_result ok 0 up_to_date
 }
 
+# Update setup never overwrites own changes.
 test_update_setup_never_overwrites_own_changes() {
     # alice commits the update, then changes the Dockerfile herself.
     as_person alice git -C "$ALICE_COPY" commit -q -m 'docker_setup update'
@@ -704,6 +778,7 @@ test_update_setup_never_overwrites_own_changes() {
     as_person alice git -C "$ALICE_COPY" commit -q -m 'docker_setup update'
 }
 
+# Update setup from another branch.
 test_update_setup_from_another_branch() {
     run_cmd as_person alice "$UPDATE" "$MODEL" --branch dev-example
     assert_result ok 0 updated
@@ -715,6 +790,7 @@ test_update_setup_from_another_branch() {
     assert_result error 1 branch_missing
 }
 
+# Update setup refuses a copy of another repository.
 test_update_setup_refuses_a_copy_of_another_repository() {
     as_person alice git -C "$ALICE_COPY" config remote.origin.url git@github.com:example-org/Other-Model.git
     snapshot_unchanged_by --content "$ALICE_COPY" -- as_person alice "$UPDATE" "$MODEL"
@@ -722,6 +798,7 @@ test_update_setup_refuses_a_copy_of_another_repository() {
     as_person alice git -C "$ALICE_COPY" config remote.origin.url "$ADDRESS"
 }
 
+# Update setup refuses an unknown host key.
 test_update_setup_refuses_an_unknown_host_key() {
     # The copy of Ssh-Model reaches the test server, whose host key is not
     # one of GitHub's keys (it was known only during an earlier test).

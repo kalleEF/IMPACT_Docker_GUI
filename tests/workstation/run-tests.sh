@@ -330,6 +330,14 @@ run_level() {
         printf 'SUMMARY %s: not run (preconditions not met)\n' "$level"
         return 1
     fi
+    if [[ "$level" == 'system' ]]; then
+        # The home folders that exist before any test runs belong to the
+        # machine (the account that builds, for example). Other programs may
+        # write inside them at any time, so snapshots record only these
+        # folders themselves, not their content (see snapshot.sh).
+        IMPACT_TEST_FOREIGN_HOMES="$(find /home -mindepth 1 -maxdepth 1 -type d 2>/dev/null | LC_ALL=C sort)"
+        export IMPACT_TEST_FOREIGN_HOMES
+    fi
     # "nullglob": a pattern without any match expands to nothing.
     shopt -s nullglob
     for file in "$TESTS_DIR/$level"/*.test.sh; do

@@ -98,6 +98,7 @@ state_of() {
     docker inspect --format '{{.State.Status}}' "impact-test-$1"
 }
 
+# Dry run stops nothing.
 test_dry_run_stops_nothing() {
     run_cmd sys_as_admin "$REMOVE" "$ACC" --dry-run
     assert_status 0
@@ -108,6 +109,7 @@ test_dry_run_stops_nothing() {
     assert_eq running "$(state_of alice)" "container of the person after the dry run"
 }
 
+# The removal stops exactly the containers of the person.
 test_the_removal_stops_exactly_the_containers_of_the_person() {
     run_cmd sys_as_admin "$REMOVE" "$ACC" --yes
     assert_status 0
@@ -118,6 +120,7 @@ test_the_removal_stops_exactly_the_containers_of_the_person() {
     assert_eq created "$(state_of created)" "container of the person that never ran"
 }
 
+# Second run changes nothing.
 test_second_run_changes_nothing() {
     run_cmd sys_as_admin "$REMOVE" "$ACC" --yes
     assert_status 0

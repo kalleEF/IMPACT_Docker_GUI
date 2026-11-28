@@ -76,6 +76,7 @@ conf_value() {
     sed -n -e "s/^$1=//p" "$CONF"
 }
 
+# Every option with its own value.
 test_every_option_with_its_own_value() {
     mkdir -p /srv/impact-test
     run_cmd sys_as_admin "$SETUP" \
@@ -120,6 +121,7 @@ test_every_option_with_its_own_value() {
     assert_eq 'Zoë Example, room 1.01' "$(conf_value ADMIN_CONTACT)"
 }
 
+# Existing group is used as it is.
 test_existing_group_is_used_as_it_is() {
     groupadd --gid 34567 "$SYS_GROUP"
     sys_setup
@@ -138,6 +140,7 @@ test_existing_group_is_used_as_it_is() {
     assert_status 4
 }
 
+# System group is never used.
 test_system_group_is_never_used() {
     groupadd --system "$SYS_GROUP"
     local gid
@@ -151,6 +154,7 @@ test_system_group_is_never_used() {
     assert_missing "$RULES"
 }
 
+# Account name and used number are refused.
 test_account_name_and_used_number_are_refused() {
     local before="$TEST_TMP/before" after="$TEST_TMP/after" admin_gid
     snapshot_take "$before" --content /etc/impact /srv /etc/ssh/sshd_config.d /mnt/disk_a /mnt/disk_b
@@ -172,6 +176,7 @@ test_account_name_and_used_number_are_refused() {
     assert_fails getent group "$SYS_GROUP"
 }
 
+# Existing storage root is left as it is.
 test_existing_storage_root_is_left_as_it_is() {
     # A root with content that belongs to another account, as on a machine
     # that is already in use.
@@ -191,6 +196,7 @@ test_existing_storage_root_is_left_as_it_is() {
     assert_file_facts "$SYS_ROOT_B" 2750 root "$SYS_GROUP"
 }
 
+# Root that members cannot enter gives a warning.
 test_root_that_members_cannot_enter_gives_a_warning() {
     mkdir -p "$SYS_ROOT_A"
     chown root:root "$SYS_ROOT_A"
@@ -201,6 +207,7 @@ test_root_that_members_cannot_enter_gives_a_warning() {
     assert_file_facts "$SYS_ROOT_A" 700 root root
 }
 
+# Storage root behind a symbolic link gives a warning.
 test_storage_root_behind_a_symbolic_link_gives_a_warning() {
     mkdir -p /mnt/disk_a/real-shared
     ln -s /mnt/disk_a/real-shared /mnt/disk_a/link-to-shared
@@ -218,6 +225,7 @@ test_storage_root_behind_a_symbolic_link_gives_a_warning() {
     assert_fails impact_storage_real_root /mnt/disk_a/real-shared
 }
 
+# Run without a running ssh server.
 test_run_without_a_running_ssh_server() {
     if sys_ssh_answers; then
         skip "an SSH server runs on this machine"
@@ -240,6 +248,7 @@ test_run_without_a_running_ssh_server() {
     mkdir -p /run/sshd
 }
 
+# Run from the unpacked folder.
 test_run_from_the_unpacked_folder() {
     # The first look at a machine happens before the installation: the
     # command must work from the unpacked folder as well.
@@ -251,6 +260,7 @@ test_run_from_the_unpacked_folder() {
     assert_status 0
 }
 
+# Link at the place of the rules file is refused before any change.
 test_link_at_the_place_of_the_rules_file_is_refused_before_any_change() {
     # A symbolic link where the rules file belongs was made by hand. The
     # command could not put it back after a failed check, so it must stop
@@ -271,6 +281,7 @@ test_link_at_the_place_of_the_rules_file_is_refused_before_any_change() {
     rm -f "$RULES"
 }
 
+# Existing folders with other rights are corrected.
 test_existing_folders_with_other_rights_are_corrected() {
     mkdir -p /srv/impact/models/Existing-Model /etc/impact
     chmod 755 /srv/impact/models

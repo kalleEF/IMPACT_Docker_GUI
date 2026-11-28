@@ -1,0 +1,132 @@
+# settings-lines.vectors: cases for the reader of KEY=value lines
+#
+# Shared test cases: the bash tests of the workstation commands read this
+# file (tests/workstation/unit/22-settings-vectors.test.sh), and the tests
+# of the GUI read the same file, so both readers of the settings file keep
+# exactly the same rules. The rules themselves are written in
+# workstation/lib/impact-settings.sh (impact_kv_parse and
+# impact_conf_check_value) and in the header of the settings file.
+#
+# Lines that start with "#" and empty lines are no cases. Escapes in the
+# texts: \n line feed (LF), \r carriage return (CR), \t tab, \\ one
+# backslash, \xHH the byte with the hexadecimal value HH (for example \x00
+# a zero byte, \xc3\xa9 the letter e with an accent in UTF-8). Every other
+# character stands for itself. A space at the start or end of a text is
+# written as \x20.
+#
+# One case: a line "ACCEPT <name> <content>" or "REFUSE <name> <content>",
+# separated by single spaces; <content> (everything after the second space)
+# is the complete file. After an ACCEPT case, one line "=> KEY=value" for
+# each pair the reader must find, in the order of the file. Keys are not
+# checked against the list of known keys here, and values are not checked
+# against their rules (that is settings-values.vectors).
+
+ACCEPT lf_line_ends A=1\nB=two words\n
+=> A=1
+=> B=two words
+
+ACCEPT crlf_line_ends A=1\r\nB=2\r\n
+=> A=1
+=> B=2
+
+ACCEPT mixed_line_ends A=1\r\nB=2\n
+=> A=1
+=> B=2
+
+ACCEPT no_line_end_after_the_last_line A=1\nB=2
+=> A=1
+=> B=2
+
+ACCEPT crlf_without_lf_at_the_end A=1\r
+=> A=1
+
+ACCEPT byte_order_mark_at_the_start \xef\xbb\xbfA=1\n
+=> A=1
+
+REFUSE byte_order_mark_in_a_later_line A=1\n\xef\xbb\xbfB=2\n
+
+ACCEPT spaces_and_tabs_around_key_and_value   A =\t1 \t\n
+=> A=1
+
+ACCEPT value_is_everything_after_the_first_equals_sign A=b=c\n
+=> A=b=c
+
+ACCEPT empty_value A=\n
+=> A=
+
+ACCEPT blanks_inside_the_value_stay A=x  y\n
+=> A=x  y
+
+ACCEPT comments_and_empty_lines \n# comment\n  \t\n\t# indented comment\nA=1\n
+=> A=1
+
+ACCEPT hash_inside_a_value_is_part_of_it A=x # no comment\n
+=> A=x # no comment
+
+ACCEPT quotes_are_part_of_the_value A="x"\n
+=> A="x"
+
+ACCEPT no_expansion A=$(id) ${HOME} `id`\n
+=> A=$(id) ${HOME} `id`
+
+ACCEPT backslash_is_part_of_the_value A=x\\ny\n
+=> A=x\\ny
+
+ACCEPT utf8_in_a_value A=Jos\xc3\xa9\n
+=> A=Jos\xc3\xa9
+
+ACCEPT utf8_in_a_comment # Jos\xc3\xa9\nA=1\n
+=> A=1
+
+ACCEPT key_with_digits_and_underscore A_1=1\n
+=> A_1=1
+
+ACCEPT non_breaking_space_after_a_value_stays A=x\xc2\xa0\n
+=> A=x\xc2\xa0
+
+ACCEPT form_feed_after_a_value_stays A=x\x0c\n
+=> A=x\x0c
+
+REFUSE lone_cr_between_two_lines A=1\rB=2\n
+
+REFUSE cr_only_line_ends A=1\rB=2\r
+
+REFUSE cr_inside_a_comment # x\rA=1\n
+
+REFUSE two_cr_before_lf A=1\r\r\n
+
+REFUSE zero_byte_in_a_key A_\x00B=1\n
+
+REFUSE zero_byte_in_a_value A=Ali\x00ce\n
+
+REFUSE zero_byte_in_a_comment # \x00\nA=1\n
+
+REFUSE invalid_utf8_in_a_value A=\xff\n
+
+REFUSE invalid_utf8_in_a_comment # \xc3(\nA=1\n
+
+REFUSE latin1_text A=Jos\xe9\n
+
+REFUSE vertical_tab_before_a_key \x0bA=1\n
+
+REFUSE form_feed_alone_on_a_line \x0c\nA=1\n
+
+REFUSE non_breaking_space_before_a_key \xc2\xa0A=1\n
+
+REFUSE key_twice A=1\nA=1\n
+
+REFUSE key_twice_with_other_values FOO=1\nFOO=2\n
+
+REFUSE lower_case_key a=1\n
+
+REFUSE key_starts_with_a_digit 1A=1\n
+
+REFUSE key_starts_with_underscore _A=1\n
+
+REFUSE line_without_equals_sign A\n
+
+REFUSE empty_key =1\n
+
+REFUSE blank_inside_a_key A B=1\n
+
+REFUSE export_in_front export A=1\n

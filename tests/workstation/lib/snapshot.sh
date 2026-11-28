@@ -31,6 +31,13 @@
 #                    (for a step that is expected to create a group or an
 #                    account and must leave the folders alone)
 #
+# Home folders of the machine
+#   The runner lists the home folders that exist before the system tests
+#   start in IMPACT_TEST_FOREIGN_HOMES (one per line). For each of them a
+#   snapshot records the folder itself (owner, mode, ACL) and leaves its
+#   content out: other programs of the machine write there at any time, and
+#   no IMPACT command writes into a folder of an account it did not enrol.
+#
 # What it changes on the system
 #   It writes the snapshot file. Everything else is only read.
 #
@@ -124,6 +131,15 @@ snapshot_take() {
                 ;;
         esac
     done
+    # The content of the machine's own home folders is left out: the find
+    # pattern "<folder>/*" matches everything below the folder, and not the
+    # folder itself.
+    local home
+    while IFS= read -r home; do
+        if [[ -n "$home" ]]; then
+            excludes+=("$home/*")
+        fi
+    done <<<"${IMPACT_TEST_FOREIGN_HOMES:-}"
     {
         if ((with_accounts == 1)); then
             printf '## accounts\n'

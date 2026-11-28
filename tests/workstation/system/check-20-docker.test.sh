@@ -159,6 +159,7 @@ assert_block() {
     assert_block_contains "$1" "  Result of block $1: $2"
 }
 
+# The docker blocks read the real daemon.
 test_the_docker_blocks_read_the_real_daemon() {
     docker_state >"$TEST_TMP/docker-before"
     snapshot_unchanged_by --content "${EXCLUDES[@]}" "${WATCHED[@]}" -- sys_as_admin "$CHECK"
@@ -218,6 +219,7 @@ test_the_docker_blocks_read_the_real_daemon() {
     assert_block_not_contains 15 'impact-test-hostile'
 }
 
+# Second run and mask change nothing in docker.
 test_second_run_and_mask_change_nothing_in_docker() {
     docker_state >"$TEST_TMP/docker-before"
     run_cmd sys_as_admin "$CHECK" --mask

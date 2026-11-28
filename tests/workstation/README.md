@@ -88,6 +88,10 @@ test_command_refuses_a_bad_name() {
   `assert_missing`, `assert_file_facts PATH MODE OWNER GROUP`, `assert_success`, `assert_fails`
   and a few more; `lib/testlib.sh` lists them with a comment each.
 - `skip "reason"` ends a test as skipped, for example when a tool is missing.
+- Every test function has a comment directly above it that states the behaviour it proves, for
+  example `# impact_lower turns upper-case letters into lower-case ones and keeps every other
+  character.` Where the name of the function already says it in full, the comment is the name
+  written as a sentence.
 
 The helper files in `lib/`:
 
@@ -113,6 +117,55 @@ snapshot_unchanged_by --content /etc/impact /opt/impact /home -- \
 assert_status 0
 ```
 
+The home folders that exist before the system tests start (for example the one of the account
+that runs the tests) belong to the machine, and other programs may write inside them at any
+time. The runner lists them in `IMPACT_TEST_FOREIGN_HOMES`, and a snapshot records only these
+folders themselves (owner, mode, access control list), without their content. Otherwise a file
+that another program changes there would make a test fail that has nothing to do with it.
+Likewise, a test that compares two reports of `impact-check` leaves out the free space of the
+disks, which changes by itself.
+
+## Stand-in programs and signals
+
+Some cases cannot be made with the real programs alone. The commands search programs first in
+`/usr/local/sbin`, then in `/usr/local/bin`, so a system test may put a small stand-in there
+and removes it again at its end: `curl` answers the questions to GitHub from local files
+(users-10), `useradd` runs the real `/usr/sbin/useradd` and then sends a signal while the
+command still waits for it (users-10), and `docker` and `dockerd` answer with fixed lists or
+versions (check-10, users-30, 20-setup).
+A stand-in proves how a command treats an answer; it proves nothing about the real program.
+
+A signal is sent to the whole process group of a command (`kill -s TERM -- -<group>`), as a
+closed SSH session does, after `setsid` gave the command a group of its own. Ctrl+C itself
+comes from a terminal: repos-30 starts `impact-give-repo` on a pseudo terminal (a terminal
+made by a small `python3` program) and types the byte that Ctrl+C sends, so the terminal
+signals every program of the command at once, as it does for a person.
+
+## Shared test cases of the settings file
+
+The GUI reads the settings file `/etc/impact/impact.conf` as well. So that both readers keep
+exactly the same rules, the cases live in two plain text files that the tests of both read:
+
+- `vectors/settings-lines.vectors`: whole files for the reader of `KEY=value` lines (line ends,
+  blanks, zero bytes, encoding, comments, duplicate keys), each marked `ACCEPT` or `REFUSE`,
+  with the pairs an accepted file must give;
+- `vectors/settings-values.vectors`: single values per key (numbers, versions, paths, storage
+  roots, container patterns, contact texts), each marked `ACCEPT` or `REFUSE`.
+
+The header of each file explains its format. `unit/22-settings-vectors.test.sh` runs every
+case. A new rule gets a new case in these files first.
+
+## The check for values of a real installation
+
+The repository is public and must not hold values of a real installation (account and host
+names, paths of the storage disks). `unit/90-delivery.test.sh` searches every file for them.
+The values themselves are kept outside the repository: the variable `IMPACT_SITE_VALUES_FILE`
+names a file with one value per line. Without that variable the test is reported as skipped.
+
+```
+IMPACT_SITE_VALUES_FILE=/path/outside/the/repository/site-values.txt bash tests/workstation/run-tests.sh unit --filter 90-delivery
+```
+
 ## Running the system tests and the scenario
 
 On a disposable Ubuntu machine with `sudo`:
@@ -134,8 +187,8 @@ sudo env IMPACT_TEST_DISPOSABLE=yes bash tests/workstation/scenario.sh
 
 The scenario takes about a minute. Its steps build on each other: when a step that later steps
 need fails (for example the installation), the later steps are reported as failed with the
-note "not run". `scenario.sh --from <folder>` installs from an unpacked delivery archive in
-place of the working copy, which tests the archive that `workstation/build-archive.sh` builds.
+note "not run". `scenario.sh --from <folder>` installs from an unpacked delivery archive; this
+tests the archive that `workstation/build-archive.sh` builds.
 `scenario.sh --keep` leaves the state in place at the end, to look at it.
 
 ## Adding a test

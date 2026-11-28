@@ -75,6 +75,15 @@
 #   sudo impact-remove-user <account> --delete    deletes it completely
 #   The command prints the matching lines for each step at its end.
 #
+# A run that stopped early
+#   When a run stops after it created the account (an error, Ctrl+C, a
+#   closed window), the account record says "enrolment not finished"
+#   (STATE=enrolling); impact-list-users and impact-check show it. Such an
+#   account has no confirmed SSH restriction yet, and impact-key refuses it.
+#   Continue: run the same impact-add-user command again (without
+#   --existing); it checks every part and does the missing steps. Or close
+#   the account: sudo impact-remove-user <account>
+#
 # Exit codes
 #   0 done, or nothing to do; 1 a check or a step failed, or the fingerprint
 #   was not confirmed; 2 wrong usage, or a key line that is not accepted;
@@ -117,6 +126,8 @@
 #                        ":") into the variables A and B; with -a LIST into a list
 #   while IFS= read -r line   read input line by line, exactly as written:
 #                        "IFS=" keeps blanks at both ends, -r keeps backslashes
+#   shopt -s nullglob    a file pattern (*.conf) without a match gives an empty
+#                        list; "shopt -u" switches this off again
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -126,7 +137,9 @@
 set -euo pipefail
 
 # Find this file's real place (the name in /usr/local/bin is a link) and load
-# the shared functions that lie next to it in ../lib.
+# the shared functions that lie next to it in ../lib. "${BASH_SOURCE[0]}" is
+# the path of this file as it was started; "readlink -f" resolves every
+# symbolic link in it.
 IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 # The comment lines below tell the checking tool "shellcheck" where the
 # loaded files are.
@@ -424,13 +437,17 @@ check_repository_folder() {
 #   In the same step the account record is written with the state
 #   "enrolling". A run that stops after this step (an error, Ctrl+C, a
 #   closed window) leaves an account that a second run of the same command
-#   continues, and that impact-remove-user can close.
+#   continues, and that impact-remove-user can close. The main flow holds
+#   the signals around this step (impact_signals_hold), and useradd ignores
+#   them while it writes the account files (impact_run_uninterrupted): a
+#   Ctrl+C during useradd therefore takes effect after the record is
+#   written, never between the two.
 create_account() {
     local -a options=(--create-home --shell /bin/bash --user-group)
     if [[ -n "$UID_WANTED" ]]; then
         options+=(--uid "$UID_WANTED")
     fi
-    useradd "${options[@]}" -- "$ACCOUNT" &&
+    impact_run_uninterrupted useradd "${options[@]}" -- "$ACCOUNT" &&
         impact_account_record_write "$ACCOUNT" "$GITHUB" enrolling
 }
 
@@ -604,9 +621,24 @@ if [[ "$MODE" == 'new' ]]; then
         text+=", the system chooses the user number"
     fi
     text+="), and note it as 'enrolment not finished' in $(impact_account_record_file "$ACCOUNT")"
-    impact_do "$text" create_account || impact_die "$IMPACT_EXIT_FAILED" "The account '$ACCOUNT' could not be created and noted." "Read the message of useradd above."
+    # From the start of useradd until the undo line below is noted, Ctrl+C,
+    # a closed window or a request to end only take effect afterwards (see
+    # create_account): the report of a stopped run then lists the account
+    # with its working undo line, and the record lets a second run of the
+    # same command continue.
+    impact_signals_hold
+    if ! impact_do "$text" create_account; then
+        if ! impact_is_dry_run && impact_account_exists "$ACCOUNT"; then
+            # useradd worked and the record could not be written (for
+            # example a full disk): the account exists without a record.
+            impact_die "$IMPACT_EXIT_FAILED" "The account '$ACCOUNT' was created, and its record $(impact_account_record_file "$ACCOUNT") could not be written (see the line above)." \
+                "Fix the cause named above, then run the same command again with --existing added; it continues the enrolment of this account. Or remove the new account (it has no key and no files yet): sudo userdel --remove $ACCOUNT"
+        fi
+        impact_die "$IMPACT_EXIT_FAILED" "The account '$ACCOUNT' could not be created and noted." "Read the message of useradd above."
+    fi
     UNDO_BY_REMOVE=1
     impact_undo "Close the account again and keep its number (add --delete to delete it with its home folder): sudo impact-remove-user $ACCOUNT"
+    impact_signals_release
     if ! impact_is_dry_run; then
         if [[ "$(impact_account_password_state "$ACCOUNT")" != 'L' ]]; then
             do_step "Lock the password of '$ACCOUNT' (useradd left it usable)" usermod --lock -- "$ACCOUNT"

@@ -51,6 +51,7 @@ script_files() {
     } | LC_ALL=C sort -u
 }
 
+# VERSION holds exactly one line with three numbers.
 test_version_file() {
     local version
     IFS= read -r version <"$WORKSTATION_DIR/VERSION"
@@ -58,6 +59,7 @@ test_version_file() {
     assert_eq 1 "$(wc -l <"$WORKSTATION_DIR/VERSION")" "VERSION has exactly one line"
 }
 
+# Scripts start with bash and pass the syntax check.
 test_scripts_start_with_bash_and_pass_the_syntax_check() {
     local file first_line
     while IFS= read -r file; do
@@ -70,6 +72,7 @@ test_scripts_start_with_bash_and_pass_the_syntax_check() {
     done < <(script_files)
 }
 
+# Scripts have unix line ends.
 test_scripts_have_unix_line_ends() {
     local file
     while IFS= read -r file; do
@@ -80,6 +83,7 @@ test_scripts_have_unix_line_ends() {
     done < <(script_files)
 }
 
+# Scripts carry the standard header.
 test_scripts_carry_the_standard_header() {
     local file header part
     while IFS= read -r file; do
@@ -93,6 +97,7 @@ test_scripts_carry_the_standard_header() {
     done < <(script_files)
 }
 
+# Commands are executable and have no extension.
 test_commands_are_executable_and_have_no_extension() {
     local file name
     for file in "$WORKSTATION_DIR"/bin/*; do
@@ -113,6 +118,7 @@ test_commands_are_executable_and_have_no_extension() {
     done
 }
 
+# No long dashes in any file.
 test_no_long_dashes_in_any_file() {
     # The two dash characters are built from their byte values, so this
     # file does not contain them itself.
@@ -165,6 +171,7 @@ test_no_site_values_in_any_file() {
     done < <(all_files)
 }
 
+# Only example addresses appear.
 test_only_example_addresses_appear() {
     # Network addresses in examples and tests come from 192.0.2.x (reserved
     # for documentation), 10.0.0.x or 192.168.1.x; 127.x and 0.0.0.0 are
@@ -181,6 +188,7 @@ test_only_example_addresses_appear() {
     done < <(all_files)
 }
 
+# Settings files are never executed.
 test_settings_files_are_never_executed() {
     local file
     while IFS= read -r file; do
@@ -195,6 +203,8 @@ test_settings_files_are_never_executed() {
     done < <(find "$WORKSTATION_DIR" -type f \( -name '*.sh' -o -path '*/bin/*' \))
 }
 
+# github_known_hosts holds GitHub's three host keys, and they have the
+# published fingerprints.
 test_github_host_keys() {
     local file="$WORKSTATION_DIR/etc/github_known_hosts"
     local -a lines=()
@@ -216,6 +226,7 @@ test_github_host_keys() {
     assert_eq 3 "$(printf '%s\n' "$prints" | wc -l)"
 }
 
+# Every library function has a comment.
 test_every_library_function_has_a_comment() {
     # Every function of the library must have a comment block directly
     # above it that starts with the name of the function.

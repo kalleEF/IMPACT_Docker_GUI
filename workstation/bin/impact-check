@@ -8,7 +8,7 @@
 #   attention) or FAIL (does not work, or a protection is missing). For WARN
 #   and FAIL the block says what to do. A summary follows at the end.
 #   The check only reads. It runs on a machine where nothing of IMPACT is
-#   installed or set up yet (the first step of the walk-through), on a half
+#   installed or set up yet (the first thing to run on a new machine), on a half
 #   set-up machine, and on a fully set-up one. It prints no secret: no key
 #   material and no password hash.
 #
@@ -105,7 +105,9 @@
 set -euo pipefail
 
 # Find this file's real place (the name in /usr/local/bin is a link) and load
-# the shared functions that lie next to it in ../lib.
+# the shared functions that lie next to it in ../lib. "${BASH_SOURCE[0]}" is
+# the path of this file as it was started; "readlink -f" resolves every
+# symbolic link in it.
 IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 # The comment lines below tell the checking tool "shellcheck" where the
 # loaded files are.
@@ -164,7 +166,8 @@ if impact_opt_given mask; then
     impact_say "Addresses and host names are masked."
 fi
 
-# 6. The blocks, in the order of the specification.
+# 6. The blocks, from the machine itself (system, disks) to the people and
+#    their containers, in the order of the help text above.
 impact_check_run_block 'System' impact_check_block_system
 impact_check_run_block 'Docker' impact_check_block_docker
 impact_check_run_block 'Free disk space' impact_check_block_free_space

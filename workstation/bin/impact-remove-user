@@ -114,7 +114,9 @@
 set -euo pipefail
 
 # Find this file's real place (the name in /usr/local/bin is a link) and load
-# the shared functions that lie next to it in ../lib.
+# the shared functions that lie next to it in ../lib. "${BASH_SOURCE[0]}" is
+# the path of this file as it was started; "readlink -f" resolves every
+# symbolic link in it.
 IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 # The comment lines below tell the checking tool "shellcheck" where the
 # loaded files are.

@@ -90,6 +90,13 @@
 #   "${NAME:0:10}"       a part of the text: from position 0, 10 characters
 #   shopt -s nullglob    a file pattern (*.conf) without a match gives an empty
 #                        list; "shopt -u" switches this off again
+#   cat <<'END' ... END  a "here-document": the lines up to the end mark are
+#                        the input of the command; the quotes around END
+#                        switch off every replacement inside
+#   printf -v NAME FORMAT TEXT   write the formatted text into the variable
+#                        NAME (nothing is printed)
+#   BASH_REMATCH         after [[ text =~ pattern ]]: the matched text (entry 0)
+#                        and the parts in round brackets (entries 1, 2, ...)
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -131,6 +138,9 @@ IMPACT_SHARING_STATE=''      # "present", "absent" or empty
 IMPACT_SHARING_QUICK=0       # 1 = --repair: files only after the quick test
 IMPACT_SHARING_APPLY=0       # 1 = change; 0 = only count (dry run)
 IMPACT_SHARING_MODE_WORD='full'   # "full" or "repair", for run.info
+IMPACT_SHARING_EARLIER=()    # backup folders of earlier runs on the same
+                             # folder that did not finish, oldest first
+                             # (impact_sharing_unfinished_backups)
 
 # -----------------------------------------------------------------------------
 # Results
@@ -517,31 +527,18 @@ impact_sharing_mounts_below() {
 
 # impact_sharing_blocking_parents PATH GID
 #   Prints every folder above PATH (from / down to the folder that holds
-#   PATH) that members of the shared group cannot enter: neither all others
-#   nor (when it is the folder's group) the group may enter it. Members then
-#   cannot reach PATH, whatever its own rights are.
+#   PATH) that members of the shared group cannot enter, as a line "folder,
+#   a tab, the command that lets them enter". Members then cannot reach
+#   PATH, whatever its own rights are. It is the check of impact-check and
+#   impact-workstation-setup (impact_member_blocked_folders), for the
+#   folders above PATH only: PATH itself gets the rules from this command.
 impact_sharing_blocking_parents() {
-    local path="$1" gid="$2" current='' part facts mode group
-    local -a parts=()
-    # Split the path at "/" into its parts.
-    IFS='/' read -r -a parts <<<"${path#/}"
-    unset 'parts[${#parts[@]}-1]'
-    for part in '' "${parts[@]}"; do
-        if [[ -n "$part" ]]; then
-            current="$current/$part"
-        fi
-        facts="$(stat -c '%a %g' -- "${current:-/}" 2>/dev/null)" || continue
-        mode="${facts%% *}"
-        group="${facts##* }"
-        # 8#1 is the "enter" right of all others, 8#10 that of the group.
-        if (((8#$mode & 8#1) != 0)); then
-            continue
-        fi
-        if [[ "$group" == "$gid" ]] && (((8#$mode & 8#10) != 0)); then
-            continue
-        fi
-        printf '%s\n' "${current:-/}"
-    done
+    local path="$1" gid="$2" folder fix
+    # "IFS=$'\t' read -r A B" splits each line at its tab into A and B.
+    while IFS=$'\t' read -r folder fix; do
+        [[ -n "$folder" && "$folder" != "$path" ]] || continue
+        printf '%s\t%s\n' "$folder" "$fix"
+    done < <(impact_member_blocked_folders "$path" "$gid")
 }
 
 # impact_sharing_blocking_parents_for PATH ACCOUNT
@@ -935,8 +932,67 @@ impact__sharing_on_exit() {
         impact__sharing_run_info interrupted 2>/dev/null || true
         impact_changed "Apply the shared rules to $(impact_sharing_count "${IMPACT_SHARING_COUNT[changed_folders]:-0}" folder folders) and $(impact_sharing_count "${IMPACT_SHARING_COUNT[changed_files]:-0}" file files) below $IMPACT_SHARING_TARGET (the run stopped early; previous rights saved in $IMPACT_SHARING_BACKUP)"
         impact_undo "Put the previous rights back: sudo impact-share-folder --restore $IMPACT_SHARING_BACKUP"
+        impact_sharing_undo_earlier
         impact_undo "Or finish the work: run the same impact-share-folder command again."
     fi
+}
+
+# impact_sharing_unfinished_backups TARGET
+#   Prints the backup folders of earlier runs on the folder TARGET that did
+#   not finish (killed, interrupted or failed) and that no later run has
+#   completed, one per line, oldest first. A backup folder name starts with
+#   the UTC time of its run, so the order of the names is the order of the
+#   runs. Read-only.
+#   Example: mapfile -t IMPACT_SHARING_EARLIER < <(impact_sharing_unfinished_backups "$IMPACT_SHARING_TARGET")
+impact_sharing_unfinished_backups() {
+    local target="$1" info_file
+    # Without a match the pattern stays as it is; "-f" then fails and the
+    # loop goes on.
+    for info_file in "$IMPACT_ACL_BACKUP_DIR"/*/run.info; do
+        [[ -f "$info_file" && ! -L "$info_file" ]] || continue
+        # grep -x: the whole line; -F: the text as it is (a "." in a path is
+        # no pattern); -q: only the result.
+        grep -qxF -- "TARGET=$target" "$info_file" 2>/dev/null || continue
+        grep -qxF -- 'STATE=finished' "$info_file" 2>/dev/null && continue
+        grep -q -- '^CONTINUED_BY=' "$info_file" 2>/dev/null && continue
+        printf '%s\n' "${info_file%/run.info}"
+    done
+}
+
+# impact_sharing_undo_earlier
+#   Adds one "How to undo" line per earlier unfinished run on the same
+#   folder (IMPACT_SHARING_EARLIER), newest first. Each of those runs
+#   changed rights as well, and its backup holds the rights from before
+#   its own changes. Restored one after the other, newest first and after
+#   the backup of this run, they bring back the state before the first run.
+impact_sharing_undo_earlier() {
+    local index
+    for ((index = ${#IMPACT_SHARING_EARLIER[@]} - 1; index >= 0; index--)); do
+        impact_undo "Then put back the rights saved by an earlier run on this folder that did not finish: sudo impact-share-folder --restore ${IMPACT_SHARING_EARLIER[index]}"
+    done
+}
+
+# impact__sharing_mark_continued
+#   Internal: after a run that finished its walk, adds the line
+#   CONTINUED_BY=<backup of this run> to the run.info of every earlier
+#   unfinished run on the same folder (IMPACT_SHARING_EARLIER), so later
+#   runs do not call them unfinished any more. Their backups stay, and the
+#   "How to undo" of this run names them. The other lines of run.info stay
+#   as they are.
+#   Result: failure when a run.info could not be written.
+impact__sharing_mark_continued() {
+    local folder file by status=0
+    by="${IMPACT_SHARING_BACKUP:-the run of $IMPACT__SHARING_STARTED, which found nothing left to change}"
+    for folder in "${IMPACT_SHARING_EARLIER[@]}"; do
+        file="$folder/run.info"
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        # grep -v prints every line except an older CONTINUED_BY line.
+        {
+            grep -v -- '^CONTINUED_BY=' "$file"
+            printf 'CONTINUED_BY=%s\n' "$by"
+        } | impact_write_file_atomic "$file" 600 root root || status=1
+    done
+    return "$status"
 }
 
 # impact_sharing_walk
@@ -1082,6 +1138,9 @@ impact_sharing_walk() {
                 } | impact_write_file_atomic "$IMPACT_SHARING_BACKUP/problems.txt" 600 root root || true
             fi
         fi
+        if ((status != 2)) && ! impact__sharing_mark_continued; then
+            impact_warn "The run.info of an earlier unfinished run could not be marked as continued, so later runs name that run again. Its backup is complete; nothing else is affected."
+        fi
     fi
     if ((status == 2)); then
         return 2
@@ -1221,8 +1280,8 @@ impact_sharing_flags_of_mode() {
 #   links are never followed: chown -h changes a link itself, setfacl -P
 #   skips a link, and the caller checked just before that no PATH is a link.
 #   The special bits (setuid, setgid, sticky) of files are never set here:
-#   "chmod" would follow a symbolic link that somebody put in place of a
-#   file at the last moment. The caller compares them afterwards and names
+#   "chmod" would follow a symbolic link that somebody put at the place of
+#   a file at the last moment. The caller compares them afterwards and names
 #   every file whose special bits differ from the saved ones.
 impact__sharing_restore_files() {
     local key="$1" kind owner group flags entries

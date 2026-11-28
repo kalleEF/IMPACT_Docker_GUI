@@ -111,7 +111,9 @@
 set -euo pipefail
 
 # Find this file's real place (the name in /usr/local/bin is a link) and load
-# the shared functions that lie next to it in ../lib.
+# the shared functions that lie next to it in ../lib. "${BASH_SOURCE[0]}" is
+# the path of this file as it was started; "readlink -f" resolves every
+# symbolic link in it.
 IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/impact-common.sh
@@ -306,7 +308,7 @@ impact_step "docker_setup"
 # Untracked files of docker_setup (not ignored ones) count as changes too.
 UNTRACKED="$(impact_git -C "$COPY" ls-files --others --exclude-standard -- docker_setup)"
 # "git diff --quiet A -- path" succeeds when the files at path equal commit
-# A; "--cached" compares git's list of staged files instead.
+# A; with "--cached" it compares git's list of staged files with A.
 if impact_git -C "$COPY" diff --quiet "$COMMIT" -- docker_setup &&
     impact_git -C "$COPY" diff --cached --quiet "$COMMIT" -- docker_setup &&
     [[ -z "$UNTRACKED" ]]; then

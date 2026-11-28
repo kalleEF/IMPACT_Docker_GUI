@@ -267,6 +267,7 @@ terminal_answers() {
 # Refusals and the dry run
 # ----------------------------------------------------------------------------
 
+# Help and root check.
 test_help_and_root_check() {
     run_cmd runuser -u "$SYS_ADMIN" -- "$REMOVE" --help
     assert_status 0
@@ -275,6 +276,7 @@ test_help_and_root_check() {
     assert_status 2
 }
 
+# Wrong and hostile input is refused before any change.
 test_wrong_and_hostile_input_is_refused_before_any_change() {
     local name
     rm -f /tmp/impact-test-hostile
@@ -370,6 +372,7 @@ test_removal_switches_off_work_without_login_and_further_key_files() {
     assert_contains "$removal_output" 'account-removed-'
 }
 
+# Dry run changes nothing and ends no session.
 test_dry_run_changes_nothing_and_ends_no_session() {
     start_session m1
     start_tunnel m2
@@ -390,6 +393,7 @@ test_dry_run_changes_nothing_and_ends_no_session() {
     wait 2>/dev/null || true
 }
 
+# The removal asks first.
 test_the_removal_asks_first() {
     refused_without_change 1 sys_as_admin "$REMOVE" "$ACC"
     assert_output_contains 'not confirmed'
@@ -399,6 +403,7 @@ test_the_removal_asks_first() {
 # The removal
 # ----------------------------------------------------------------------------
 
+# Removal ends session and tunnel and closes the account.
 test_removal_ends_session_and_tunnel_and_closes_the_account() {
     local uid
     uid="$(id -u "$ACC")"
@@ -450,6 +455,7 @@ test_removal_ends_session_and_tunnel_and_closes_the_account() {
     assert_eq "$(cat "$TEST_SUITE_TMP/admin-ssh-before")" "$(cat "$TEST_TMP/admin-ssh-after")" "SSH settings of the administrator"
 }
 
+# A later login is refused.
 test_a_later_login_is_refused() {
     run_cmd sys_ssh_key "$ACC" m1 id -un
     assert_status 255
@@ -461,6 +467,7 @@ test_a_later_login_is_refused() {
     assert_status 255
 }
 
+# The user number is kept.
 test_the_user_number_is_kept() {
     local uid
     uid="$(cat "$TEST_SUITE_TMP/uid")"
@@ -470,6 +477,7 @@ test_the_user_number_is_kept() {
     userdel --remove newcomer 2>/dev/null || true
 }
 
+# Second run changes nothing.
 test_second_run_changes_nothing() {
     snapshot_unchanged_by --content --exclude /opt/impact/admin/log "${WATCHED[@]}" -- \
         sys_as_admin "$REMOVE" "$ACC" --yes
@@ -478,6 +486,7 @@ test_second_run_changes_nothing() {
     assert_eq "$(cat "$TEST_SUITE_TMP/way-back")" "$(way_back_lines "$RUN_OUTPUT")" "the way back printed by the second run"
 }
 
+# List users shows the removed person.
 test_list_users_shows_the_removed_person() {
     run_cmd sys_as_admin /usr/local/bin/impact-list-users
     assert_status 0
@@ -486,12 +495,14 @@ test_list_users_shows_the_removed_person() {
     assert_output_contains 'Summary: 1 enrolled, 2 removed, 0 deleted'
 }
 
+# A removed account needs the way back.
 test_a_removed_account_needs_the_way_back() {
     refused_without_change 4 sys_as_admin "$ADD" "$GH" --key-file "$(pub m1)" --fingerprint "$(print_of m1)"
     assert_output_contains '--existing'
     refused_without_change 4 sys_as_admin /usr/local/bin/impact-key add "$ACC" --key-file "$(pub m1)" --fingerprint "$(print_of m1)"
 }
 
+# The printed way back works.
 test_the_printed_way_back_works() {
     local line count=0
     while IFS= read -r line; do
@@ -512,6 +523,7 @@ test_the_printed_way_back_works() {
     assert_status 0
 }
 
+# A docker that does not answer is reported.
 test_a_docker_that_does_not_answer_is_reported() {
     sed -i -e "s/^$ID_ALICE \(.*\) exited\$/$ID_ALICE \1 running/" "$CONTAINERS"
     : >/run/impact-test-docker-down
@@ -534,6 +546,7 @@ test_a_docker_that_does_not_answer_is_reported() {
 # --delete
 # ----------------------------------------------------------------------------
 
+# Delete lists the files first and asks twice.
 test_delete_lists_the_files_first_and_asks_twice() {
     mkdir -p "$SYS_ROOT_A/Example-Model/outputs/analysis_1"
     printf 'result\n' >"$SYS_ROOT_A/Example-Model/outputs/analysis_1/table.csv"
@@ -577,6 +590,7 @@ test_delete_lists_the_files_first_and_asks_twice() {
     assert_file_contains "/opt/impact/admin/accounts/$ACC.conf" 'STATE=removed'
 }
 
+# After delete nothing to do and the way back gives the old number.
 test_after_delete_nothing_to_do_and_the_way_back_gives_the_old_number() {
     snapshot_unchanged_by --content --exclude /opt/impact/admin/log "${WATCHED[@]}" -- \
         sys_as_admin "$REMOVE" "$ACC" --delete --yes

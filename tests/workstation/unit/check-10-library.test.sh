@@ -67,6 +67,8 @@ make_block_command() {
 # Small pure helpers
 # -----------------------------------------------------------------------------
 
+# Sizes are printed in the largest fitting unit with at most one decimal
+# place.
 test_size_text() {
     assert_eq '0 bytes' "$(impact_check_size_text 0)"
     assert_eq '1023 bytes' "$(impact_check_size_text 1023)"
@@ -84,6 +86,8 @@ test_size_text() {
     assert_eq 'unknown size' "$(impact_check_size_text -5)"
 }
 
+# impact_check_gb_floor rounds bytes down to whole gigabytes, and gives 0 for
+# a text that is no number.
 test_gb_floor() {
     assert_eq 0 "$(impact_check_gb_floor 1073741823)"
     assert_eq 1 "$(impact_check_gb_floor 1073741824)"
@@ -91,6 +95,8 @@ test_gb_floor() {
     assert_eq 0 "$(impact_check_gb_floor 'x')"
 }
 
+# Listening addresses are sorted into loopback (this machine), all addresses,
+# and single network addresses.
 test_address_kind() {
     local address
     for address in 127.0.0.1 127.0.0.53 '127.0.0.53%lo' ::1 '[::1]' ::ffff:127.0.0.1; do
@@ -104,6 +110,7 @@ test_address_kind() {
     done
 }
 
+# Name patterns of known direct containers.
 test_name_patterns_of_known_direct_containers() {
     assert_success impact_check_name_matches data_preparation_1 'data_preparation_*'
     assert_success impact_check_name_matches prep_a 'other,prep_?'
@@ -119,9 +126,10 @@ test_name_patterns_of_known_direct_containers() {
     assert_fails impact_check_name_matches a ' *'
 }
 
+# Volume names like impact volumes.
 test_volume_names_like_impact_volumes() {
     local name
-    # The names of the GUI's volume mode (specification 7.6): the current
+    # The names of the GUI's volume mode (outputs in Docker volumes): the current
     # form with the container name, and the older form with model and person.
     for name in impactncd_output_Example-Model_alice impactncd_synthpop_Example-Model_alice \
         impactncd_germany_output_alice impactncd_germany_synthpop_alice IMPACTncd_Output_x \
@@ -133,6 +141,7 @@ test_volume_names_like_impact_volumes() {
     done
 }
 
+# Listener lines of ss.
 test_listener_lines_of_ss() {
     assert_success impact_check_parse_listener 'LISTEN 0      4096       127.0.0.1:8787       0.0.0.0:*    users:(("docker-proxy",pid=1234,fd=4))'
     assert_eq 127.0.0.1 "$IMPACT_CHECK_L_ADDRESS"
@@ -157,6 +166,8 @@ test_listener_lines_of_ss() {
     assert_fails impact_check_parse_listener 'garbage line'
 }
 
+# Quoted fields of docker output are unquoted; Docker's missing-label text
+# counts as empty, and escaped characters are refused.
 test_quoted_docker_fields() {
     assert_eq alice "$(impact_check_unquote '"alice"')"
     assert_eq '' "$(impact_check_unquote '""')"
@@ -171,6 +182,7 @@ test_quoted_docker_fields() {
     assert_fails impact_check_unquote '"'
 }
 
+# Ports text and reach.
 test_ports_text_and_reach() {
     assert_eq '127.0.0.1:8787 -> 8787/tcp' "$(impact_check_ports_text '127.0.0.1|8787|8787/tcp ')"
     assert_eq 'all addresses:8788 -> 8787/tcp' "$(impact_check_ports_text '0.0.0.0|8788|8787/tcp ::|8788|8787/tcp ')"
@@ -183,6 +195,8 @@ test_ports_text_and_reach() {
     assert_eq network "$(impact_check_ports_reach '192.0.2.10|8791|80/tcp')"
 }
 
+# The login keys of an authorized_keys text are counted by type, and comments
+# and empty lines do not count.
 test_counting_login_keys() {
     if ! command -v ssh-keygen >/dev/null 2>&1; then
         skip "ssh-keygen is not installed here (it is inside the private views)"
@@ -208,6 +222,8 @@ $two"
     assert_eq 0 "$IMPACT_CHECK_KEYS_OTHER"
 }
 
+# The summary of "git status" counts untracked and changed files, also for
+# renamed files and names with line breaks.
 test_git_status_output() {
     # Five entries: untracked, modified, renamed (followed by its old name),
     # an untracked name with a line break, an ignored one.
@@ -225,6 +241,7 @@ test_git_status_output() {
     assert_eq 5 "${#IMPACT_CHECK_UNTRACKED_NAMES[@]}"
 }
 
+# Ssh configuration without the rules file.
 test_ssh_configuration_without_the_rules_file() {
     local base="$TEST_TMP/etc-ssh" result
     mkdir -p "$base/sshd_config.d"
@@ -255,6 +272,7 @@ Port 22"
         "$(impact_check_config_without_rules "$base/sshd_config" "$base/sshd_config.d/60-impact.conf" "$base")"
 }
 
+# Mode writable by others.
 test_mode_writable_by_others() {
     assert_success impact_check_mode_writable_by_others 775
     assert_success impact_check_mode_writable_by_others 757
@@ -267,6 +285,7 @@ test_mode_writable_by_others() {
     assert_success impact_check_mode_writable_by_others 'abc'
 }
 
+# Entry facts never follow links.
 test_entry_facts_never_follow_links() {
     mkdir "$TEST_TMP/folder"
     : >"$TEST_TMP/file"
@@ -286,6 +305,7 @@ test_entry_facts_never_follow_links() {
 # Blocks and summary
 # -----------------------------------------------------------------------------
 
+# Blocks end with one result and what to do.
 test_blocks_end_with_one_result_and_what_to_do() {
     make_block_command blocks <<'END'
 good() { impact_check_ok "fine"; impact_check_info "a fact"; }
@@ -326,6 +346,7 @@ END
     assert_eq 6 "$(printf '%s\n' "$RUN_OUTPUT" | grep -c '^  Result of block ')"
 }
 
+# Exit code follows the worst result.
 test_exit_code_follows_the_worst_result() {
     make_block_command only-ok <<'END'
 good() { impact_check_ok "fine"; }
@@ -352,6 +373,7 @@ END
     assert_output_contains '    - Read the line above and correct what it names.'
 }
 
+# Note about default values appears once per block.
 test_note_about_default_values_appears_once_per_block() {
     make_block_command guess <<'END'
 IMPACT_CHECK_CONF_STATE='missing'
@@ -373,6 +395,7 @@ END
 # The command's options (no root needed for these)
 # -----------------------------------------------------------------------------
 
+# Help of the command.
 test_help_of_the_command() {
     run_cmd "$WORKSTATION_DIR/bin/impact-check" --help
     assert_status 0
@@ -383,6 +406,7 @@ test_help_of_the_command() {
     assert_output_not_contains 'Reading help'
 }
 
+# Wrong options are usage errors.
 test_wrong_options_are_usage_errors() {
     run_cmd "$WORKSTATION_DIR/bin/impact-check" --dry-run
     assert_status 2
@@ -396,6 +420,7 @@ test_wrong_options_are_usage_errors() {
     assert_output_contains 'control character'
 }
 
+# The command needs root.
 test_the_command_needs_root() {
     if ((EUID == 0)); then
         skip "this test needs an account without root rights (the system tests cover root)"
@@ -403,6 +428,9 @@ test_the_command_needs_root() {
     run_cmd "$WORKSTATION_DIR/bin/impact-check"
     assert_status 2
     assert_output_contains 'impact-check must run with administrator rights.'
-    assert_output_contains 'sudo impact-check'
+    # This copy is not installed, so the hint names it by its path, the way
+    # it can be typed ("sudo impact-check" would find no command).
+    assert_output_contains '/bin/impact-check ...'
+    assert_output_not_contains 'sudo impact-check ...'
     assert_output_not_contains 'Block 1'
 }

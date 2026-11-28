@@ -83,21 +83,24 @@ refused() {
     assert_missing "$HOSTILE_MARK"
 }
 
+# Wrong number of arguments is refused.
 test_wrong_number_of_arguments_is_refused() {
     refused 2 'An argument is missing'
     refused 2 'Too many arguments' "$T" "$SYS_ROOT_B/Other"
 }
 
+# Unknown and short options are refused.
 test_unknown_and_short_options_are_refused() {
     refused 2 "Unknown option '--force'" "$T" --force
     refused 2 'start with two dashes' "$T" -r
 }
 
+# Paths outside the storage roots are refused.
 test_paths_outside_the_storage_roots_are_refused() {
     refused 2 'is no absolute path' shared/Example
     refused 2 'does not exist' "$SYS_ROOT_A/Missing"
-    refused 2 'The storage root itself is not accepted' "$SYS_ROOT_A"
-    refused 2 'The storage root itself is not accepted' "$SYS_ROOT_A/"
+    refused 2 "$SYS_ROOT_A is a storage root. Give the folder of one model inside it" "$SYS_ROOT_A"
+    refused 2 "$SYS_ROOT_A is a storage root. Give the folder of one model inside it" "$SYS_ROOT_A/"
     refused 2 'lies inside none of the storage roots' /mnt/disk_a/not-shared
     refused 2 'lies inside none of the storage roots' /mnt/disk_a
     refused 2 'is a system folder' /etc
@@ -107,10 +110,12 @@ test_paths_outside_the_storage_roots_are_refused() {
     refused 2 'is a home folder' /home/alice
 }
 
+# A mount point inside a root is refused.
 test_a_mount_point_inside_a_root_is_refused() {
     refused 2 'is the top folder of a file system' "$SYS_ROOT_A/mp"
 }
 
+# Links and dots that lead out of a root are refused.
 test_links_and_dots_that_lead_out_of_a_root_are_refused() {
     refused 2 'a symbolic link (or' "$SYS_ROOT_A/to-home"
     refused 2 'leads out of it, to /home/alice' "$SYS_ROOT_A/to-home"
@@ -119,6 +124,7 @@ test_links_and_dots_that_lead_out_of_a_root_are_refused() {
     refused 2 'leads out of it, to /mnt/disk_a/not-shared' "$SYS_ROOT_A/../not-shared"
 }
 
+# Hostile names are refused.
 test_hostile_names_are_refused() {
     refused 2 'contains characters other than' "$SYS_ROOT_A/with space"
     refused 2 'does not exist' "$T; touch $HOSTILE_MARK"
@@ -131,6 +137,7 @@ test_hostile_names_are_refused() {
     refused 2 'no valid account name' "$T" --transition-user 'alice; touch /tmp/impact-test-hostile-mark'
 }
 
+# Wrong option combinations are refused.
 test_wrong_option_combinations_are_refused() {
     refused 2 '--repair cannot be combined with a transition option' "$T" --repair --transition-user oldshared
     refused 2 'not both' "$T" --transition-user oldshared --remove-transition-user oldshared
@@ -138,6 +145,7 @@ test_wrong_option_combinations_are_refused() {
     refused 2 'Too many arguments' --restore x "$T"
 }
 
+# Bad transition accounts are refused.
 test_bad_transition_accounts_are_refused() {
     refused 2 'no valid account name' "$T" --transition-user 'Old Shared'
     refused 2 "The account 'nosuchaccount' does not exist" "$T" --transition-user nosuchaccount
@@ -145,6 +153,7 @@ test_bad_transition_accounts_are_refused() {
     refused 2 'is a system account' "$T" --remove-transition-user root
 }
 
+# Bad backup folders are refused.
 test_bad_backup_folders_are_refused() {
     refused 2 'is no backup folder of this command' --restore ../../etc
     refused 2 'is no backup folder of this command' --restore /etc
@@ -167,6 +176,7 @@ test_bad_backup_folders_are_refused() {
     rm -f -- "$folder"
 }
 
+# A run without root rights is refused.
 test_a_run_without_root_rights_is_refused() {
     snapshot_unchanged_by --content /mnt/disk_a /opt/impact /etc/impact -- \
         runuser -u "$SYS_ADMIN" -- "$SHARE" "$T"
@@ -174,6 +184,7 @@ test_a_run_without_root_rights_is_refused() {
     assert_output_contains 'must run with administrator rights'
 }
 
+# Help works for everyone.
 test_help_works_for_everyone() {
     run_cmd runuser -u alice -- "$SHARE" --help
     assert_status 0
@@ -181,6 +192,7 @@ test_help_works_for_everyone() {
     assert_output_contains 'How to undo'
 }
 
+# A path that enters a root through a link is accepted.
 test_a_path_that_enters_a_root_through_a_link_is_accepted() {
     snapshot_unchanged_by --content /mnt/disk_a /opt/impact /etc/impact -- \
         sys_as_admin "$SHARE" "$OUTER_LINK" --dry-run
@@ -193,6 +205,7 @@ test_a_path_that_enters_a_root_through_a_link_is_accepted() {
     assert_output_contains "OK: Folder: $T (inside"
 }
 
+# A second run while one is busy is refused.
 test_a_second_run_while_one_is_busy_is_refused() {
     mkdir -p /run/impact
     # A process in the background holds the lock of impact-share-folder, as
@@ -207,6 +220,7 @@ test_a_second_run_while_one_is_busy_is_refused() {
     wait "$holder" 2>/dev/null || true
 }
 
+# A machine without settings is refused.
 test_a_machine_without_settings_is_refused() {
     mv -- /etc/impact/impact.conf "$TEST_TMP/impact.conf"
     run_cmd sys_as_admin "$SHARE" "$T"

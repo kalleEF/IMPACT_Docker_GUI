@@ -101,6 +101,9 @@
 #   "${!LIST[@]}"        the positions (or the names) of the entries of a list
 #   shopt -s nullglob    a file pattern (*.conf) without a match gives an empty
 #                        list; "shopt -u" switches this off again
+#   cat <<'END' ... END  a "here-document": the lines up to the end mark are
+#                        the input of the command; the quotes around END
+#                        switch off every replacement inside
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -110,7 +113,9 @@
 set -euo pipefail
 
 # Find this file's real place (the name in /usr/local/bin is a link) and load
-# the shared functions that lie next to it in ../lib.
+# the shared functions that lie next to it in ../lib. "${BASH_SOURCE[0]}" is
+# the path of this file as it was started; "readlink -f" resolves every
+# symbolic link in it.
 IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 # The comment lines that start with "shellcheck" tell the checking tool
 # where the loaded files are.

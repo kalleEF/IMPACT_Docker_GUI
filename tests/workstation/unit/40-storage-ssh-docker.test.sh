@@ -45,6 +45,8 @@ setup() {
 # Paths
 # ----------------------------------------------------------------------------
 
+# impact_path_is_below: a folder is not below itself, and a name with the same
+# beginning (shared2) is another folder.
 test_path_is_below() {
     assert_success impact_path_is_below /mnt/disk_a/shared/Model /mnt/disk_a/shared
     assert_success impact_path_is_below /mnt/disk_a/shared/Model/outputs/x /mnt/disk_a/shared
@@ -60,6 +62,7 @@ test_path_is_below() {
     assert_fails impact_path_is_below /mnt/disk_a /mnt/disk_a/shared
 }
 
+# Path is below refuses unclean paths.
 test_path_is_below_refuses_unclean_paths() {
     # ".." would climb out of the parent; such a text is never "below".
     assert_fails impact_path_is_below /mnt/disk_a/shared/../../etc /mnt/disk_a/shared
@@ -73,6 +76,8 @@ test_path_is_below_refuses_unclean_paths() {
     assert_fails impact_path_is_below /mnt/x/y /mnt/x/../x
 }
 
+# impact_nearest_existing prints the path itself or its closest existing
+# parent.
 test_nearest_existing() {
     mkdir -p "$TEST_TMP/a/b"
     assert_eq "$TEST_TMP/a/b" "$(impact_nearest_existing "$TEST_TMP/a/b")"
@@ -80,6 +85,7 @@ test_nearest_existing() {
     assert_eq '/' "$(impact_nearest_existing /no-such-top-folder-xyz/a)"
 }
 
+# Only ext4, xfs and btrfs count as file systems for the shared storage.
 test_fs_type_supported() {
     local type
     for type in ext4 xfs btrfs; do
@@ -90,6 +96,7 @@ test_fs_type_supported() {
     done
 }
 
+# Fs type of an existing and a missing path.
 test_fs_type_of_an_existing_and_a_missing_path() {
     if ! command -v findmnt >/dev/null 2>&1; then
         skip "the tool findmnt is not installed"
@@ -101,6 +108,8 @@ test_fs_type_of_an_existing_and_a_missing_path() {
         "a missing path counts as its closest existing parent"
 }
 
+# impact_is_system_path names the system folders and the top folders, and
+# accepts folders on storage disks.
 test_system_paths() {
     local path
     for path in / /etc /etc/ssh /usr /usr/local/bin /var /var/lib/docker /home /mnt /srv /opt /opt/impact \
@@ -113,6 +122,7 @@ test_system_paths() {
     done
 }
 
+# Model dir counts as system path once settings are loaded.
 test_model_dir_counts_as_system_path_once_settings_are_loaded() {
     assert_fails impact_is_system_path /srv/impact/models/Example
     IMPACT_CONF[MODEL_DIR]=/srv/impact/models
@@ -121,6 +131,8 @@ test_model_dir_counts_as_system_path_once_settings_are_loaded() {
     assert_fails impact_is_system_path /srv/impact/other
 }
 
+# impact_is_home_path names /home and everything in it, and no folder that
+# only has a similar name.
 test_home_paths() {
     assert_success impact_is_home_path /home
     assert_success impact_is_home_path /home/alice
@@ -130,6 +142,7 @@ test_home_paths() {
     assert_fails impact_is_home_path /srv/home
 }
 
+# Storage check target refusals.
 test_storage_check_target_refusals() {
     IMPACT_CONF[SHARED_ROOTS]=/mnt/disk_a/shared
     IMPACT_CONF[MODEL_DIR]=/srv/impact/models
@@ -156,6 +169,7 @@ test_storage_check_target_refusals() {
     assert_eq '' "$IMPACT_STORAGE_ROOT"
 }
 
+# Shared functions refuse folders outside the roots.
 test_shared_functions_refuse_folders_outside_the_roots() {
     IMPACT_CONF[SHARED_ROOTS]=/mnt/disk_a/shared
     mkdir -p "$TEST_TMP/folder"
@@ -183,6 +197,8 @@ test_shared_functions_refuse_folders_outside_the_roots() {
 # SSH rules
 # ----------------------------------------------------------------------------
 
+# impact_permitopen_line writes one 127.0.0.1:<port> entry per port of the
+# range, and refuses a wrong range.
 test_permitopen_line() {
     assert_eq 'PermitOpen 127.0.0.1:8787' "$(impact_permitopen_line 8787 8787)"
     assert_eq 'PermitOpen 127.0.0.1:8787 127.0.0.1:8788 127.0.0.1:8789' "$(impact_permitopen_line 8787 8789)"
@@ -199,6 +215,7 @@ test_permitopen_line() {
     assert_eq 201 "${#words[@]}" "200 ports are the upper limit"
 }
 
+# Permitopen line refuses bad ranges.
 test_permitopen_line_refuses_bad_ranges() {
     assert_fails impact_permitopen_line 8789 8787
     assert_fails impact_permitopen_line 8000 8200
@@ -210,7 +227,8 @@ test_permitopen_line_refuses_bad_ranges() {
     assert_fails impact_permitopen_line 8787 '8790 0.0.0.0:22'
 }
 
-test_rules_content_is_the_block_of_the_specification() {
+# Rules content is the agreed block.
+test_rules_content_is_the_agreed_block() {
     local content
     content="$(impact_ssh_rules_content impact 8787 8789)"
     # Remove comment lines; the rest must be exactly the agreed block.
@@ -240,6 +258,7 @@ END
     assert_contains "$content" 'PermitOpen 127.0.0.1:9000 127.0.0.1:9001'
 }
 
+# Rules content refuses bad input.
 test_rules_content_refuses_bad_input() {
     assert_fails impact_ssh_rules_content 'impact evil' 8787 8789
     assert_fails impact_ssh_rules_content $'impact\nPermitRootLogin yes' 8787 8789
@@ -249,6 +268,8 @@ test_rules_content_refuses_bad_input() {
     assert_fails impact_ssh_rules_content '' 8787 8789
 }
 
+# impact_ssh_expected_member_values prints the twelve values that a member
+# must get, and refuses a wrong range.
 test_expected_member_values() {
     local values
     values="$(impact_ssh_expected_member_values 8787 8788)"
@@ -261,6 +282,8 @@ test_expected_member_values() {
     assert_fails impact_ssh_expected_member_values 9 8
 }
 
+# The Include line of sshd_config is found in its usual forms, and only before
+# the first Match line.
 test_include_line_check() {
     local config="$TEST_TMP/sshd_config"
     # The form of Ubuntu's default file.
@@ -279,6 +302,7 @@ test_include_line_check() {
     assert_success impact_ssh_config_includes_rules "$config"
 }
 
+# Include line check refusals.
 test_include_line_check_refusals() {
     local config="$TEST_TMP/sshd_config"
     printf 'PasswordAuthentication yes\n' >"$config"
@@ -295,6 +319,8 @@ test_include_line_check_refusals() {
     assert_fails impact_ssh_config_includes_rules "$TEST_TMP/missing"
 }
 
+# impact_ssh_client_address takes the address of the administrator's session
+# from SSH_CONNECTION, and 127.0.0.1 for anything that is no address.
 test_client_address() {
     local address
     address="$(SSH_CONNECTION='192.0.2.7 51234 192.0.2.1 22' impact_ssh_client_address)"
@@ -308,6 +334,7 @@ test_client_address() {
     assert_eq '127.0.0.1' "$address"
 }
 
+# Effective settings refuse unusable names.
 test_effective_settings_refuse_unusable_names() {
     # A comma in the name would add a second condition for sshd.
     assert_fails impact_ssh_effective 'alice,addr=192.0.2.1'
@@ -365,8 +392,8 @@ test_sshd_values_are_read_from_the_whole_output() {
     assert_eq '' "$(impact__sshd_config_values nosuchsetting)" "a setting sshd does not print"
 }
 
-# impact_ssh_listening tries the ports that sshd -T names (here 2222 and
-# 2200), not only port 22, on the loopback addresses.
+# impact_ssh_listening tries every port that sshd -T names (here 2222 and
+# 2200), and port 22 last, on the loopback addresses.
 test_probe_targets_follow_the_ports_of_sshd() {
     fake_sshd_T 2222 2200
     local targets
@@ -426,6 +453,7 @@ END
     PATH="$TEST_TMP/bin:$PATH"
 }
 
+# Docker ro refuses changing commands.
 test_docker_ro_refuses_changing_commands() {
     fake_tools
     local subcommand
@@ -441,6 +469,7 @@ test_docker_ro_refuses_changing_commands() {
     assert_missing "$TEST_TMP/docker-calls"
 }
 
+# Docker ro passes reading commands on.
 test_docker_ro_passes_reading_commands_on() {
     fake_tools
     run_cmd impact_docker_ro ps --all --filter 'label=impact.account=alice' --format '{{.Names}}'
@@ -456,6 +485,7 @@ test_docker_ro_passes_reading_commands_on() {
     done
 }
 
+# Docker versions with stand ins.
 test_docker_versions_with_stand_ins() {
     fake_tools
     assert_eq '29.1.0' "$(impact_docker_engine_version)"
@@ -470,6 +500,7 @@ test_docker_versions_with_stand_ins() {
     assert_fails impact_docker_server_version
 }
 
+# Docker missing is reported.
 test_docker_missing_is_reported() {
     # An empty folder as the only PATH entry: no docker anywhere.
     mkdir -p "$TEST_TMP/empty"
@@ -507,6 +538,7 @@ END
     PATH="$TEST_TMP/bin:$PATH"
 }
 
+# Https get refuses other addresses without calling curl.
 test_https_get_refuses_other_addresses_without_calling_curl() {
     fake_curl 200 0
     local url
@@ -521,6 +553,7 @@ test_https_get_refuses_other_addresses_without_calling_curl() {
     assert_missing "$TEST_TMP/out"
 }
 
+# Https get result codes.
 test_https_get_result_codes() {
     fake_curl 200 0
     assert_success impact_https_get 'https://github.com/alice-example.keys' "$TEST_TMP/out"
@@ -550,6 +583,20 @@ test_https_get_result_codes() {
     assert_eq 6 "$status"
 }
 
+# An answer larger than 1 MB is refused also when curl let it through: curl
+# before version 8.4 (Ubuntu 22.04) applies --max-filesize only to answers
+# that announce their size. The stand-in writes 2 MB and reports success.
+test_https_get_refuses_an_answer_over_one_megabyte() {
+    fake_curl 200 0
+    sed -i -e 's|printf .downloaded text\\n. >"\$2"|head -c 2097152 /dev/zero >"$2"|' "$TEST_TMP/bin/curl"
+    local status=0
+    impact_https_get 'https://github.com/alice-example.keys' "$TEST_TMP/out" 2>"$TEST_TMP/err" || status=$?
+    assert_eq 6 "$status" "exit code for an answer over 1 MB"
+    assert_eq 0 "$(stat -c '%s' -- "$TEST_TMP/out")" "size of the output file afterwards"
+    assert_file_contains "$TEST_TMP/err" 'is larger than 1 MB'
+}
+
+# Docker source and boot state give one of the agreed words.
 test_docker_source_and_boot_state_give_one_of_the_agreed_words() {
     local word
     word="$(impact_docker_install_source)"

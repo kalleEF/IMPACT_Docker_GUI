@@ -61,6 +61,7 @@ make_key() {
 # Keys
 # ----------------------------------------------------------------------------
 
+# Valid key is accepted.
 test_valid_key_is_accepted() {
     need_ssh_keygen
     make_key alice
@@ -72,6 +73,7 @@ test_valid_key_is_accepted() {
     assert_eq '' "$IMPACT_KEY_ERROR"
 }
 
+# Fingerprint equals ssh keygen.
 test_fingerprint_equals_ssh_keygen() {
     need_ssh_keygen
     make_key alice
@@ -81,6 +83,7 @@ test_fingerprint_equals_ssh_keygen() {
     assert_fails impact_key_fingerprint ''
 }
 
+# Key without comment and with windows line end.
 test_key_without_comment_and_with_windows_line_end() {
     need_ssh_keygen
     make_key alice
@@ -93,6 +96,7 @@ test_key_without_comment_and_with_windows_line_end() {
     assert_eq "$bare" "$IMPACT_KEY_LINE"
 }
 
+# Comment is reduced to safe characters.
 test_comment_is_reduced_to_safe_characters() {
     need_ssh_keygen
     make_key alice
@@ -103,6 +107,7 @@ test_comment_is_reduced_to_safe_characters() {
     assert_eq "$bare" "$IMPACT_KEY_LINE" "nothing of the comment reaches the key line"
 }
 
+# Empty text is refused.
 test_empty_text_is_refused() {
     assert_fails impact_parse_ed25519_key ''
     assert_contains "$IMPACT_KEY_ERROR" 'No key was given'
@@ -110,6 +115,7 @@ test_empty_text_is_refused() {
     assert_eq '' "$IMPACT_KEY_LINE"
 }
 
+# Two keys are refused.
 test_two_keys_are_refused() {
     need_ssh_keygen
     make_key alice
@@ -123,6 +129,7 @@ test_two_keys_are_refused() {
     assert_eq '' "$IMPACT_KEY_LINE"
 }
 
+# Key line with options is refused.
 test_key_line_with_options_is_refused() {
     need_ssh_keygen
     make_key alice
@@ -139,6 +146,7 @@ test_key_line_with_options_is_refused() {
     done
 }
 
+# Other key types are refused.
 test_other_key_types_are_refused() {
     need_ssh_keygen
     make_key old rsa
@@ -153,6 +161,7 @@ test_other_key_types_are_refused() {
     assert_contains "$IMPACT_KEY_ERROR" 'shape'
 }
 
+# Private key is refused with a clear message.
 test_private_key_is_refused_with_a_clear_message() {
     need_ssh_keygen
     make_key alice
@@ -162,6 +171,7 @@ test_private_key_is_refused_with_a_clear_message() {
     assert_eq '' "$IMPACT_KEY_BLOB"
 }
 
+# Damaged and hostile key texts are refused.
 test_damaged_and_hostile_key_texts_are_refused() {
     need_ssh_keygen
     make_key alice
@@ -187,6 +197,7 @@ test_damaged_and_hostile_key_texts_are_refused() {
     done
 }
 
+# Ed25519 keys in a downloaded list.
 test_ed25519_keys_in_a_downloaded_list() {
     need_ssh_keygen
     make_key first
@@ -211,6 +222,7 @@ test_ed25519_keys_in_a_downloaded_list() {
 # Accounts and groups (read-only questions about this machine)
 # ----------------------------------------------------------------------------
 
+# Account lookups for root.
 test_account_lookups_for_root() {
     assert_success impact_account_exists root
     assert_eq '0' "$(impact_account_uid root)"
@@ -223,6 +235,7 @@ test_account_lookups_for_root() {
     assert_success impact_account_in_group root root
 }
 
+# Lookups for names that do not exist.
 test_lookups_for_names_that_do_not_exist() {
     assert_fails impact_account_exists no-such-account-xyz
     assert_fails impact_account_uid no-such-account-xyz
@@ -236,6 +249,7 @@ test_lookups_for_names_that_do_not_exist() {
     assert_fails impact_name_is_free root
 }
 
+# A number is never taken as a name.
 test_a_number_is_never_taken_as_a_name() {
     # "getent passwd 0" would return root. A name made of digits is refused.
     assert_fails impact_account_exists 0
@@ -251,6 +265,8 @@ test_a_number_is_never_taken_as_a_name() {
     assert_fails impact_group_by_gid 'x y'
 }
 
+# impact_uid_is_free and impact_gid_is_free refuse a number in use (0) and
+# accept an unused one.
 test_free_numbers() {
     assert_fails impact_uid_is_free 0
     assert_fails impact_gid_is_free 0
@@ -262,12 +278,14 @@ test_free_numbers() {
     assert_success impact_gid_is_free 59999
 }
 
+# Group members lists primary members too.
 test_group_members_lists_primary_members_too() {
     local members
     members="$(impact_group_members root)"
     assert_contains "$members" 'root' "root has the group root as its primary group"
 }
 
+# Repo base for needs settings and an account.
 test_repo_base_for_needs_settings_and_an_account() {
     assert_fails impact_repo_base_for root
     IMPACT_CONF[REPO_BASE]='%h/Repositories'
@@ -277,6 +295,7 @@ test_repo_base_for_needs_settings_and_an_account() {
     assert_fails impact_repo_base_for no-such-account-xyz
 }
 
+# Run as needs root.
 test_run_as_needs_root() {
     if ((EUID == 0)); then
         skip "this test is about a call without root rights"
@@ -286,6 +305,7 @@ test_run_as_needs_root() {
     assert_output_contains 'needs root rights'
 }
 
+# Key copy path and record file.
 test_key_copy_path_and_record_file() {
     assert_eq '/home/alice/.ssh/id_ed25519_alice-example' "$(impact_key_copy_path /home/alice Alice-Example)"
     assert_fails impact_key_copy_path /home/alice '../x'

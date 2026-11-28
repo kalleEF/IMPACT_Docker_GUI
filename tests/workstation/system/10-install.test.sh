@@ -54,6 +54,7 @@ suite_teardown() {
     sys_clean_slate
 }
 
+# Help works and changes nothing.
 test_help_works_and_changes_nothing() {
     snapshot_unchanged_by "${WATCHED[@]}" -- bash "$WORKSTATION_DIR/install.sh" --help
     assert_status 0
@@ -64,6 +65,7 @@ test_help_works_and_changes_nothing() {
     assert_output_contains 'What it changes on the system'
 }
 
+# Wrong and hostile input is refused before any change.
 test_wrong_and_hostile_input_is_refused_before_any_change() {
     local before="$TEST_TMP/before" after="$TEST_TMP/after" call
     snapshot_take "$before" --content "${WATCHED[@]}"
@@ -90,6 +92,7 @@ test_wrong_and_hostile_input_is_refused_before_any_change() {
     assert_missing /tmp/impact-test-hostile
 }
 
+# Dry run changes nothing.
 test_dry_run_changes_nothing() {
     snapshot_unchanged_by --content "${WATCHED[@]}" -- bash "$WORKSTATION_DIR/install.sh" --dry-run
     assert_status 0
@@ -100,6 +103,7 @@ test_dry_run_changes_nothing() {
     assert_missing /usr/local/bin/impact-workstation-setup
 }
 
+# File of another origin is refused before any change.
 test_file_of_another_origin_is_refused_before_any_change() {
     # A plain file with the name of a command.
     printf '#!/bin/sh\necho other\n' >/usr/local/bin/impact-workstation-setup
@@ -122,6 +126,7 @@ test_file_of_another_origin_is_refused_before_any_change() {
     rm -f /opt/impact
 }
 
+# Missing tool stops with the apt get line.
 test_missing_tool_stops_with_the_apt_get_line() {
     local before="$TEST_TMP/before" after="$TEST_TMP/after"
     snapshot_take "$before" "${WATCHED[@]}"
@@ -139,6 +144,7 @@ test_missing_tool_stops_with_the_apt_get_line() {
     assert_missing /opt/impact
 }
 
+# Incomplete or damaged folder is refused.
 test_incomplete_or_damaged_folder_is_refused() {
     local copy="$TEST_TMP/unpacked"
     cp -a "$WORKSTATION_DIR" "$copy"
@@ -161,6 +167,7 @@ test_incomplete_or_damaged_folder_is_refused() {
     assert_missing /opt/impact
 }
 
+# Install creates the agreed files.
 test_install_creates_the_agreed_files() {
     run_cmd sys_as_admin bash "$WORKSTATION_DIR/install.sh"
     assert_status 0
@@ -194,6 +201,7 @@ test_install_creates_the_agreed_files() {
     assert_missing /etc/ssh/sshd_config.d/60-impact.conf
 }
 
+# Install writes one log block.
 test_install_writes_one_log_block() {
     assert_file_facts /opt/impact/admin/log 700 root root
     assert_file_facts "$LOG_FILE" 600 root root
@@ -205,6 +213,7 @@ test_install_writes_one_log_block() {
     assert_file_contains "$LOG_FILE" '  + Create the folder /opt/impact/admin'
 }
 
+# Installed command runs through its link.
 test_installed_command_runs_through_its_link() {
     run_cmd /usr/local/bin/impact-workstation-setup --help
     assert_status 0
@@ -215,6 +224,7 @@ test_installed_command_runs_through_its_link() {
     assert_status 0
 }
 
+# Second run changes nothing.
 test_second_run_changes_nothing() {
     # The log gets one block per real run; everything else must be identical.
     snapshot_unchanged_by --content --exclude /opt/impact/admin/log "${WATCHED[@]}" -- bash "$WORKSTATION_DIR/install.sh"
@@ -225,12 +235,14 @@ test_second_run_changes_nothing() {
     assert_file_contains "$LOG_FILE" 'result:  ok, nothing had to be changed'
 }
 
+# Dry run after install writes no log block.
 test_dry_run_after_install_writes_no_log_block() {
     snapshot_unchanged_by --content "${WATCHED[@]}" -- bash "$WORKSTATION_DIR/install.sh" --dry-run
     assert_status 0
     assert_output_contains 'A real run would change nothing either'
 }
 
+# Update repairs changes and removes leftovers.
 test_update_repairs_changes_and_removes_leftovers() {
     # Leftovers of an older version: a command that no longer exists, with
     # its link; and a file that was changed by hand.
@@ -253,6 +265,7 @@ test_update_repairs_changes_and_removes_leftovers() {
     assert_output_contains 'Nothing to do'
 }
 
+# Uninstall dry run changes nothing.
 test_uninstall_dry_run_changes_nothing() {
     snapshot_unchanged_by --content "${WATCHED[@]}" -- /opt/impact/uninstall.sh --dry-run
     assert_status 0
@@ -260,6 +273,7 @@ test_uninstall_dry_run_changes_nothing() {
     assert_output_contains 'What stays on this machine'
 }
 
+# Uninstall removes the commands and keeps the rest.
 test_uninstall_removes_the_commands_and_keeps_the_rest() {
     # An entry of another origin with a similar name must stay.
     printf '#!/bin/sh\n' >/usr/local/bin/impact-foreign-tool
@@ -289,21 +303,37 @@ test_uninstall_removes_the_commands_and_keeps_the_rest() {
     rmdir /etc/impact
 }
 
+# Uninstall second run changes nothing.
 test_uninstall_second_run_changes_nothing() {
     snapshot_unchanged_by --content --exclude /opt/impact/admin/log "${WATCHED[@]}" -- bash "$WORKSTATION_DIR/uninstall.sh"
     assert_status 0
     assert_output_contains 'Nothing to do'
 }
 
+# Install again and uninstall from the unpacked folder.
 test_install_again_and_uninstall_from_the_unpacked_folder() {
     run_cmd bash "$WORKSTATION_DIR/install.sh"
     assert_status 0
     assert_exists /usr/local/bin/impact-workstation-setup
     assert_exists /opt/impact/admin/keep-me
+    # A stand-in for the SSH rules file (no SSH server reads it here): the
+    # script names the safe order before it removes anything, and after the
+    # removal it names a way that works without the removed commands.
+    mkdir -p /etc/ssh/sshd_config.d
+    printf '# stand-in of the test\n' >/etc/ssh/sshd_config.d/60-impact.conf
+    run_cmd bash "$WORKSTATION_DIR/uninstall.sh" --dry-run
+    assert_status 0
+    assert_output_contains 'To remove them as well, first run: sudo impact-workstation-setup --remove-ssh-rules'
+    assert_output_contains 'The safe way, while the commands are still installed (before this script)'
     run_cmd bash "$WORKSTATION_DIR/uninstall.sh"
+    rm -f /etc/ssh/sshd_config.d/60-impact.conf
     assert_status 0
     assert_missing /opt/impact/bin
     assert_missing /usr/local/bin/impact-workstation-setup
+    # The hint about the SSH rules comes before step 2 (the removal).
+    assert_matches "$RUN_OUTPUT" 'To remove them as well, first run: sudo impact-workstation-setup --remove-ssh-rules.*Step 2: Remove the links and the commands'
+    assert_output_contains 'install them again from the unpacked folder (sudo ./install.sh), run  sudo impact-workstation-setup --remove-ssh-rules,  then remove the commands again from the unpacked folder (sudo ./uninstall.sh)'
+    assert_output_not_contains 'while the commands are still installed'
     # The administrator folder with the log stays in every case.
     assert_exists /opt/impact/admin/keep-me
     assert_file_contains "$LOG_FILE" 'command: uninstall.sh'

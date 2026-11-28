@@ -57,6 +57,7 @@ setup() {
 # Names
 # ----------------------------------------------------------------------------
 
+# Unescape turns escaped names back.
 test_unescape_turns_escaped_names_back() {
     impact_sharing_unescape '/mnt/disk_a/plain-name.csv'
     assert_eq '/mnt/disk_a/plain-name.csv' "$IMPACT_SHARING_TEXT"
@@ -77,12 +78,15 @@ test_unescape_turns_escaped_names_back() {
     assert_eq '$(touch x);' "$IMPACT_SHARING_TEXT"
 }
 
+# Glob quote protects pattern characters.
 test_glob_quote_protects_pattern_characters() {
     assert_eq '/mnt/a\*b\?c\[d]' "$(impact_sharing_glob_quote '/mnt/a*b?c[d]')"
     assert_eq '/mnt/back\\slash' "$(impact_sharing_glob_quote '/mnt/back\slash')"
     assert_eq '/mnt/with space' "$(impact_sharing_glob_quote '/mnt/with space')"
 }
 
+# Backup folder names are made from the time and the path, and nothing else
+# passes as one.
 test_backup_names() {
     assert_eq '20261124T201500Z_mnt_disk_a_shared_Example' \
         "$(impact_sharing_backup_name /mnt/disk_a/shared/Example 20261124T201500Z)"
@@ -129,12 +133,15 @@ classify_one() {
     printf '%s' "$3" | impact_sharing_classify "$info" 1005 "$uid" "$2" '' | sed -n 's/^0 //p'
 }
 
+# Folder that follows the rules.
 test_folder_that_follows_the_rules() {
     local good
     good="$(record /s/d 1005 -s- user::rwx group::rwx other::r-x default:user::rwx default:group::rwx default:other::r-x)"
     assert_eq '-' "$(classify_one d '' "$good")"
 }
 
+# Each way a folder can deviate from the shared rules gets its own reason word
+# (group, setgid, access, default).
 test_folder_reasons() {
     assert_eq 'group,setgid,access,default' \
         "$(classify_one d '' "$(record /s/d 2001 --- user::rwx group::r-x other::r-x)")"
@@ -152,6 +159,7 @@ test_folder_reasons() {
         default:user::rwx default:group::rwx default:other::---)")"
 }
 
+# Folder with transition account.
 test_folder_with_transition_account() {
     local base=(user::rwx group::rwx other::--- default:user::rwx default:group::rwx default:other::---)
     assert_eq 'user' "$(classify_one d present "$(record /s/d 1005 -s- "${base[@]}")")"
@@ -166,6 +174,8 @@ test_folder_with_transition_account() {
         default:user::rwx default:group::rwx default:other::---)")"
 }
 
+# Each way a file can deviate from the shared rules gets its own reason word,
+# and a group with more rights than the owner is fine.
 test_file_reasons() {
     assert_eq '-' "$(classify_one f '' "$(record /s/f 1005 --- user::rw- group::rw- other::r--)")"
     assert_eq '-' "$(classify_one f '' "$(record /s/f 1005 --- user::rwx group::rwx other::r-x)")"
@@ -183,6 +193,7 @@ test_file_reasons() {
     assert_eq 'access' "$(classify_one f '' "$(record /s/f 1005 --- user::rwx user:2002:rwx group::rwx mask::rw- other::r--)")"
 }
 
+# File with transition account.
 test_file_with_transition_account() {
     assert_eq 'user' "$(classify_one f present "$(record /s/f 1005 --- user::rw- group::rw- other::r--)")"
     assert_eq 'user' "$(classify_one f present "$(record /s/f 1005 --- user::rw- user:1001:r-- group::rw- mask::rw- other::r--)")"
@@ -191,6 +202,7 @@ test_file_with_transition_account() {
     assert_eq '-' "$(classify_one f absent "$(record /s/f 1005 --- user::rw- group::rw- other::r--)")"
 }
 
+# Classify counts and saves only deviating records.
 test_classify_counts_and_saves_only_deviating_records() {
     local info="$TEST_TMP/info" backup="$TEST_TMP/backup" output
     printf 'd 64768 11\nf 64768 12\nf 64768 13\n' >"$info"
@@ -210,6 +222,7 @@ test_classify_counts_and_saves_only_deviating_records() {
     assert_contains "$output" 'BROKEN'
 }
 
+# Effective remarks do not confuse the test.
 test_effective_remarks_do_not_confuse_the_test() {
     # Without -E getfacl adds "#effective:" remarks; they must not count.
     local text
@@ -217,6 +230,7 @@ test_effective_remarks_do_not_confuse_the_test() {
     assert_eq 'access' "$(classify_one f '' "$text")"
 }
 
+# Normalize gives one line per entry.
 test_normalize_gives_one_line_per_entry() {
     local output
     output="$({
@@ -231,6 +245,7 @@ test_normalize_gives_one_line_per_entry() {
 # Small helpers
 # ----------------------------------------------------------------------------
 
+# The special bits of a getfacl record become the matching chmod arguments.
 test_flags_to_chmod() {
     assert_eq 'u-s,g+s,-t' "$(impact_sharing_flags_chmod -s-)"
     assert_eq 'u+s,g-s,+t' "$(impact_sharing_flags_chmod s-t)"
@@ -238,6 +253,7 @@ test_flags_to_chmod() {
     assert_eq 'u-s,g-s,-t' "$(impact_sharing_flags_chmod '')"
 }
 
+# Flags of a mode.
 test_flags_of_a_mode() {
     assert_eq '---' "$(impact_sharing_flags_of_mode 644)"
     assert_eq '-s-' "$(impact_sharing_flags_of_mode 2775)"
@@ -247,6 +263,7 @@ test_flags_of_a_mode() {
     assert_eq '---' "$(impact_sharing_flags_of_mode 0)"
 }
 
+# Number and size texts.
 test_number_and_size_texts() {
     assert_eq '0' "$(impact_sharing_number 0)"
     assert_eq '999' "$(impact_sharing_number 999)"
@@ -265,6 +282,7 @@ test_number_and_size_texts() {
 # impact-clean-images
 # ----------------------------------------------------------------------------
 
+# Image names that may reach docker.
 test_image_names_that_may_reach_docker() {
     assert_success impact_sharing_valid_image_name example-model:alice
     assert_success impact_sharing_valid_image_name impactncd_germany:alice-example
@@ -280,6 +298,8 @@ test_image_names_that_may_reach_docker() {
     assert_fails impact_sharing_valid_image_id "--force"
 }
 
+# impact-clean-images removes an image only when nobody uses it and its
+# account or repository copy is gone.
 test_image_decisions() {
     assert_eq 'keep in_use' "$(impact_sharing_image_decision yes removed example-model:bob '')"
     assert_eq 'keep not_impact' "$(impact_sharing_image_decision no invalid weird:tag '')"
@@ -296,6 +316,7 @@ test_image_decisions() {
 # impact-export-state
 # ----------------------------------------------------------------------------
 
+# Manifest code follows content mode and names only.
 test_manifest_code_follows_content_mode_and_names_only() {
     local folder="$TEST_TMP/state" first second
     # shellcheck disable=SC2034

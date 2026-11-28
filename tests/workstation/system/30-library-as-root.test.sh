@@ -88,6 +88,7 @@ facts() {
 # Files in a person's home folder
 # ----------------------------------------------------------------------------
 
+# Run as uses the rights and a clean environment.
 test_run_as_uses_the_rights_and_a_clean_environment() {
     assert_eq 'alice' "$(impact_run_as alice id -un)"
     assert_contains "$(impact_run_as alice id -nG)" "$SYS_GROUP"
@@ -108,6 +109,7 @@ test_run_as_uses_the_rights_and_a_clean_environment() {
     assert_status 1
 }
 
+# User mkdir and write and read.
 test_user_mkdir_and_write_and_read() {
     assert_success impact_user_mkdir alice /home/alice/.ssh 700
     assert_eq 'alice:alice 700' "$(facts /home/alice/.ssh)"
@@ -132,6 +134,7 @@ test_user_mkdir_and_write_and_read() {
     assert_eq 'alice:alice 750' "$(facts /home/alice/a)"
 }
 
+# User files never follow symbolic links.
 test_user_files_never_follow_symbolic_links() {
     local status
     impact_user_mkdir alice /home/alice/.ssh 700
@@ -167,6 +170,7 @@ test_user_files_never_follow_symbolic_links() {
     rm -f /root/impact-test-target /home/alice/linked_folder
 }
 
+# User files refuse foreign owners and paths outside home.
 test_user_files_refuse_foreign_owners_and_paths_outside_home() {
     local status
     # A folder inside the home folder that belongs to root.
@@ -192,6 +196,8 @@ test_user_files_refuse_foreign_owners_and_paths_outside_home() {
     assert_missing /home/bob/file
 }
 
+# impact_user_remove_file removes a file as the person, counts a missing file
+# as done, and refuses paths outside the home folder.
 test_user_remove_file() {
     printf 'x\n' | impact_user_write_file alice /home/alice/to-remove 600
     assert_exists /home/alice/to-remove
@@ -205,6 +211,7 @@ test_user_remove_file() {
     assert_eq 3 "$status" "a folder is not removed"
 }
 
+# Locked and expired accounts.
 test_locked_and_expired_accounts() {
     assert_eq 'L' "$(impact_account_password_state alice)"
     assert_eq 'P' "$(impact_account_password_state "$SYS_ADMIN")"
@@ -221,6 +228,8 @@ test_locked_and_expired_accounts() {
     rm -f /home/bob/after-expiry
 }
 
+# The questions about groups and accounts give the members, the memberships
+# and the numbers in use.
 test_group_questions() {
     assert_eq $'alice\nbob' "$(impact_group_members "$SYS_GROUP")"
     assert_success impact_account_in_group alice "$SYS_GROUP"
@@ -237,6 +246,7 @@ test_group_questions() {
 # The repository folder
 # ----------------------------------------------------------------------------
 
+# Repo base inside the home folder.
 test_repo_base_inside_the_home_folder() {
     assert_eq '/home/alice/Repositories' "$(impact_repo_base_for alice)"
     assert_fails impact_repo_base_is_ready alice
@@ -252,6 +262,7 @@ test_repo_base_inside_the_home_folder() {
     rm -f /home/bob/Repositories
 }
 
+# Repo base outside the home folder.
 test_repo_base_outside_the_home_folder() {
     IMPACT_CONF[REPO_BASE]='/srv/impact-test/repos/%u'
     assert_eq '/srv/impact-test/repos/alice' "$(impact_repo_base_for alice)"
@@ -279,6 +290,7 @@ test_repo_base_outside_the_home_folder() {
 # The shared rules for one folder
 # ----------------------------------------------------------------------------
 
+# Apply dir sets group setgid and acl on the folder only.
 test_apply_dir_sets_group_setgid_and_acl_on_the_folder_only() {
     local folder="$SYS_ROOT_A/Example/outputs"
     mkdir -p "$folder/existing/deeper"
@@ -309,6 +321,7 @@ test_apply_dir_sets_group_setgid_and_acl_on_the_folder_only() {
     assert_eq "$above_before" "$(facts "$SYS_ROOT_A/Example")"
 }
 
+# Apply dir a second time changes nothing.
 test_apply_dir_a_second_time_changes_nothing() {
     local folder="$SYS_ROOT_A/Example/outputs"
     snapshot_take "$TEST_TMP/before" --content "$SYS_ROOT_A"
@@ -318,6 +331,7 @@ test_apply_dir_a_second_time_changes_nothing() {
     snapshot_assert_same "$TEST_TMP/before" "$TEST_TMP/after"
 }
 
+# Apply dir repairs single deviations.
 test_apply_dir_repairs_single_deviations() {
     local folder="$SYS_ROOT_A/Example/outputs"
     chmod g-s "$folder"
@@ -338,6 +352,7 @@ test_apply_dir_repairs_single_deviations() {
     assert_eq "oldshared:$SYS_GROUP 2775" "$(facts "$folder")"
 }
 
+# Rights of others stay as they are.
 test_rights_of_others_stay_as_they_are() {
     local folder="$SYS_ROOT_A/Example/private"
     mkdir "$folder"
@@ -350,6 +365,7 @@ test_rights_of_others_stay_as_they_are() {
     assert_eq "alice:$SYS_GROUP 660" "$(facts "$folder/by-alice")"
 }
 
+# Two members write whatever their umask.
 test_two_members_write_whatever_their_umask() {
     local folder="$SYS_ROOT_A/Example/outputs"
     # The members must be able to reach the folder.
@@ -376,6 +392,7 @@ test_two_members_write_whatever_their_umask() {
     assert_missing "$folder/by-carol"
 }
 
+# Moved in file keeps its rights until repaired.
 test_moved_in_file_keeps_its_rights_until_repaired() {
     local folder="$SYS_ROOT_A/Example/outputs"
     # The known limit: a file that is moved in keeps its old rights.
@@ -391,6 +408,7 @@ test_moved_in_file_keeps_its_rights_until_repaired() {
     assert_eq 0 "$IMPACT_SHARED_CHANGED"
 }
 
+# Transition account entry can be added and removed.
 test_transition_account_entry_can_be_added_and_removed() {
     # The fixture folder belongs to the account oldshared. For this test it
     # gets root as owner, so that only the extra entry decides.
@@ -433,6 +451,7 @@ test_transition_account_entry_can_be_added_and_removed() {
     assert_status 1
 }
 
+# Apply dir refuses links and unresolved paths.
 test_apply_dir_refuses_links_and_unresolved_paths() {
     local folder="$SYS_ROOT_A/Example"
     # A symbolic link to a system folder where a folder is expected.
@@ -468,6 +487,7 @@ test_apply_dir_refuses_links_and_unresolved_paths() {
 # The shared rules for files
 # ----------------------------------------------------------------------------
 
+# Apply files in one call.
 test_apply_files_in_one_call() {
     local folder="$SYS_ROOT_B/Example"
     mkdir -p "$folder"
@@ -496,6 +516,7 @@ test_apply_files_in_one_call() {
     assert_status 1
 }
 
+# Apply files never follows links and refuses other entries.
 test_apply_files_never_follows_links_and_refuses_other_entries() {
     local folder="$SYS_ROOT_B/Example"
     printf 'target\n' >"$folder/target-file"
@@ -522,6 +543,7 @@ test_apply_files_never_follows_links_and_refuses_other_entries() {
     assert_eq "$inner_before" "$(facts "$folder/subfolder/inner")" "a folder is never walked through"
 }
 
+# Transition account entry on files.
 test_transition_account_entry_on_files() {
     local folder="$SYS_ROOT_B/Example" uid
     uid="$(id -u oldshared)"
@@ -541,6 +563,8 @@ test_transition_account_entry_on_files() {
 # The storage safety check and the ACL test
 # ----------------------------------------------------------------------------
 
+# impact_storage_check_target accepts folders inside a storage root, in their
+# resolved form, and refuses every other place.
 test_storage_check_target() {
     assert_success impact_storage_check_target "$SYS_ROOT_A/Example"
     assert_eq "$SYS_ROOT_A/Example" "$IMPACT_STORAGE_PATH"
@@ -551,7 +575,7 @@ test_storage_check_target() {
     assert_eq "$SYS_ROOT_B" "$IMPACT_STORAGE_ROOT"
     # Refusals.
     assert_fails impact_storage_check_target "$SYS_ROOT_A"
-    assert_contains "$IMPACT_STORAGE_ERROR" 'storage root itself is not accepted'
+    assert_contains "$IMPACT_STORAGE_ERROR" 'is a storage root. Give the folder of one model inside it'
     assert_fails impact_storage_check_target /mnt/disk_a
     assert_fails impact_storage_check_target "$SYS_ROOT_A/Example/outputs/analysis/results.csv"
     assert_contains "$IMPACT_STORAGE_ERROR" 'is no folder'
@@ -572,6 +596,7 @@ test_storage_check_target() {
     rmdir "$SYS_ROOT_A/Example/two words"
 }
 
+# Storage check target refuses the top of a file system.
 test_storage_check_target_refuses_the_top_of_a_file_system() {
     mkdir -p "$SYS_ROOT_A/mounted"
     # A "bind mount" of a folder onto itself makes it the top folder of a
@@ -586,6 +611,7 @@ test_storage_check_target_refuses_the_top_of_a_file_system() {
     rmdir "$SYS_ROOT_A/mounted"
 }
 
+# Acl probe and file system questions.
 test_acl_probe_and_file_system_questions() {
     assert_success impact_acl_probe "$SYS_ROOT_A"
     assert_eq '' "$(find "$SYS_ROOT_A" -maxdepth 1 -name '.impact*')" "the test folder was removed"
@@ -601,6 +627,7 @@ test_acl_probe_and_file_system_questions() {
 # The model file, as root
 # ----------------------------------------------------------------------------
 
+# Model file written and loaded.
 test_model_file_written_and_loaded() {
     local folder=/srv/impact/models/Example-Model
     local -A values=(
@@ -628,6 +655,7 @@ test_model_file_written_and_loaded() {
     assert_output_contains "no member of the group '$SYS_GROUP'"
 }
 
+# Model file that others can change is refused.
 test_model_file_that_others_can_change_is_refused() {
     local file=/srv/impact/models/Example-Model/model.conf status=0
     chmod 664 "$file"
@@ -680,6 +708,7 @@ last_log_block() {
     tac "$LOG_FILE" | sed -e '/^==== /q' | tac
 }
 
+# Log block of a normal run.
 test_log_block_of_a_normal_run() {
     log_command
     local blocks_before
@@ -702,6 +731,7 @@ test_log_block_of_a_normal_run() {
     assert_contains "$(last_log_block)" 'account: root'
 }
 
+# Log is silent for dry runs and early failures.
 test_log_is_silent_for_dry_runs_and_early_failures() {
     log_command
     local before
@@ -717,6 +747,7 @@ test_log_is_silent_for_dry_runs_and_early_failures() {
     assert_eq "$before" "$(sha256sum <"$LOG_FILE")" "the log must be unchanged"
 }
 
+# Log records a failure after a change.
 test_log_records_a_failure_after_a_change() {
     log_command
     run_cmd sys_as_admin "$TEST_SUITE_TMP/log-test" --fail-late --name bob
@@ -755,6 +786,7 @@ test_log_names_the_step_that_ran_at_a_signal() {
     assert_contains "$block" '  ? Create the folder for the signal test'
 }
 
+# Log is never written through a link.
 test_log_is_never_written_through_a_link() {
     log_command
     mv /opt/impact/admin/log /opt/impact/admin/log.aside
@@ -771,6 +803,8 @@ test_log_is_never_written_through_a_link() {
 # Questions to sshd, as root
 # ----------------------------------------------------------------------------
 
+# The questions to sshd give the effective settings of an account for a given
+# address.
 test_ssh_questions() {
     mkdir -p /run/sshd
     assert_success impact_ssh_include_ok
@@ -814,6 +848,7 @@ test_member_check_requires_use_pam() {
 # The record of an enrolled account
 # ----------------------------------------------------------------------------
 
+# Account record write and load.
 test_account_record_write_and_load() {
     local file=/opt/impact/admin/accounts/alice.conf status=0
     impact_account_record_load alice || status=$?
@@ -839,6 +874,8 @@ test_account_record_write_and_load() {
     assert_eq $'alice\nbob' "$(impact_account_records)"
 }
 
+# Account records are written only for a real account with a valid name and
+# state, and a damaged record is refused.
 test_account_record_refusals() {
     run_cmd impact_account_record_write no-such-account-xyz some-name enrolled
     assert_status 1
@@ -867,6 +904,7 @@ test_account_record_refusals() {
 # The lock
 # ----------------------------------------------------------------------------
 
+# Lock keeps a second command out.
 test_lock_keeps_a_second_command_out() {
     {
         printf '#!/bin/bash\n# lock-test: a command made by a test\n'

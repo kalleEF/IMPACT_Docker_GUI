@@ -96,6 +96,7 @@ assert_conf_invalid() {
 # The line format
 # ----------------------------------------------------------------------------
 
+# Valid file is read.
 test_valid_file_is_read() {
     write_valid_conf
     assert_success impact_conf_parse_file "$CONF"
@@ -110,6 +111,7 @@ test_valid_file_is_read() {
     assert_eq 0 "${#IMPACT_CONF_WARNINGS[@]}"
 }
 
+# Blanks comments and empty lines.
 test_blanks_comments_and_empty_lines() {
     {
         printf '\n   \n\t# indented comment\n'
@@ -127,6 +129,7 @@ test_blanks_comments_and_empty_lines() {
     assert_eq '' "${IMPACT_CONF[DEPUTY_CONTACT]}"
 }
 
+# Value is everything after the first equals sign.
 test_value_is_everything_after_the_first_equals_sign() {
     write_valid_conf
     replace_line ADMIN_CONTACT 'ADMIN_CONTACT=Alice = Example # no comment "here"'
@@ -135,6 +138,7 @@ test_value_is_everything_after_the_first_equals_sign() {
         "no quotes, no comment at the end of a line"
 }
 
+# Windows line ends and missing last line end.
 test_windows_line_ends_and_missing_last_line_end() {
     write_valid_conf
     # Turn every line end into the Windows form (carriage return + new line).
@@ -149,6 +153,7 @@ test_windows_line_ends_and_missing_last_line_end() {
     assert_eq 'Bob Example' "${IMPACT_CONF[DEPUTY_CONTACT]}"
 }
 
+# Byte order mark is tolerated.
 test_byte_order_mark_is_tolerated() {
     write_valid_conf
     local content
@@ -157,6 +162,7 @@ test_byte_order_mark_is_tolerated() {
     assert_success impact_conf_parse_file "$CONF"
 }
 
+# File is never executed.
 test_file_is_never_executed() {
     write_valid_conf
     # A value with shell syntax is kept as plain text.
@@ -175,6 +181,7 @@ test_file_is_never_executed() {
     assert_missing "$TEST_TMP/executed-3"
 }
 
+# Unknown key gives a warning and is ignored.
 test_unknown_key_gives_a_warning_and_is_ignored() {
     write_valid_conf
     printf 'FUTURE_SETTING=whatever\n' >>"$CONF"
@@ -187,18 +194,21 @@ test_unknown_key_gives_a_warning_and_is_ignored() {
     fi
 }
 
+# Duplicate key is an error.
 test_duplicate_key_is_an_error() {
     write_valid_conf
     printf 'PORT_MIN=8787\n' >>"$CONF"
     assert_conf_invalid 'PORT_MIN appears a second time'
 }
 
+# Line without equals sign is an error.
 test_line_without_equals_sign_is_an_error() {
     write_valid_conf
     printf 'this is no setting\n' >>"$CONF"
     assert_conf_invalid 'neither a comment nor KEY=value'
 }
 
+# Invalid key is an error.
 test_invalid_key_is_an_error() {
     local bad
     for bad in 'lower_case=1' '1KEY=1' 'KEY WITH BLANK=1' 'KEY-DASH=1' '=1' 'export PORT_MIN=1'; do
@@ -208,6 +218,7 @@ test_invalid_key_is_an_error() {
     done
 }
 
+# A settings file that does not exist is an error that says so.
 test_missing_file() {
     assert_fails impact_conf_parse_file "$TEST_TMP/does-not-exist"
     assert_contains "${IMPACT_CONF_ERRORS[*]}" 'does not exist'
@@ -217,6 +228,7 @@ test_missing_file() {
 # Required keys and value rules
 # ----------------------------------------------------------------------------
 
+# Each required key must be present.
 test_each_required_key_must_be_present() {
     local key
     for key in IMPACT_CONF_VERSION MIN_GUI_VERSION ACCESS_MODE REPO_BASE MODEL_DIR SHARED_GROUP \
@@ -227,6 +239,7 @@ test_each_required_key_must_be_present() {
     done
 }
 
+# Optional keys may be missing.
 test_optional_keys_may_be_missing() {
     write_valid_conf
     replace_line KNOWN_DIRECT_CONTAINERS ''
@@ -234,6 +247,7 @@ test_optional_keys_may_be_missing() {
     assert_success impact_conf_parse_file "$CONF"
 }
 
+# Unknown format version is an error.
 test_unknown_format_version_is_an_error() {
     local value
     for value in 2 0 1.0 '' one; do
@@ -243,6 +257,8 @@ test_unknown_format_version_is_an_error() {
     done
 }
 
+# Every key refuses the values that break its rule, and the error names the
+# key.
 test_value_rules() {
     # Each entry: KEY, then a value that must be refused.
     local -a cases=(
@@ -298,6 +314,8 @@ test_value_rules() {
     done
 }
 
+# PORT_MIN must not be larger than PORT_MAX, and the range holds at most 200
+# ports (exactly 200, and a single port, are fine).
 test_port_range_rules() {
     write_valid_conf
     replace_line PORT_MIN 'PORT_MIN=9000'
@@ -316,6 +334,7 @@ test_port_range_rules() {
     assert_success impact_conf_parse_file "$CONF"
 }
 
+# Check value explains the rule.
 test_check_value_explains_the_rule() {
     assert_fails impact_conf_check_value PORT_MIN 80
     assert_contains "$IMPACT_CHECK_REASON" '1024 to 65535'
@@ -325,6 +344,7 @@ test_check_value_explains_the_rule() {
     assert_contains "$IMPACT_CHECK_REASON" 'unknown key'
 }
 
+# Defaults are valid values.
 test_defaults_are_valid_values() {
     local key value
     for key in IMPACT_CONF_VERSION MIN_GUI_VERSION ACCESS_MODE REPO_BASE MODEL_DIR SHARED_GROUP MIN_FREE_GB PORT_MIN PORT_MAX; do
@@ -343,6 +363,7 @@ test_defaults_are_valid_values() {
 # Trust in the file (owner and mode)
 # ----------------------------------------------------------------------------
 
+# Trust check refuses files that others can change.
 test_trust_check_refuses_files_that_others_can_change() {
     write_valid_conf
     chmod 644 "$CONF"
@@ -363,6 +384,7 @@ test_trust_check_refuses_files_that_others_can_change() {
     fi
 }
 
+# Trust check refuses symbolic links and missing files.
 test_trust_check_refuses_symbolic_links_and_missing_files() {
     write_valid_conf
     ln -s "$CONF" "$TEST_TMP/link.conf"
@@ -387,6 +409,7 @@ fill_values() {
     )
 }
 
+# New file has every key with a comment and reads back.
 test_new_file_has_every_key_with_a_comment_and_reads_back() {
     local -A values=()
     fill_values values
@@ -408,6 +431,7 @@ test_new_file_has_every_key_with_a_comment_and_reads_back() {
     assert_eq '644' "$(stat -c '%a' "$CONF")"
 }
 
+# Example file matches the writer.
 test_example_file_matches_the_writer() {
     # The delivered example is exactly what the writer produces for the
     # example values, so the two can never drift apart.
@@ -422,6 +446,7 @@ test_example_file_matches_the_writer() {
     assert_success impact_conf_parse_file "$WORKSTATION_DIR/etc/impact.conf.example"
 }
 
+# Update keeps comments unknown lines and order.
 test_update_keeps_comments_unknown_lines_and_order() {
     cat >"$CONF" <<'END'
 # Site notes of the administrator: keep this line.
@@ -459,6 +484,7 @@ END
     assert_eq 'Bob Example' "${IMPACT_CONF[DEPUTY_CONTACT]}"
 }
 
+# Second write changes nothing.
 test_second_write_changes_nothing() {
     local -A values=()
     fill_values values
@@ -473,6 +499,7 @@ test_second_write_changes_nothing() {
     assert_success impact_conf_needs_write "$CONF" values
 }
 
+# Invalid values are never written.
 test_invalid_values_are_never_written() {
     local -A values=()
     fill_values values
@@ -491,6 +518,7 @@ test_invalid_values_are_never_written() {
     assert_output_contains 'ADMIN_CONTACT is missing'
 }
 
+# Write refuses a symbolic link as target.
 test_write_refuses_a_symbolic_link_as_target() {
     local -A values=()
     fill_values values
@@ -502,6 +530,7 @@ test_write_refuses_a_symbolic_link_as_target() {
     assert_eq 0 "$(wc -c <"$TEST_TMP/elsewhere")" "nothing was written through the link"
 }
 
+# Atomic write leaves no temporary file.
 test_atomic_write_leaves_no_temporary_file() {
     printf 'new content\n' | impact_write_file_atomic "$TEST_TMP/target.txt" 600
     assert_eq 'new content' "$(cat "$TEST_TMP/target.txt")"
@@ -534,6 +563,8 @@ STORAGE_ROOTS=/mnt/disk_a/shared
 END
 }
 
+# A valid model file is read with all its values, also without the optional
+# BRANCH line.
 test_model_file_valid() {
     load_site_for_models
     write_valid_model
@@ -548,6 +579,7 @@ test_model_file_valid() {
     assert_eq '' "${IMPACT_MODEL[BRANCH]}"
 }
 
+# Every key of the model file refuses the values that break its rule.
 test_model_file_refusals() {
     load_site_for_models
     local -a cases=(
@@ -585,6 +617,7 @@ test_model_file_refusals() {
     assert_contains "${IMPACT_MODEL_ERRORS[*]}" 'The required key REPO_URL is missing'
 }
 
+# Model roots must be listed in shared roots.
 test_model_roots_must_be_listed_in_shared_roots() {
     load_site_for_models
     assert_success impact_model_check_value STORAGE_ROOTS /mnt/disk_a/shared,/mnt/disk_b/shared
@@ -594,6 +627,7 @@ test_model_roots_must_be_listed_in_shared_roots() {
     assert_fails impact_model_check_value STORAGE_ROOTS /mnt/disk_a/shared
 }
 
+# Model dir and load refuse bad names.
 test_model_dir_and_load_refuse_bad_names() {
     load_site_for_models
     assert_eq '/srv/impact/models/Example-Model' "$(impact_model_dir Example-Model)"
@@ -615,6 +649,7 @@ test_model_dir_and_load_refuse_bad_names() {
     fi
 }
 
+# Model load names a missing group membership.
 test_model_load_names_a_missing_group_membership() {
     load_site_for_models
     if ((EUID == 0)); then
@@ -636,6 +671,7 @@ test_model_load_names_a_missing_group_membership() {
     assert_contains "${IMPACT_MODEL_ERRORS[*]}" "no member of the group 'impact-no-such-group'"
 }
 
+# Model file write and update.
 test_model_file_write_and_update() {
     load_site_for_models
     local -A values=(

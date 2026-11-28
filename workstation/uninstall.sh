@@ -25,9 +25,13 @@
 #   Keeps: the accounts, the shared group, /etc/impact (settings), the SSH
 #   rules, the model folders, the shared storage, and /opt/impact/admin with
 #   the log and the saved states.
-#   Tip: to remove the SSH rules as well, run
+#   Order: to remove the SSH rules as well, run
 #   "sudo impact-workstation-setup --remove-ssh-rules" BEFORE this script,
-#   because that command does it with all safety checks.
+#   because that command does it with all safety checks and is removed by
+#   this script. The script names this before it removes anything. Without
+#   that step the rules stay and keep the members restricted to key login.
+#   A second run, after /opt/impact/uninstall.sh is gone, starts from the
+#   unpacked folder: sudo ./uninstall.sh
 #
 # How to undo
 #   Unpack the archive again and run: sudo ./install.sh
@@ -74,6 +78,8 @@ set -euo pipefail
 # The folder this script lies in: /opt/impact after an installation, or the
 # unpacked folder. In both places the shared functions lie in "lib" next to
 # it. bash keeps them in memory, so this script can remove its own files.
+# "${BASH_SOURCE[0]}" is the path of this file; "readlink -f" resolves every
+# symbolic link in it.
 IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 SELF_DIR="$(dirname -- "$IMPACT_SELF")"
 if [[ ! -r "$SELF_DIR/lib/impact-common.sh" ]]; then
@@ -130,6 +136,11 @@ impact_info "Links in $IMPACT_LINK_DIR: ${#LINKS[@]}. Parts in $IMPACT_INSTALL_D
 if ((${#FOREIGN[@]} > 0)); then
     impact_warn "These entries are named like IMPACT commands and do not belong to the installation. They stay: ${FOREIGN[*]}"
 fi
+# The SSH rules are removed safely by a command that this script removes, so
+# the order is named before anything is removed.
+if [[ -e "$IMPACT_SSH_RULES_FILE" && -x "$IMPACT_BIN_DIR/impact-workstation-setup" ]]; then
+    impact_info "The SSH rules $IMPACT_SSH_RULES_FILE stay (members stay restricted to key login). To remove them as well, first run: sudo impact-workstation-setup --remove-ssh-rules  (it needs the commands, so before this script)."
+fi
 
 # Read the settings, when there are any, to name the group and the model
 # folder in the list of things that stay. A missing or invalid file is fine.
@@ -168,7 +179,11 @@ fi
 impact_info "    sudo rm -r $IMPACT_CONF_DIR"
 if [[ -e "$IMPACT_SSH_RULES_FILE" ]]; then
     impact_info "SSH rules: $IMPACT_SSH_RULES_FILE (exists; members of the group stay restricted to key login)."
-    impact_info "    The safe way, while the commands are still installed:  sudo impact-workstation-setup --remove-ssh-rules"
+    if [[ -x "$IMPACT_BIN_DIR/impact-workstation-setup" ]] || impact_is_dry_run; then
+        impact_info "    The safe way, while the commands are still installed (before this script):  sudo impact-workstation-setup --remove-ssh-rules"
+    else
+        impact_info "    The safe way needs the commands, which are removed now: install them again from the unpacked folder (sudo ./install.sh), run  sudo impact-workstation-setup --remove-ssh-rules,  then remove the commands again from the unpacked folder (sudo ./uninstall.sh)."
+    fi
     impact_info "    By hand: keep one session open, then:  sudo rm $IMPACT_SSH_RULES_FILE && sudo sshd -t && sudo systemctl reload ssh"
     impact_info "    (On Ubuntu 24.04 the reload can answer that ssh.service is not active; new logins then read the change by themselves.)"
     impact_info "    Test a new login from a second window before you close the first one."

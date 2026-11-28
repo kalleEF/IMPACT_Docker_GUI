@@ -91,7 +91,9 @@
 set -euo pipefail
 
 # Find this file's real place (the name in /usr/local/bin is a link) and load
-# the shared functions that lie next to it in ../lib.
+# the shared functions that lie next to it in ../lib. "${BASH_SOURCE[0]}" is
+# the path of this file as it was started; "readlink -f" resolves every
+# symbolic link in it.
 IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/impact-common.sh
@@ -247,10 +249,22 @@ if [[ -d "$EXTRAS_FOLDER" && ! -L "$EXTRAS_FOLDER" ]]; then
         impact_info "impact-get-repo refuses to copy extras that break these rules. Rename or remove the entries named above."
     fi
     EXTRA_FILES=("${IMPACT_EXTRAS_FILES[@]}")
+    # DEVIATING counts the entries that are safe and readable, and still
+    # differ from the exact rule of the model folder (owner root, the shared
+    # group, folders 2750, files 640). impact-check (block 8) applies the
+    # same rule, so both commands give the same answer.
+    DEVIATING=0
     for path in "${IMPACT_EXTRAS_DIRS[@]}" "${IMPACT_EXTRAS_FILES[@]}"; do
         full="$EXTRAS_FOLDER/$path"
         is_folder=0
-        [[ -d "$full" ]] && is_folder=1
+        expected="root $GROUP 640"
+        if [[ -d "$full" ]]; then
+            is_folder=1
+            expected="root $GROUP 2750"
+        fi
+        if [[ "$(stat -c '%U %G %a' -- "$full")" != "$expected" ]]; then
+            DEVIATING=$((DEVIATING + 1))
+        fi
         facts="$(stat -c '%U %a' -- "$full")"
         if [[ "${facts%% *}" != 'root' ]]; then
             impact_fail "'$path' belongs to ${facts%% *}. Extras must belong to root: they go into every new working copy."
@@ -264,9 +278,12 @@ if [[ -d "$EXTRAS_FOLDER" && ! -L "$EXTRAS_FOLDER" ]]; then
             FIX_RIGHTS=1
         fi
     done
+    FIX_COMMAND="sudo chown -R root:$GROUP $EXTRAS_FOLDER && sudo find $EXTRAS_FOLDER -type d -exec chmod 2750 {} + && sudo find $EXTRAS_FOLDER -type f -exec chmod 640 {} +"
     if ((FIX_RIGHTS == 1)); then
         impact_info "Fix the owners and rights of all extras with:"
-        impact_info "  sudo chown -R root:$GROUP $EXTRAS_FOLDER && sudo chmod -R u=rwX,g=rX,o= $EXTRAS_FOLDER"
+        impact_info "  $FIX_COMMAND"
+    elif ((DEVIATING > 0)); then
+        impact_warn "$DEVIATING entries in $EXTRAS_FOLDER deviate from the rules (owner root, group '$GROUP', folders 2750, files 640). Correct the rights: $FIX_COMMAND"
     fi
     impact_ok "${#IMPACT_EXTRAS_FILES[@]} extra files in ${#IMPACT_EXTRAS_DIRS[@]} folders."
     LARGE=()

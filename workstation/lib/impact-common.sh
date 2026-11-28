@@ -85,6 +85,8 @@
 #   2>&1                 send the error channel to the same place as the output
 #   "${NAME:0:10}"       a part of the text: from position 0, 10 characters
 #   "${NAME,,}"          the text in lower case
+#   command &  wait PID  start a command in the background ($! is its process
+#                        number); "wait" waits for it to end
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -220,6 +222,8 @@ IMPACT__LOCK_FD=''                 # open handle of the lock file (impact_lock)
 IMPACT__MASK_PID=''                # process number of the masking filter (impact_mask_output_start)
 IMPACT__OUT=''                     # handle of the command's own output channel (impact_init)
 IMPACT__ERR=''                     # handle of the command's own error channel (impact_init)
+IMPACT__HELD_SIGNAL=''             # a signal that arrived while signals were held (impact_signals_hold)
+IMPACT__HELD_CODE=''               # the exit code that belongs to that signal
 
 # "declare -A" creates an associative array: a list whose entries are found
 # by a name. "-g" makes it global even though the line may be read inside a
@@ -256,19 +260,32 @@ impact_init() {
     # "impact_git clone ... 2>file" sends the error channel of the whole
     # function into the file, and a signal handled during that step would
     # print its message there. The end-of-command handlers write to these
-    # copies, so their messages always reach the reader. (When a channel is
-    # closed, no copies are made and the handlers use the channels as they
-    # are.)
-    if ! { exec {IMPACT__OUT}>&1 {IMPACT__ERR}>&2; } 2>/dev/null; then
-        IMPACT__OUT=''
-        IMPACT__ERR=''
+    # copies, so their messages always reach the reader. "[[ -e /dev/fd/1 ]]"
+    # asks whether channel 1 is open. When a channel is closed, no copies
+    # are made and the handlers use the channels as they are. (The copies
+    # are made without any redirection around "exec": such a redirection
+    # would be in force while the copy is made, and the copy of channel 2
+    # would then lead to it.)
+    IMPACT__OUT=''
+    IMPACT__ERR=''
+    if [[ -e /dev/fd/1 && -e /dev/fd/2 ]]; then
+        exec {IMPACT__OUT}>&1 {IMPACT__ERR}>&2 || { IMPACT__OUT=''; IMPACT__ERR=''; }
     fi
 
     # "trap" tells bash to run a function at a certain event. EXIT is the end
-    # of the script for whatever reason. INT is Ctrl+C, TERM a polite request
-    # to end, HUP a closed terminal. After a signal the command ends with the
-    # usual code 128 plus the signal number, and the EXIT handler still runs.
+    # of the script for whatever reason. The handlers for the signals follow
+    # in impact__install_signal_traps.
     trap 'impact__on_exit' EXIT
+    impact__install_signal_traps
+}
+
+# impact__install_signal_traps
+#   Internal: installs the handlers for the three signals that end a
+#   command. INT is Ctrl+C, TERM a polite request to end, HUP a closed
+#   terminal (for example a closed SSH window). After a signal the command
+#   ends with the usual code 128 plus the signal number, and the EXIT
+#   handler still runs. impact_init and impact_signals_release call it.
+impact__install_signal_traps() {
     trap 'impact__on_signal INT 130' INT
     trap 'impact__on_signal TERM 143' TERM
     trap 'impact__on_signal HUP 129' HUP
@@ -281,6 +298,74 @@ impact_init() {
 impact__on_signal() {
     printf '\nERROR: %s was interrupted (signal %s).\n' "$IMPACT_CMD" "$1" >&"${IMPACT__ERR:-2}"
     exit "$2"
+}
+
+# impact_signals_hold
+#   Starts a short part of a command that a signal must not cut in two, for
+#   example "create the account and write its record". From now on Ctrl+C
+#   (INT), a closed terminal (HUP) and a request to end (TERM) are only
+#   noted; impact_signals_release lets a noted signal take effect, so the
+#   command stops at a point where its report ("What changed", "How to
+#   undo") is true. Keep the part short: a person who presses Ctrl+C waits
+#   until it ends. A program that runs inside the part and must not be cut
+#   in two itself is started with impact_run_uninterrupted (the terminal
+#   sends Ctrl+C to it as well). Signal 9 (kill -9) can never be held.
+#   Call it from the main flow of the command, not inside "$( ... )".
+#   Result: none.
+#   Example:
+#     impact_signals_hold
+#     impact_do "Create the account" create_account || impact_die 1 "..." "..."
+#     impact_undo "Close the account again: sudo impact-remove-user alice"
+#     impact_signals_release
+impact_signals_hold() {
+    IMPACT__HELD_SIGNAL=''
+    IMPACT__HELD_CODE=''
+    trap 'impact__note_signal INT 130' INT
+    trap 'impact__note_signal TERM 143' TERM
+    trap 'impact__note_signal HUP 129' HUP
+}
+
+# impact__note_signal NAME EXIT_CODE
+#   Internal: the handler while signals are held. It notes the first signal
+#   that arrives; later ones change nothing.
+impact__note_signal() {
+    if [[ -z "$IMPACT__HELD_SIGNAL" ]]; then
+        IMPACT__HELD_SIGNAL="$1"
+        IMPACT__HELD_CODE="$2"
+    fi
+}
+
+# impact_signals_release
+#   Ends the part that impact_signals_hold started: the normal handlers are
+#   back, and a signal that arrived meanwhile takes effect now (the command
+#   prints "was interrupted" and ends, as it would have done at once).
+#   Result: none, when no signal arrived.
+impact_signals_release() {
+    local name="$IMPACT__HELD_SIGNAL" code="$IMPACT__HELD_CODE"
+    IMPACT__HELD_SIGNAL=''
+    IMPACT__HELD_CODE=''
+    impact__install_signal_traps
+    if [[ -n "$name" ]]; then
+        impact__on_signal "$name" "$code"
+    fi
+}
+
+# impact_run_uninterrupted PROGRAM [ARGUMENTS...]
+#   Runs a program that Ctrl+C, a closed terminal or a request to end must
+#   not stop halfway, for example useradd, which writes several account
+#   files one after the other. The program ignores these three signals
+#   (trap '' means "ignore"; a program keeps ignored signals when "exec"
+#   starts it). Use it inside impact_signals_hold, so the command itself
+#   notes the signal and stops after the step. PROGRAM must be a program,
+#   not a shell function. Use it only for programs that end on their own
+#   within seconds.
+#   Result: the exit code of the program.
+#   Example: impact_run_uninterrupted useradd --create-home -- alice
+impact_run_uninterrupted() {
+    (
+        trap '' INT TERM HUP
+        exec "$@"
+    )
 }
 
 # impact_on_exit FUNCTION_NAME
@@ -684,6 +769,37 @@ impact__print_partial_summary() {
 # Who runs the command
 # =============================================================================
 
+# impact_typed_name
+#   Prints how to type the running command at the prompt: its name for an
+#   installed command (the link in /usr/local/bin leads to this very file),
+#   otherwise the path it was started from: "./install.sh" or
+#   "./bin/impact-check" when it lies inside the current folder, else its
+#   full path, for example /opt/impact/uninstall.sh. A path with other
+#   characters than letters, digits and . _ / + - is put in single quotes.
+#   Messages use it in lines such as "sudo <name> ...", so the line works
+#   when it is typed as printed.
+impact_typed_name() {
+    local link="$IMPACT_LINK_DIR/$IMPACT_CMD" text quote="'"
+    if [[ -L "$link" && "$(readlink -f -- "$link" 2>/dev/null)" == "$IMPACT_SELF" ]]; then
+        printf '%s' "$IMPACT_CMD"
+        return 0
+    fi
+    # PWD is the current folder. "${IMPACT_SELF#"$PWD"/}" is the path
+    # without the current folder in front.
+    if [[ "$IMPACT_SELF" == "$PWD"/* ]]; then
+        text="./${IMPACT_SELF#"$PWD"/}"
+    else
+        text="$IMPACT_SELF"
+    fi
+    if [[ "$text" =~ ^[A-Za-z0-9._/+-]+$ ]]; then
+        printf '%s' "$text"
+    else
+        # "${text//$quote/...}" writes every single quote inside the text
+        # as '\'' (end the quotes, one quote, start the quotes again).
+        printf "'%s'" "${text//$quote/$quote\\$quote$quote}"
+    fi
+}
+
 # impact_require_root
 #   Stops the command (exit code 2) unless it runs as root. Administrator
 #   commands call it after the options were read, so --help works for anyone.
@@ -692,7 +808,7 @@ impact_require_root() {
     if ((EUID != 0)); then
         impact_die "$IMPACT_EXIT_USAGE" \
             "$IMPACT_CMD must run with administrator rights." \
-            "Run it again with sudo in front: sudo $IMPACT_CMD ..."
+            "Run it again with sudo in front: sudo $(impact_typed_name) ..."
     fi
 }
 
@@ -1567,6 +1683,15 @@ impact_https_get() {
         IMPACT_HTTP_STATUS='000'
     fi
     if ((status == 0)) && [[ "$IMPACT_HTTP_STATUS" == 2* ]]; then
+        # curl before version 8.4 (Ubuntu 22.04 has 7.81) applies
+        # --max-filesize only when the server announces the size in
+        # advance, so the limit is checked again here. "stat -c %s" prints
+        # the size of the file in bytes.
+        if (($(stat -c '%s' -- "$output" 2>/dev/null || printf '0') > 1048576)); then
+            : >"$output"
+            impact_error "The answer of $(impact_display "$url") is larger than 1 MB; it is not used."
+            return "$IMPACT_EXIT_NETWORK"
+        fi
         return 0
     fi
     if [[ "$IMPACT_HTTP_STATUS" == 4* ]]; then

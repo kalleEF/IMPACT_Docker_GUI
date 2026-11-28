@@ -102,7 +102,13 @@
 #   sudo impact-share-folder --restore /opt/impact/admin/acl-backups/<backup folder>
 #   It puts back owner, group, mode and ACL of every saved entry that has
 #   not changed in another way since. With several runs on the same folder,
-#   restore the newest backup first. The command prints the exact line.
+#   restore the newest backup first. The command prints the exact lines.
+#   After runs that were stopped early (Ctrl+C, kill), the run that
+#   completes the work lists its own backup and the backups of those runs,
+#   newest first; restored in that order they bring back the state before
+#   the first run. The completing run marks the earlier backups with a line
+#   CONTINUED_BY= in their run.info, so later runs no longer call them
+#   unfinished.
 #   The special bits setuid, setgid and sticky of files (rare in data) are
 #   never set by the command: it names each such file with the exact chmod
 #   line to run by hand. Folders get their special bits back.
@@ -169,7 +175,9 @@
 set -euo pipefail
 
 # Find this file's real place (the name in /usr/local/bin is a link) and load
-# the shared functions that lie next to it in ../lib.
+# the shared functions that lie next to it in ../lib. "${BASH_SOURCE[0]}" is
+# the path of this file as it was started; "readlink -f" resolves every
+# symbolic link in it.
 IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 # The comment lines that start with "shellcheck" tell the checking tool
 # where the loaded files are.
@@ -313,10 +321,10 @@ elif [[ "$IMPACT_SHARING_STATE" == 'absent' ]]; then
 fi
 
 # Folders above the target that members cannot enter.
-mapfile -t BLOCKING < <(impact_sharing_blocking_parents "$IMPACT_SHARING_TARGET" "$GID_NUMBER")
-for folder in "${BLOCKING[@]}"; do
-    impact_warn "Members of '$GROUP' cannot enter $folder (neither all others nor the group may enter it), so they cannot reach $IMPACT_SHARING_TARGET. If they should: sudo chmod o+x $folder"
-done
+# "IFS=$'\t' read -r A B" splits each line at its tab into A and B.
+while IFS=$'\t' read -r folder fix; do
+    impact_warn "Members of '$GROUP' cannot enter $folder (see: ls -ld $folder), so they cannot reach $IMPACT_SHARING_TARGET. If they should: $fix"
+done < <(impact_sharing_blocking_parents "$IMPACT_SHARING_TARGET" "$GID_NUMBER")
 
 # The transition account needs to reach the folder at all.
 if [[ "$IMPACT_SHARING_STATE" == 'present' ]]; then
@@ -341,15 +349,15 @@ if ((RESTORE_MODE == 0)); then
     else
         impact_ok "There is room for the backup in $IMPACT_ACL_BACKUP_DIR."
     fi
-    # Earlier runs on this folder that did not finish.
-    shopt -s nullglob
-    for info_file in "$IMPACT_ACL_BACKUP_DIR"/*/run.info; do
-        if grep -qx -- "TARGET=$IMPACT_SHARING_TARGET" "$info_file" 2>/dev/null &&
-            ! grep -qx -- 'STATE=finished' "$info_file" 2>/dev/null; then
-            impact_info "An earlier run on this folder did not finish; its backup stays in $(dirname -- "$info_file"). This run continues the work."
-        fi
+    # Earlier runs on this folder that did not finish (killed, interrupted
+    # or failed). Each one changed rights and saved the rights from before
+    # its own changes. This run continues their work; its "How to undo"
+    # names their backups as well, and when it finishes it marks them as
+    # continued, so later runs stop naming them.
+    mapfile -t IMPACT_SHARING_EARLIER < <(impact_sharing_unfinished_backups "$IMPACT_SHARING_TARGET")
+    for folder in "${IMPACT_SHARING_EARLIER[@]}"; do
+        impact_info "An earlier run on this folder did not finish; its backup stays in $folder. This run continues the work."
     done
-    shopt -u nullglob
 else
     impact_ok "Backup: $BACKUP_FOLDER (run of ${IMPACT_SHARING_RUN[STARTED]:-unknown time}, state ${IMPACT_SHARING_RUN[STATE]})."
     # Newer backups of the same folder should be restored first.
@@ -422,6 +430,17 @@ else
         else
             impact_undo "Put the previous rights back: sudo impact-share-folder --restore <the backup folder that the real run names>"
         fi
+        # The earlier unfinished runs come next, newest first.
+        impact_sharing_undo_earlier
+    elif ((${#IMPACT_SHARING_EARLIER[@]} > 0)); then
+        # This run found nothing left to change: the earlier runs had done
+        # the work before they stopped. Their changes stay; name the way
+        # back, since the summary of this run lists no changes.
+        impact_info "The earlier runs that did not finish had already applied the rules to every entry. To undo their changes, restore their backups one after the other, newest first:"
+        # "for ((start; test; step))" counts: from the last entry down to the first.
+        for ((INDEX = ${#IMPACT_SHARING_EARLIER[@]} - 1; INDEX >= 0; INDEX--)); do
+            impact_info "  sudo impact-share-folder --restore ${IMPACT_SHARING_EARLIER[INDEX]}"
+        done
     fi
 fi
 

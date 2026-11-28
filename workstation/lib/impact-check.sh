@@ -313,9 +313,16 @@ impact_check_print_summary() {
         esac
     done
     printf '  %d blocks: %d OK, %d WARN, %d FAIL.\n' "${#IMPACT_CHECK_TITLES[@]}" "$ok" "$warn" "$failed"
+    if [[ ! -d "$IMPACT_INSTALL_DIR/bin" ]]; then
+        # Before the installation (block 1 says so as well), the commands
+        # that the lines "What to do" name (sudo impact-workstation-setup,
+        # ...) do not exist yet.
+        printf 'First step: the IMPACT commands are not installed yet (block 1). Install them from the unpacked folder: sudo ./install.sh\n'
+        printf 'The lines "What to do" that name an IMPACT command (for example sudo impact-workstation-setup) work after the installation.\n'
+    fi
     if ((failed > 0)); then
         IMPACT_CHECK_EXIT=2
-        printf 'Overall result: FAIL (exit code 2). Work through the lines "What to do" of the blocks marked FAIL first, then of those marked WARN. Then run sudo impact-check again.\n'
+        printf 'Overall result: FAIL (exit code 2). Work through the lines "What to do" of the blocks marked FAIL first, then of those marked WARN. Then run sudo %s again.\n' "$(impact_typed_name)"
     elif ((warn > 0)); then
         IMPACT_CHECK_EXIT=1
         printf 'Overall result: WARN (exit code 1). The setup works; read the lines "What to do" of the blocks marked WARN.\n'
@@ -418,7 +425,8 @@ impact_check_name_matches() {
 
 # impact_check_volume_like_impact NAME
 #   Result: success when a Docker volume NAME looks like a volume of the
-#   GUI's volume mode (specification section 7.6): the GUI 2.0 names are
+#   GUI's volume mode (the mode that keeps outputs in Docker volumes): the
+#   GUI 2.0 names are
 #   impactncd_output_<container> and impactncd_synthpop_<container>, older
 #   versions used impactncd_<model>_output_<person> and
 #   impactncd_<model>_synthpop_<person>. The rule: the name starts with
@@ -658,8 +666,9 @@ impact_check_mode_writable_by_others() {
 # impact_check_load_settings
 #   Reads the site settings file. On success IMPACT_CONF holds its values,
 #   as for every other command. When the file is missing or cannot be used,
-#   the check must still give a complete report (it is the first step of the
-#   walk-through on an untouched machine). IMPACT_CONF then holds the default
+#   the check must still give a complete report (the administrator runs it
+#   first on an untouched machine, before anything is installed). IMPACT_CONF
+#   then holds the default
 #   values of impact-workstation-setup; from a file that root alone can
 #   change but that breaks a rule, every single value that passes its own
 #   rule is taken over. A file that other accounts can change is never used:
@@ -731,7 +740,7 @@ impact_check_shared_roots() {
 
 # impact_check_root_is_configured ROOT
 #   Result: success when ROOT is listed in SHARED_ROOTS of a usable
-#   settings file (and not only given with --shared-roots).
+#   settings file. A root given only with --shared-roots is no such root.
 impact_check_root_is_configured() {
     local -a configured=()
     [[ "$IMPACT_CHECK_CONF_STATE" == 'ok' ]] || return 1
@@ -787,6 +796,18 @@ impact_check_members() {
     if impact_group_exists "${IMPACT_CONF[SHARED_GROUP]}"; then
         impact_group_members "${IMPACT_CONF[SHARED_GROUP]}" || true
     fi
+}
+
+# impact_check__enrolment_unfinished ACCOUNT
+#   Internal: success when the account record of ACCOUNT says that its
+#   enrolment is not finished (STATE=enrolling: impact-add-user created the
+#   account and stopped before its end). Block 7 reports such an account
+#   once, with the way to continue; the other blocks leave out advice that
+#   does not fit it (adding a key, creating folders, adding a group by
+#   hand). Needs root rights to read the record; without them the answer
+#   is no.
+impact_check__enrolment_unfinished() {
+    impact_account_record_load "$1" >/dev/null 2>&1 && [[ "${IMPACT_ACCOUNT_RECORD[STATE]}" == 'enrolling' ]]
 }
 
 # impact_check_entry_facts PATH
@@ -1323,6 +1344,44 @@ impact_check__images_per_account() {
 # Block 3: Free disk space
 # =============================================================================
 
+# impact_check__mount_of PATH
+#   Internal: prints the mount point of the disk that holds PATH (or its
+#   closest existing parent), or nothing.
+impact_check__mount_of() {
+    local place
+    place="$(impact_nearest_existing "$1")" || return 0
+    findmnt -n -o TARGET -T "$place" 2>/dev/null | head -n 1 || true
+}
+
+# impact_check__free_space_hint MOUNT
+#   Internal: prints what can be removed to free space on the disk mounted
+#   at MOUNT, naming only what lies on that disk: old images when Docker's
+#   data folder is there, files in home folders when /home is there, old
+#   outputs and synthetic populations when a storage root is there.
+impact_check__free_space_hint() {
+    local mount="$1" root
+    local -a parts=() roots=()
+    if [[ "$(impact_check__mount_of "$(impact_check_docker_data_dir)")" == "$mount" ]]; then
+        parts+=('old images (sudo impact-clean-images)')
+    fi
+    if [[ "$(impact_check__mount_of /home)" == "$mount" ]]; then
+        parts+=('files in home folders')
+    fi
+    impact_check_shared_roots roots
+    for root in "${roots[@]}"; do
+        if [[ -e "$root" && "$(impact_check__mount_of "$root")" == "$mount" ]]; then
+            parts+=("old outputs and synthetic populations in the model folders of $root")
+        fi
+    done
+    if ((${#parts[@]} == 0)); then
+        parts+=('files that are no longer needed (sudo du -xh --max-depth=2 '"$mount"' | sort -h | tail -n 20 shows the largest folders)')
+    fi
+    # Join the parts with ", ": "${parts[*]}" joins with the first
+    # character of IFS, which is set to "," for this one line.
+    local IFS=','
+    printf '%s' "${parts[*]}" | sed -e 's/,/, /g'
+}
+
 # impact_check__free_space LABEL PATH
 #   Internal part of block 3: free space of the disk that holds PATH,
 #   compared with MIN_FREE_GB.
@@ -1334,14 +1393,17 @@ impact_check__free_space() {
         return 0
     fi
     free_gb="$(impact_check_gb_floor "$IMPACT_CHECK_DISK_FREE")"
-    local text
+    local text hint
     text="$label ($(impact_display "$path"), disk mounted at $(impact_display "$IMPACT_CHECK_DISK_MOUNT")): $(impact_check_size_text "$IMPACT_CHECK_DISK_FREE") free of $(impact_check_size_text "$IMPACT_CHECK_DISK_SIZE")"
+    if ((IMPACT_CHECK_DISK_FREE < 1073741824 || free_gb < limit)); then
+        hint="$(impact_check__free_space_hint "$IMPACT_CHECK_DISK_MOUNT")"
+    fi
     if ((IMPACT_CHECK_DISK_FREE < 1073741824)); then
         impact_check_fail "$text. The disk is full." \
-            "Free space on the disk mounted at $(impact_display "$IMPACT_CHECK_DISK_MOUNT") now: old images (sudo impact-clean-images), old outputs, files in home folders."
+            "Free space on the disk mounted at $(impact_display "$IMPACT_CHECK_DISK_MOUNT") now: $hint."
     elif ((free_gb < limit)); then
         impact_check_warn "$text: less than MIN_FREE_GB=$limit GB." \
-            "Free space on the disk mounted at $(impact_display "$IMPACT_CHECK_DISK_MOUNT"): old images (sudo impact-clean-images), old outputs, files in home folders."
+            "Free space on the disk mounted at $(impact_display "$IMPACT_CHECK_DISK_MOUNT"): $hint."
     else
         impact_check_ok "$text (limit MIN_FREE_GB=$limit GB)."
     fi
@@ -1478,7 +1540,7 @@ impact_check__known_hosts() {
 # impact_check__sshd_settings ACCOUNT ADDRESS [CONFIG_FILE]
 #   Internal: prints the effective SSH settings of ACCOUNT for a login from
 #   ADDRESS, sorted, as "sshd -T" reports them. With CONFIG_FILE sshd reads
-#   that file in place of /etc/ssh/sshd_config. Read-only. The question
+#   that file as its main configuration file. Read-only. The question
 #   itself is impact_ssh_effective of the library (30 seconds at most).
 #   Result: failure when sshd reports an error.
 impact_check__sshd_settings() {
@@ -1699,7 +1761,9 @@ impact_check_block_groups() {
         mapfile -t docker_members < <(impact_group_members docker || true)
         impact_check_info "Members of the group docker: ${docker_members[*]:-none}. Membership in docker equals root rights on this machine."
         for member in "${members[@]}"; do
-            if ! impact_in_list "$member" "${docker_members[@]}"; then
+            # An unfinished enrolment is reported in block 7; the command
+            # that continues it adds the group docker.
+            if ! impact_in_list "$member" "${docker_members[@]}" && ! impact_check__enrolment_unfinished "$member"; then
                 no_docker+=("$member")
             fi
         done
@@ -1760,7 +1824,8 @@ impact_check__expiry() {
 #   Every account of a person: numbers, groups, password state, expiry,
 #   rights of the home folder and of .ssh, login keys, key copy, size of the
 #   home folder. Also accounts with root's number, user numbers used twice,
-#   and records of deleted accounts.
+#   records of deleted accounts, and enrolments that impact-add-user did not
+#   finish (one warning each, with the way to continue).
 impact_check_block_accounts() {
     local name number other
     local -a accounts=() records=() duplicates=() root_like=()
@@ -1876,7 +1941,10 @@ impact_check__account() {
     if ((record_state == 0)); then
         github="${IMPACT_ACCOUNT_RECORD[GITHUB_NAME]}"
     fi
-    if impact_account_in_group "$account" "$group"; then
+    if ((record_state == 0)) && [[ "${IMPACT_ACCOUNT_RECORD[STATE]}" == 'enrolling' ]]; then
+        # impact-add-user created the account and stopped before its end.
+        role='enrolling'
+    elif impact_account_in_group "$account" "$group"; then
         role='member'
     elif ((record_state == 0)) && [[ "${IMPACT_ACCOUNT_RECORD[STATE]}" == 'removed' ]]; then
         role='removed'
@@ -1895,13 +1963,16 @@ impact_check__account() {
     case "$role" in
         member) role_text="member of '$group'" ;;
         removed) role_text='removed with impact-remove-user' ;;
+        enrolling) role_text='enrolment not finished (impact-add-user stopped early)' ;;
         administrator) role_text='the account that runs this check' ;;
         *) role_text="no member of '$group'" ;;
     esac
     impact_check_info "Account $account: user number $uid, group number $gid, $role_text${github:+, GitHub name $github}."
     impact_check_info "  groups: ${groups% }; shell: $(impact_display "$shell"); password: $password; expiry: $expiry."
 
-    if [[ "$role" == 'member' ]]; then
+    # The password and shell rules of a member apply as well to an account
+    # whose enrolment is not finished.
+    if [[ "$role" == 'member' || "$role" == 'enrolling' ]]; then
         if ((record_state == 1)); then
             impact_check_warn "$account is a member of '$group' without an IMPACT account record, so the commands do not know its GitHub name." \
                 "Enrol $account with its GitHub name: sudo impact-add-user <github-name> --account $account --existing"
@@ -1913,7 +1984,7 @@ impact_check__account() {
             impact_check_warn "$account has a password that is not locked ($password). Colleagues log in with their key only." \
                 "Lock the password of $account: sudo passwd --lock $account"
         fi
-        if impact_account_is_expired "$account"; then
+        if [[ "$role" == 'member' ]] && impact_account_is_expired "$account"; then
             impact_check_warn "$account is expired but still a member of '$group'." \
                 "Finish the removal (sudo impact-remove-user $account) or bring the person back (see the help of impact-remove-user)."
         fi
@@ -1936,7 +2007,40 @@ impact_check__account() {
                 "Run the removal again: sudo impact-remove-user $account"
         fi
     fi
+    # The counts of login keys are set by impact_check__account_home when
+    # it can read them; 0 when it cannot.
+    IMPACT_CHECK_KEYS_ED25519=0
+    IMPACT_CHECK_KEYS_OTHER=0
     impact_check__account_home "$account" "$role" "$home" "$github"
+    if [[ "$role" == 'enrolling' ]]; then
+        impact_check__enrolment_warning "$account" "$groups"
+    fi
+}
+
+# impact_check__enrolment_warning ACCOUNT GROUPS
+#   Internal part of block 7: the one warning for an account whose
+#   enrolment is not finished. It says what the account has already (the
+#   groups, login keys) and names the two ways on: run the same
+#   impact-add-user command again, or close the account. The advice for a
+#   finished member (add a key with impact-key, create folders by hand)
+#   does not fit: impact-key refuses such an account, and impact-add-user
+#   does these steps itself when it continues. GROUPS is the list of the
+#   account's groups, separated by blanks.
+impact_check__enrolment_warning() {
+    local account="$1" groups=" $2 " group="${IMPACT_CONF[SHARED_GROUP]}" text
+    text="The enrolment of $account is not finished (impact-add-user stopped early)."
+    if [[ "$groups" == *" docker "* ]]; then
+        text+=" The account is a member of docker (root rights on this machine) and has no confirmed SSH restriction."
+    elif [[ "$groups" == *" $group "* ]]; then
+        text+=" The account is a member of '$group' and has no confirmed SSH restriction."
+    fi
+    if ((IMPACT_CHECK_KEYS_ED25519 + IMPACT_CHECK_KEYS_OTHER > 0)); then
+        text+=" It has login keys, so it can log in."
+    else
+        text+=" It has no login key, so it cannot log in yet."
+    fi
+    impact_check_warn "$text" \
+        "Run the same impact-add-user command again (it checks every part and does the missing steps), or close the account: sudo impact-remove-user $account"
 }
 
 # impact_check__account_home ACCOUNT ROLE HOME GITHUB_NAME
@@ -2370,6 +2474,10 @@ impact_check_block_working_copies() {
 impact_check__working_copies() {
     local account="$1" base name copy inside count=0
     local -a names=()
+    if impact_check__enrolment_unfinished "$account"; then
+        impact_check_info "$account: the enrolment is not finished (see block 7); impact-add-user creates the repository folder when it continues."
+        return 0
+    fi
     if ! base="$(impact_repo_base_for "$account")"; then
         impact_check_warn "The repository folder of $account cannot be worked out from REPO_BASE=${IMPACT_CONF[REPO_BASE]}." \
             "Look at the home folder of the account (getent passwd $account) and at REPO_BASE."
@@ -2530,6 +2638,21 @@ impact_check__storage_root() {
     if ((is_configured == 0)); then
         impact_check_info "  $root is not in SHARED_ROOTS; only its file system and its free space were checked."
         return 0
+    fi
+
+    # Can the members reach the storage at all? Every folder above the root
+    # must let them enter, and the root itself must let them enter and list.
+    # (A storage root that already existed, for example with the old shared
+    # account as its owner, is left as it is by impact-workstation-setup.)
+    local gid folder fix group_name="${IMPACT_CONF[SHARED_GROUP]}"
+    gid="$(impact_group_gid "$group_name" 2>/dev/null)" || gid=''
+    if [[ -n "$gid" ]]; then
+        # "IFS=$'\t' read -r A B" splits each line at its tab into A and B.
+        while IFS=$'\t' read -r folder fix; do
+            [[ -n "$folder" ]] || continue
+            impact_check_warn "Members of '$group_name' cannot enter $folder (see: ls -ld $folder), so they cannot reach the model folders in $root." \
+                "If they should: $fix"
+        done < <(impact_member_blocked_folders "$real" "$gid")
     fi
 
     # The storage folders of every model that may use this root.

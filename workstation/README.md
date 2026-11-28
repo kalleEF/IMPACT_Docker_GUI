@@ -18,10 +18,14 @@ Every command:
 - shows every step without changing anything when you add `--dry-run` (commands that only read
   have no `--dry-run`);
 - can be run again safely: a second run with the same input changes nothing and says so;
-- ends with the lists "What changed" and "How to undo";
+- ends with the lists "What changed" and "How to undo", whose lines work when you follow them
+  from top to bottom;
 - writes one block to the log `/opt/impact/admin/log/impact-admin.log` when it changes
   something (time in UTC, who ran `sudo`, the command, the result; public keys appear as their
-  fingerprint, private keys and passwords never).
+  fingerprint, private keys and passwords never). The two commands for colleagues
+  (`impact-get-repo`, `impact-update-setup`) run without root rights and write no log block:
+  the log folder is readable by root only. `impact-give-repo`, which the administrator runs,
+  logs the copies it makes, and `impact-check` (block 9) shows the working copies of everyone.
 
 The repository is public. It holds no values of a real installation: the settings of a site
 reach the machine as command options and through the settings file `/etc/impact/impact.conf`.
@@ -109,7 +113,11 @@ You need: Ubuntu 22.04 or 24.04, Docker Engine 28.3.3 or newer from Docker's own
 
 To remove the commands again: `sudo /opt/impact/uninstall.sh`. It removes the commands and
 their links only, and lists everything that stays (accounts, group, settings, SSH rules,
-models, storage) with the command that removes each part by hand.
+models, storage) with the command that removes each part by hand. When the SSH rules should go
+as well, remove them first, while the commands are still installed:
+`sudo impact-workstation-setup --remove-ssh-rules`, then `sudo /opt/impact/uninstall.sh`.
+After the removal, `/opt/impact/uninstall.sh` is gone; a later run starts from the unpacked
+folder: `sudo ./uninstall.sh`.
 
 ## A worked example: from the first setup to a colleague's first repository
 
@@ -120,7 +128,9 @@ something with `--dry-run` first, read its steps, then run it again without `--d
 
 **1. Look at the untouched machine.** Run the health check from the unpacked folder, before
 anything is installed. It reads only and prints numbered blocks that end in OK, WARN or FAIL;
-on an untouched machine block 4 (settings file) is FAIL, which is expected.
+on an untouched machine block 4 (settings file) is FAIL, which is expected. Its lines "What to
+do" name IMPACT commands such as `sudo impact-workstation-setup`: these work after the
+installation (step 2), so install first, then follow them.
 
 ```
 sudo ./bin/impact-check
@@ -147,7 +157,12 @@ keep exactly their SSH settings, and it puts the previous state back if a check 
 end it asks you to keep this session open and to log in from a second window: do that before
 you close anything. Note the number of the group it prints: a rebuilt workstation needs it
 (`--gid`). A later run changes only the values you give, for example
-`sudo impact-workstation-setup --port-max 8850`.
+`sudo impact-workstation-setup --port-max 8850`; its "How to undo" is the one command that sets
+the previous values again (`sudo impact-workstation-setup --port-max 8830`), which also writes
+the SSH rules for them. When there were no SSH rules before the run (an earlier run removed them
+with `--remove-ssh-rules`), the line that removes them again follows after that command. If a
+run is ended by force during the SSH step, the next run puts the previous rules back first and
+repeats the change with all checks.
 
 **4. Register the model.** This writes `/srv/impact/models/Example-Model/model.conf`, an empty
 `extras/` folder, and the folders `outputs` and `inputs/synthpop` on the storage root with the
@@ -161,16 +176,19 @@ sudo impact-add-model Example-Model git@github.com:example-org/Example-Model.git
 ```
 
 Files that the model needs and that are not on GitHub go into `extras/`, at their path inside
-the repository, owned by root and readable for the group. Then check the model:
+the repository, owned by root and readable for the group: folders with mode 2750, files with
+mode 640. Create each folder first, then put the file in it, then check the model:
 
 ```
-sudo install -D -m 640 -o root -g impact table.csv /srv/impact/models/Example-Model/extras/inputs/table.csv
+sudo install -d -m 2750 -o root -g impact /srv/impact/models/Example-Model/extras/inputs
+sudo install -m 640 -o root -g impact table.csv /srv/impact/models/Example-Model/extras/inputs/table.csv
 sudo impact-check-model Example-Model
 ```
 
 When the storage folder of the model holds files from before these rules, give them the group
 rules once (`--dry-run` prints counts; a large tree takes long, see `--help` for a run that
-continues after you log out):
+continues after you log out). The command is safe to stop and to start again: the run that
+completes the work names in its "How to undo" the backups of every stopped run, newest first.
 
 ```
 sudo impact-share-folder /mnt/disk_a/shared/Example --dry-run
@@ -190,11 +208,23 @@ sudo impact-add-user alice-example --account alice --key-file /tmp/alice.pub \
 ```
 
 The command creates the account with a locked password, adds it to the shared group and to
-`docker`, installs the key, creates `~/Repositories`, notes the GitHub name, and confirms with
-the SSH server that the rules of the group apply. At the end it prints the text to send to
-Alice. Without `--fingerprint` it shows the fingerprint and asks you to compare it with the one
-Alice sent. With `--github` the command takes the key from
-`https://github.com/alice-example.keys`, the list of public keys that GitHub shows for an account.
+`docker`, confirms with the SSH server that the rules of the group apply, and only then
+installs the key; it creates `~/Repositories`, notes the GitHub name, and at the end prints the
+text to send to Alice. One key pair belongs to one person: a key that is already a login key of
+another account is refused. The key login of an account with a locked password needs
+`UsePAM yes` in `/etc/ssh/sshd_config` (the setting of Ubuntu); `impact-add-user` and
+`impact-check` report it when it is off. Without `--fingerprint` it shows the fingerprint and asks you to
+compare it with the one Alice sent. With `--github` the command takes the key from
+`https://github.com/alice-example.keys`, the list of public keys that GitHub shows for an
+account.
+
+If the command stops after it has created the account (an error, Ctrl+C, a closed window), the
+account record says "enrolment not finished"; `impact-list-users` and `impact-check` show it,
+and `impact-key` refuses the account until then. Run the same `impact-add-user` command again:
+it checks every part and does the missing steps. Or close the account with
+`sudo impact-remove-user alice`. A Ctrl+C that comes while the account is being created takes
+effect right after the account and its record are written, so the one never exists without the
+other.
 
 **6. Give Alice her first working copy.** Alice presses "Add repository" in the GUI, which runs
 `impact-get-repo Example-Model` in her account. You can do the same for her:
@@ -206,7 +236,10 @@ sudo impact-give-repo alice Example-Model
 
 The copy is a fresh clone from GitHub in `/home/alice/Repositories/Example-Model`, made with
 Alice's own key copy (or over anonymous HTTPS for a public repository while she has none). The
-extra files are added and listed in the copy's own ignore list, so git never commits them.
+extra files are added and listed in the copy's own ignore list, so git never commits them. The
+messages of `impact-get-repo` appear inside a frame of lines marked `|`; after Ctrl+C the frame
+still shows everything `impact-get-repo` reports about its own stop before
+`impact-give-repo` reports its own.
 
 **7. Check the whole setup again.**
 
@@ -224,7 +257,7 @@ sudo impact-check
 | `impact-add-user <GitHub name>` | administrator | Enrols a colleague: account with locked password, groups, login key, repository folder, SSH rules confirmed. |
 | `impact-key list\|add\|replace\|remove <account>` | administrator | Shows and manages the login keys of a person with their fingerprints. |
 | `impact-list-users` | administrator | Lists the enrolled people with numbers, groups, keys and last login. |
-| `impact-remove-user <account>` | administrator | Closes the account of a person who leaves (expired, keys moved away, groups, sessions, containers) and keeps its number; `--delete` deletes it. |
+| `impact-remove-user <account>` | administrator | Closes the account of a person who leaves (expired, keys moved away, groups, sessions, containers, lingering, cron and at jobs) and keeps its number; `--delete` deletes it. |
 | `impact-add-model <model> <GitHub address>` | administrator | Registers a model with its `model.conf`, `extras/` and storage folders. |
 | `impact-check-model <model>` | administrator | Checks the model file, the extras (names, rights, files over 50 MB) and the extras rule in every working copy. |
 | `impact-share-folder <folder>` | administrator | Gives existing content on the shared storage the group rules, with a backup of the previous rights; `--repair`, `--restore`. |
@@ -240,9 +273,23 @@ developer's computer.
 Exit codes of all commands: 0 done or nothing to do; 1 a check or step failed; 2 wrong usage;
 3 the workstation is not prepared (settings file missing or invalid); 4 the target exists or the
 request conflicts with the current state; 5 no access (for example GitHub refused the key);
-6 network problem. `impact-check` uses 0 for all OK, 1 for at least one WARN and 2 for at least
-one FAIL. The two commands for colleagues end with one line for the GUI:
+6 network problem; 129, 130 and 143 the command was stopped by a signal (a closed session,
+Ctrl+C, a request to end). `impact-check` uses 0 for all OK, 1 for at least one WARN and 2 for
+at least one FAIL. The two commands for colleagues end with one line for the GUI:
 `IMPACT_RESULT status=<ok|error> code=<exit code> path=<path> reason=<one word>`.
+
+## The settings file
+
+`/etc/impact/impact.conf` holds one `KEY=value` per line; `impact-workstation-setup` writes it,
+and the GUI reads it too. It is read as text and never executed. The exact rules, the same for
+the commands and for the GUI: UTF-8 text (a byte order mark at the start is allowed); each line
+ends with LF or CR LF, and no other carriage return or zero byte may appear; spaces and tabs
+around key and value are removed (they are the only blanks); a line whose first character
+after blanks is `#` is a comment; each key may appear only once. Numbers have no sign and no
+leading zero; a contact text has 1 to 80 characters (an emoji counts as one) without control
+characters, invisible format characters or spaces at its ends. The file
+`workstation/etc/impact.conf.example` explains every key, and
+`tests/workstation/vectors/` holds the test cases that both readers share.
 
 ## Tests
 

@@ -39,17 +39,20 @@ setup() {
     load_library
 }
 
+# Library sets the fixed path.
 test_library_sets_the_fixed_path() {
     assert_eq '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' "$PATH" "PATH after loading the library"
     assert_eq 'C' "$LC_ALL" "LC_ALL after loading the library"
 }
 
+# Library can be loaded twice.
 test_library_can_be_loaded_twice() {
     load_library
     load_library
     assert_eq '/etc/impact/impact.conf' "$IMPACT_CONF_FILE"
 }
 
+# Trim removes blanks at both ends.
 test_trim_removes_blanks_at_both_ends() {
     assert_eq 'a b' "$(impact_trim '   a b   ')"
     assert_eq 'x' "$(impact_trim $'\t x \r')" "tab and carriage return count as blanks"
@@ -57,10 +60,14 @@ test_trim_removes_blanks_at_both_ends() {
     assert_eq 'a' "$(impact_trim 'a')"
 }
 
+# impact_lower turns upper-case letters into lower-case ones and keeps every
+# other character.
 test_lower() {
     assert_eq 'alice-example' "$(impact_lower 'Alice-Example')"
 }
 
+# impact_split_list splits at commas, gives an empty list for an empty text
+# and keeps empty entries.
 test_split_list() {
     local -a parts=()
     impact_split_list 'a,b,c' parts
@@ -76,6 +83,8 @@ test_split_list() {
     assert_eq '' "${parts[3]}"
 }
 
+# impact_in_list finds only an entry that is exactly equal, never a part of
+# one.
 test_in_list() {
     assert_success impact_in_list b a b c
     assert_fails impact_in_list d a b c
@@ -83,6 +92,7 @@ test_in_list() {
     assert_fails impact_in_list 'a b' a b
 }
 
+# Display replaces control characters and cuts long text.
 test_display_replaces_control_characters_and_cuts_long_text() {
     assert_eq 'a?b?c' "$(impact_display $'a\nb\tc')"
     assert_eq 'x?[31m' "$(impact_display $'x\e[31m')" "an escape sequence cannot reach the terminal"
@@ -95,6 +105,8 @@ test_display_replaces_control_characters_and_cuts_long_text() {
     assert_eq 13 "$(impact_display "$long" 10 | wc -c)" "10 characters plus three dots"
 }
 
+# impact_version_compare compares the parts as numbers (10 after 9) and counts
+# a missing part as 0.
 test_version_compare() {
     assert_eq 'lt' "$(impact_version_compare 28.3.2 28.3.3)"
     assert_eq 'eq' "$(impact_version_compare 28.3.3 28.3.3)"
@@ -106,6 +118,7 @@ test_version_compare() {
     assert_eq 'eq' "$(impact_version_compare 08.09 8.9)" "leading zeros are read as decimal numbers"
 }
 
+# Version compare accepts package and suffix forms.
 test_version_compare_accepts_package_and_suffix_forms() {
     assert_eq 'eq' "$(impact_version_compare '5:29.1.0-1~ubuntu.22.04~jammy' 29.1.0)" "package version with epoch"
     assert_eq 'eq' "$(impact_version_compare v28.3.3 28.3.3)"
@@ -113,12 +126,15 @@ test_version_compare_accepts_package_and_suffix_forms() {
     assert_eq 'gt' "$(impact_version_compare 29.0.0+build5 28.3.3)"
 }
 
+# Version compare refuses texts without a number.
 test_version_compare_refuses_texts_without_a_number() {
     assert_fails impact_version_compare abc 1.0
     assert_fails impact_version_compare 1.0 ''
     assert_fails impact_version_compare '' ''
 }
 
+# impact_version_ge accepts the same or a newer version and refuses a text
+# that is no version.
 test_version_ge() {
     assert_success impact_version_ge 28.3.3 28.3.3
     assert_success impact_version_ge 29.10.0 28.3.3
@@ -129,6 +145,7 @@ test_version_ge() {
     assert_fails impact_version_ge '' 28.3.3
 }
 
+# Own version reads the version file.
 test_own_version_reads_the_version_file() {
     local expected
     IFS= read -r expected <"$WORKSTATION_DIR/VERSION"
@@ -136,10 +153,13 @@ test_own_version_reads_the_version_file() {
     assert_matches "$(impact_own_version)" '^[0-9]+\.[0-9]+\.[0-9]+$'
 }
 
+# impact_now_utc prints the UTC time in the form 2026-01-31T14:05:09Z.
 test_now_utc_format() {
     assert_matches "$(impact_now_utc)" '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
 }
 
+# impact_package_for_tool names the Ubuntu package of each tool, and nothing
+# for an unknown one.
 test_package_for_tool() {
     assert_eq 'acl' "$(impact_package_for_tool setfacl)"
     assert_eq 'acl' "$(impact_package_for_tool getfacl)"
@@ -151,6 +171,7 @@ test_package_for_tool() {
     assert_eq '' "$(impact_package_for_tool no-such-tool)"
 }
 
+# Missing tools lists only missing ones.
 test_missing_tools_lists_only_missing_ones() {
     local output status=0
     output="$(impact_missing_tools bash no-such-tool-a cat no-such-tool-b)" || status=$?
@@ -159,6 +180,7 @@ test_missing_tools_lists_only_missing_ones() {
     assert_success impact_missing_tools bash cat
 }
 
+# Install hint prints one apt get line.
 test_install_hint_prints_one_apt_get_line() {
     local output
     output="$(impact_install_hint setfacl getfacl git)"
@@ -169,6 +191,7 @@ test_install_hint_prints_one_apt_get_line() {
     assert_not_contains "$output" 'apt-get install'
 }
 
+# Require tools stops with exit code 1.
 test_require_tools_stops_with_exit_code_1() {
     run_cmd impact_require_tools bash no-such-tool-a
     assert_status 1
@@ -177,6 +200,8 @@ test_require_tools_stops_with_exit_code_1() {
     assert_status 0
 }
 
+# impact_contact_text names "the administrator" before the settings are read,
+# then ADMIN_CONTACT, with DEPUTY_CONTACT in brackets when it is set.
 test_contact_text() {
     assert_eq 'the administrator' "$(impact_contact_text)" "before the settings are loaded"
     IMPACT_CONF[ADMIN_CONTACT]='Alice Example'
@@ -186,6 +211,7 @@ test_contact_text() {
     assert_eq 'Alice Example (or Bob Example)' "$(impact_contact_text)"
 }
 
+# Ok warn fail lines and counters.
 test_ok_warn_fail_lines_and_counters() {
     local output
     output="$(impact_ok 'in order'; impact_warn 'look at this'; impact_fail 'broken')"

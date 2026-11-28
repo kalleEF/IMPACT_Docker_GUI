@@ -163,6 +163,7 @@ backup_folders() {
     find /opt/impact/admin/acl-backups -mindepth 1 -maxdepth 1 -type d 2>/dev/null | LC_ALL=C sort
 }
 
+# Dry run changes nothing and counts.
 test_dry_run_changes_nothing_and_counts() {
     snapshot_unchanged_by --content /mnt/disk_a /opt/impact /etc/impact -- \
         sys_as_admin "$SHARE" "$T" --dry-run
@@ -178,6 +179,7 @@ test_dry_run_changes_nothing_and_counts() {
     assert_eq '' "$(backup_folders)" "backup folders after a dry run"
 }
 
+# First run applies the rules to every entry.
 test_first_run_applies_the_rules_to_every_entry() {
     run_cmd sys_as_admin "$SHARE" "$T"
     assert_status 0
@@ -228,6 +230,7 @@ test_first_run_applies_the_rules_to_every_entry() {
     assert_file_contains /opt/impact/admin/log/impact-admin.log "backup: $folder"
 }
 
+# Second run changes nothing.
 test_second_run_changes_nothing() {
     snapshot_unchanged_by --content --exclude /opt/impact/admin/log /mnt/disk_a /opt/impact /etc/impact -- \
         sys_as_admin "$SHARE" "$T"
@@ -238,6 +241,7 @@ test_second_run_changes_nothing() {
     assert_eq 1 "$(backup_folders | wc -l)" "number of backup folders"
 }
 
+# Restore dry run changes nothing.
 test_restore_dry_run_changes_nothing() {
     local folder
     folder="$(backup_folders)"
@@ -247,6 +251,7 @@ test_restore_dry_run_changes_nothing() {
     assert_output_contains 'To put back: 15.'
 }
 
+# Restore brings back the exact previous state.
 test_restore_brings_back_the_exact_previous_state() {
     local folder
     folder="$(backup_folders)"
@@ -264,6 +269,7 @@ test_restore_brings_back_the_exact_previous_state() {
     assert_output_contains 'Already in the saved state: 15.'
 }
 
+# Restore leaves alone an entry that became a link.
 test_restore_leaves_alone_an_entry_that_became_a_link() {
     local folder
     folder="$(backup_folders)"
@@ -289,6 +295,7 @@ test_restore_leaves_alone_an_entry_that_became_a_link() {
     [[ -n "$folder" ]] || fail "no backup folder"
 }
 
+# Walk and library agree on every kind of entry.
 test_walk_and_library_agree_on_every_kind_of_entry() {
     load_settings
     local base="$SYS_ROOT_A/Variants" uid index state answer expected
@@ -365,6 +372,7 @@ test_walk_and_library_agree_on_every_kind_of_entry() {
     rm -rf -- "$base"
 }
 
+# Two accounts with umask 077 can change each others entries.
 test_two_accounts_with_umask_077_can_change_each_others_entries() {
     local out="$T/outputs"
     as_person alice "printf 'a\n' >'$out/alice.txt' && mkdir '$out/alice-dir' && printf 'x\n' >'$out/alice-dir/inner.txt'" ||
@@ -384,6 +392,7 @@ test_two_accounts_with_umask_077_can_change_each_others_entries() {
     assert_eq '' "$(deviating_entries "$out")" "new entries that deviate"
 }
 
+# Repair finds entries moved in with old rights.
 test_repair_finds_entries_moved_in_with_old_rights() {
     local out="$T/outputs"
     mkdir -p -- "$PRIVATE"
@@ -421,6 +430,7 @@ test_repair_finds_entries_moved_in_with_old_rights() {
     assert_output_contains 'Nothing to do'
 }
 
+# Transition account gets access and loses it again.
 test_transition_account_gets_access_and_loses_it_again() {
     local out="$T/outputs" uid
     uid="$(id -u oldshared)"
@@ -470,6 +480,7 @@ test_transition_account_gets_access_and_loses_it_again() {
     setfacl -x u:oldshared -- "$SYS_ROOT_A"
 }
 
+# Restore names files whose special bits it leaves.
 test_restore_names_files_whose_special_bits_it_leaves() {
     local base="$SYS_ROOT_A/Special" before folder
     mkdir -p -- "$base/d-sticky"
@@ -512,6 +523,7 @@ test_restore_names_files_whose_special_bits_it_leaves() {
     rm -rf -- "$base"
 }
 
+# Restore of a folder works only on the saved folder.
 test_restore_of_a_folder_works_only_on_the_saved_folder() {
     load_settings
     local base="$SYS_ROOT_A/Swap" ident key status

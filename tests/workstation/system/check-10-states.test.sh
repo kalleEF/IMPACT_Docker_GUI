@@ -78,9 +78,11 @@ BOB_PASSWORD='Bob-Test-Pass-58'
 FAKE_DOCKER=/usr/local/sbin/docker
 FAKE_MARK='# impact-test stand-in for docker (check-10)'
 TEST_HOST='ws-check-host'
-# The folders whose state must not change: the places of brief section 5.2
-# and the storage. /home/user and /home/ubuntu belong to the sandbox around
-# the private view and are left out.
+# The folders whose state must not change: every place where the commands
+# keep files (/etc/impact, /etc/ssh/sshd_config.d, /opt/impact with its
+# admin folder, /srv/impact/models, the links in /usr/local/bin, the home
+# folders) and the storage. /home/user and /home/ubuntu belong to the
+# machine that runs the tests and are left out.
 WATCHED=(/etc /opt/impact /srv /usr/local/bin /usr/local/sbin /home /mnt/disk_a /mnt/disk_b)
 EXCLUDES=(--exclude /home/user --exclude /home/ubuntu --exclude /etc/ld.so.cache)
 
@@ -301,9 +303,9 @@ END
 }
 
 # make_member ACCOUNT GITHUB_NAME
-#   An account as impact-add-user leaves it (brief section 6 and the notes
-#   of the agent "users"): member of impact and docker, a locked password,
-#   one ed25519 login key, an account record, the repository folder (750).
+#   An account as impact-add-user leaves it: member of impact and docker,
+#   a locked password, one ed25519 login key, an account record, the
+#   repository folder (750).
 make_member() {
     local account="$1" github="$2"
     sys_account_add "$account" impact docker
@@ -328,6 +330,7 @@ as_person() {
 # Wrong input and the untouched machine
 # -----------------------------------------------------------------------------
 
+# Help works and names the blocks.
 test_help_works_and_names_the_blocks() {
     run_cmd bash "$WORKSTATION_DIR/bin/impact-check" --help
     assert_status 0
@@ -336,6 +339,7 @@ test_help_works_and_names_the_blocks() {
     assert_output_not_contains 'Reading help'
 }
 
+# Wrong input is refused before anything is looked at.
 test_wrong_input_is_refused_before_anything_is_looked_at() {
     local value
     snapshot_unchanged_by --content "${EXCLUDES[@]}" "${WATCHED[@]}" -- bash "$WORKSTATION_DIR/bin/impact-check" --dry-run
@@ -363,6 +367,7 @@ test_wrong_input_is_refused_before_anything_is_looked_at() {
     assert_missing /tmp/impact-check-pwned
 }
 
+# Untouched machine gives a complete report and changes nothing.
 test_untouched_machine_gives_a_complete_report_and_changes_nothing() {
     # Nothing is installed or set up: the administrator runs the check from
     # the unpacked folder, as root.
@@ -381,8 +386,23 @@ test_untouched_machine_gives_a_complete_report_and_changes_nothing() {
     # The blocks that need the settings say that they use default values.
     assert_block_contains 6 'Without a usable settings file (block 4) this block works with default values'
     assert_output_contains 'Overall result: FAIL (exit code 2).'
+    # Before the installation the summary names the installation as the
+    # first step, and the line about running the check again names the
+    # check by the path it was started from. Only the summary line counts
+    # here: a "What to do" line of a block may name sudo impact-check (for
+    # example block 5 when /run/sshd is missing), and the summary says that
+    # such lines work after the installation.
+    assert_output_contains 'First step: the IMPACT commands are not installed yet (block 1). Install them from the unpacked folder: sudo ./install.sh'
+    assert_output_contains 'The lines "What to do" that name an IMPACT command (for example sudo impact-workstation-setup) work after the installation.'
+    local overall
+    overall="$(printf '%s\n' "$RUN_OUTPUT" | grep '^Overall result: ' || true)"
+    assert_eq 1 "$(printf '%s\n' "$overall" | grep -c .)" "number of lines 'Overall result:'"
+    # The check was started by its path, so the line names that path.
+    assert_matches "$overall" '/bin/impact-check again\.$' "the summary line"
+    assert_not_contains "$overall" 'sudo impact-check again' "the summary line"
 }
 
+# Candidate storage roots are looked at before the setup.
 test_candidate_storage_roots_are_looked_at_before_the_setup() {
     mkdir -p /mnt/disk_a/shared
     run_cmd bash "$WORKSTATION_DIR/bin/impact-check" --shared-roots /mnt/disk_a/shared,/mnt/disk_b/missing
@@ -398,6 +418,7 @@ test_candidate_storage_roots_are_looked_at_before_the_setup() {
 # The half set-up machine: installed and set up, no people, no models
 # -----------------------------------------------------------------------------
 
+# Half set up machine.
 test_half_set_up_machine() {
     sys_install
     sys_admin_create
@@ -434,6 +455,7 @@ test_half_set_up_machine() {
     fi
 }
 
+# Not root is refused.
 test_not_root_is_refused() {
     run_cmd runuser -u "$SYS_ADMIN" -- "$CHECK"
     assert_status 2
@@ -445,6 +467,7 @@ test_not_root_is_refused() {
 # The fully set-up machine
 # -----------------------------------------------------------------------------
 
+# Build the full fixture.
 test_build_the_full_fixture() {
     local dir="/srv/impact/models/$MODEL" real copy="/home/$ALICE/Repositories/$MODEL"
     load_library
@@ -517,6 +540,7 @@ test_build_the_full_fixture() {
     start_listener 127.0.0.1 8795 local
 }
 
+# Full set up machine report.
 test_full_set_up_machine_report() {
     run_check_unchanged
     assert_complete_report
@@ -565,16 +589,29 @@ test_full_set_up_machine_report() {
     assert_block_contains 12 '43 of the 44 ports of the range 8787 to 8830 are free.'
 }
 
+# stable_report
+#   Prints the last report (RUN_OUTPUT) without the parts that change by
+#   themselves between two runs: the time line, the uptime line, and the
+#   free space of the disks (other programs on the machine write and delete
+#   files at any time). Each size "<number> <unit> free of <number> <unit>"
+#   becomes "<size> free of <size>".
+stable_report() {
+    printf '%s\n' "$RUN_OUTPUT" | grep -v -e '^Time (UTC): ' -e 'Running since: ' |
+        sed -E 's/[0-9]+(\.[0-9])? (bytes|KB|MB|GB|TB|PB) free of [0-9]+(\.[0-9])? (bytes|KB|MB|GB|TB|PB)/<size> free of <size>/g'
+}
+
+# A second run on an unchanged machine gives the same report, apart from
+# the lines that stable_report leaves out.
 test_second_run_gives_the_same_report() {
     local first second
     run_cmd sys_as_admin "$CHECK"
-    # The time line and the uptime line are the only lines that may differ.
-    first="$(printf '%s\n' "$RUN_OUTPUT" | grep -v -e '^Time (UTC): ' -e 'Running since: ')"
+    first="$(stable_report)"
     run_check_unchanged
-    second="$(printf '%s\n' "$RUN_OUTPUT" | grep -v -e '^Time (UTC): ' -e 'Running since: ')"
+    second="$(stable_report)"
     assert_eq "$first" "$second" "the report of the second run"
 }
 
+# No secret appears in the output.
 test_no_secret_appears_in_the_output() {
     local blob hash line
     run_cmd sys_as_admin "$CHECK"
@@ -599,6 +636,7 @@ test_no_secret_appears_in_the_output() {
     assert_output_not_contains '$6$'
 }
 
+# Mask hides addresses and host names.
 test_mask_hides_addresses_and_host_names() {
     hostname >"$TEST_SUITE_TMP/old-hostname"
     hostname "$TEST_HOST"
@@ -630,6 +668,7 @@ test_mask_hides_addresses_and_host_names() {
     rm -f -- "$TEST_SUITE_TMP/hosts-saved"
 }
 
+# Extra that git would commit is a fail.
 test_extra_that_git_would_commit_is_a_fail() {
     local copy="/home/$ALICE/Repositories/$MODEL"
     # The extra is no longer listed as ignored.
@@ -649,6 +688,7 @@ test_extra_that_git_would_commit_is_a_fail() {
     assert_block_contains 9 "git ignores every extra of the model $MODEL"
 }
 
+# Docker blocks with the stand in.
 test_docker_blocks_with_the_stand_in() {
     install_fake_docker
     sys_fake_systemd_install ssh.service
@@ -703,6 +743,7 @@ test_docker_blocks_with_the_stand_in() {
 # Hostile and broken state
 # -----------------------------------------------------------------------------
 
+# Hostile names and links are reported and not followed.
 test_hostile_names_and_links_are_reported_and_not_followed() {
     local dir=/srv/impact/models
     # Model folder entries with hostile names, and a link.
@@ -741,6 +782,7 @@ test_hostile_names_and_links_are_reported_and_not_followed() {
     mv "/home/$DAVE/ssh-saved" "/home/$DAVE/.ssh"
 }
 
+# Changed ssh rules are reported.
 test_changed_ssh_rules_are_reported() {
     cp -p -- "$RULES" "$TEST_SUITE_TMP/rules-saved"
     # A comment changes the content but not the effect.
@@ -774,6 +816,112 @@ test_changed_ssh_rules_are_reported() {
     assert_block_contains 5 'Further rule files in /etc/ssh/sshd_config.d: 10-impact-test.conf.'
 }
 
+# An account whose enrolment is not finished (impact-add-user stopped after
+# it created the account: record STATE=enrolling). Block 7 names it in one
+# warning, with the two ways on that work: the same impact-add-user command
+# again, or impact-remove-user. The advice for a finished member does not
+# appear for it: impact-key refuses such an account (block 7), and the
+# command that continues creates the repository folder (block 9) and adds
+# the group docker (block 6).
+test_unfinished_enrolment_is_one_warning_with_the_way_on() {
+    local first_output first_status second_output
+    # pat stopped after the groups step, quin between the two groups. Both
+    # have no .ssh folder and no repository folder.
+    sys_account_add pat impact docker
+    sys_account_add quin impact
+    load_library
+    impact_account_record_write pat pat-example enrolling || fail "record of pat"
+    impact_account_record_write quin quin-example enrolling || fail "record of quin"
+    run_check_unchanged
+    first_output="$RUN_OUTPUT"
+    first_status="$RUN_STATUS"
+    # A key installed before the stop: the warning says the account can
+    # log in.
+    sys_keypair pat
+    sys_install_key pat pat
+    run_check_unchanged
+    second_output="$RUN_OUTPUT"
+    # The next tests start without these two accounts, whatever the
+    # results.
+    sys_account_del pat
+    sys_account_del quin
+    rm -f -- /opt/impact/admin/accounts/pat.conf /opt/impact/admin/accounts/quin.conf
+    RUN_OUTPUT="$first_output"
+    RUN_STATUS="$first_status"
+    assert_complete_report
+    assert_block 7 WARN
+    assert_block_contains 7 'Account pat: user number'
+    assert_block_contains 7 'enrolment not finished (impact-add-user stopped early), GitHub name pat-example.'
+    assert_block_contains 7 'WARNING: The enrolment of pat is not finished (impact-add-user stopped early). The account is a member of docker (root rights on this machine) and has no confirmed SSH restriction. It has no login key, so it cannot log in yet.'
+    assert_block_contains 7 "WARNING: The enrolment of quin is not finished (impact-add-user stopped early). The account is a member of 'impact' and has no confirmed SSH restriction."
+    assert_block_contains 7 'Run the same impact-add-user command again (it checks every part and does the missing steps), or close the account: sudo impact-remove-user pat'
+    assert_block_not_contains 7 'sudo impact-key add pat'
+    assert_block_not_contains 7 'sudo impact-key add quin'
+    assert_block_not_contains 7 'pat has no folder /home/pat/.ssh'
+    assert_block_contains 9 'pat: the enrolment is not finished (see block 7); impact-add-user creates the repository folder when it continues.'
+    assert_block_not_contains 9 'sudo -u pat mkdir'
+    assert_block_not_contains 9 'sudo -u quin mkdir'
+    assert_block_not_contains 6 'no members of docker and cannot start containers: quin'
+    RUN_OUTPUT="$second_output"
+    assert_block_contains 7 'WARNING: The enrolment of pat is not finished (impact-add-user stopped early). The account is a member of docker (root rights on this machine) and has no confirmed SSH restriction. It has login keys, so it can log in.'
+}
+
+# A storage root that members cannot enter: block 10 warns with the exact
+# command, for the root itself (enter and list) and for a folder above it
+# (enter). The rule of the kernel applies: when the folder belongs to the
+# shared group, the rights of the group decide, also when all others may
+# enter.
+test_storage_root_that_members_cannot_enter_is_a_warning() {
+    local root_facts parent_mode parent="${SYS_ROOT_A%/*}"
+    root_facts="$(stat -c '%U:%G %a' -- "$SYS_ROOT_A")"
+    parent_mode="$(stat -c '%a' -- "$parent")"
+    # The group owns the root, with no rights for the group.
+    chgrp impact -- "$SYS_ROOT_A"
+    chmod 2705 -- "$SYS_ROOT_A"
+    run_check_unchanged
+    assert_complete_report
+    assert_block 10 WARN
+    assert_block_contains 10 "Members of 'impact' cannot enter $SYS_ROOT_A (see: ls -ld $SYS_ROOT_A), so they cannot reach the model folders in $SYS_ROOT_A."
+    assert_block_contains 10 "If they should: sudo chmod g+rx $SYS_ROOT_A"
+    # The old shared account's group owns the root (a disk that was in use
+    # before), mode 750.
+    chgrp root -- "$SYS_ROOT_A"
+    chmod 2750 -- "$SYS_ROOT_A"
+    run_check_unchanged
+    assert_block 10 WARN
+    assert_block_contains 10 "If they should: sudo chgrp impact $SYS_ROOT_A && sudo chmod g+rx $SYS_ROOT_A"
+    # A folder above the root that only root may enter.
+    chown "${root_facts%% *}" -- "$SYS_ROOT_A"
+    chmod "${root_facts##* }" -- "$SYS_ROOT_A"
+    chmod 700 -- "$parent"
+    run_check_unchanged
+    chmod "$parent_mode" -- "$parent"
+    assert_block 10 WARN
+    assert_block_contains 10 "Members of 'impact' cannot enter $parent (see: ls -ld $parent)"
+    assert_block_contains 10 "If they should: sudo chmod o+x $parent"
+    # Back to the state of the fixture: no such warning.
+    run_check_unchanged
+    assert_block_not_contains 10 'cannot enter'
+}
+
+# Too little free space: the hint for each disk names only what lies on
+# that disk. Images and home folders are on the system disk here; the
+# storage disk holds model folders, where impact-clean-images frees nothing.
+test_free_space_hint_names_what_lies_on_each_disk() {
+    local line
+    cp -p -- "$CONF" "$TEST_SUITE_TMP/conf-saved"
+    sed -i -e 's/^MIN_FREE_GB=.*/MIN_FREE_GB=100000/' "$CONF"
+    run_check_unchanged
+    cp -p -- "$TEST_SUITE_TMP/conf-saved" "$CONF"
+    assert_block 3 WARN
+    assert_block_contains 3 "Free space on the disk mounted at /mnt/disk_a: old outputs and synthetic populations in the model folders of $SYS_ROOT_A."
+    line="$(block_of 3 | grep -F 'Free space on the disk mounted at /mnt/disk_a:')"
+    assert_not_contains "$line" 'impact-clean-images' "the hint for the storage disk"
+    assert_not_contains "$line" 'home folders' "the hint for the storage disk"
+    assert_block_contains 3 'files in home folders'
+}
+
+# Invalid and unsafe settings files.
 test_invalid_and_unsafe_settings_files() {
     cp -p -- "$CONF" "$TEST_SUITE_TMP/conf-saved"
     # One invalid value: the block names it; the other values are used.
@@ -801,6 +949,7 @@ test_invalid_and_unsafe_settings_files() {
     cp -p -- "$TEST_SUITE_TMP/conf-saved" "$CONF"
 }
 
+# Broken installation and groups.
 test_broken_installation_and_groups() {
     # The administrator in the shared group: the SSH rules would restrict
     # its own login.

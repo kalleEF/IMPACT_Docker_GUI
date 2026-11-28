@@ -44,6 +44,7 @@ mask() {
     printf '%s\n' "$1" | impact_mask_text
 }
 
+# Ipv4 addresses are replaced.
 test_ipv4_addresses_are_replaced() {
     assert_eq 'from <address> to <address>' "$(mask 'from 192.0.2.5 to 10.0.0.17')"
     assert_eq '<address>:8787' "$(mask '192.0.2.5:8787')"
@@ -58,6 +59,7 @@ test_ipv4_addresses_are_replaced() {
     assert_eq '<address>' "$(mask '255.255.255.0')"
 }
 
+# Loopback and all addresses are kept.
 test_loopback_and_all_addresses_are_kept() {
     assert_eq '127.0.0.1:8787->8787/tcp' "$(mask '127.0.0.1:8787->8787/tcp')"
     assert_eq '0.0.0.0:8788->8787/tcp' "$(mask '0.0.0.0:8788->8787/tcp')"
@@ -67,6 +69,7 @@ test_loopback_and_all_addresses_are_kept() {
     assert_eq '0.0.0.0:22 <address>:22' "$(mask '0.0.0.0:22 192.0.2.9:22')"
 }
 
+# Ipv6 addresses are replaced.
 test_ipv6_addresses_are_replaced() {
     assert_eq 'addr <address> end' "$(mask 'addr 2001:db8::1 end')"
     assert_eq '<address>%eth0' "$(mask 'fe80::a00:27ff:fe4e:66a1%eth0')"
@@ -76,11 +79,13 @@ test_ipv6_addresses_are_replaced() {
     assert_eq 'from <address>.' "$(mask 'from 2001:db8::7.')"
 }
 
+# Hardware addresses are replaced.
 test_hardware_addresses_are_replaced() {
     assert_eq 'link/ether <hardware address> brd <hardware address>' \
         "$(mask 'link/ether 02:42:ac:11:00:02 brd ff:ff:ff:ff:ff:ff')"
 }
 
+# Ordinary text is left alone.
 test_ordinary_text_is_left_alone() {
     local text
     for text in \
@@ -100,6 +105,7 @@ test_ordinary_text_is_left_alone() {
     done
 }
 
+# Own host name is replaced.
 test_own_host_name_is_replaced() {
     local name
     name="$(hostname 2>/dev/null || true)"
@@ -115,6 +121,7 @@ test_own_host_name_is_replaced() {
     assert_eq "x${name}y" "$(mask "x${name}y")"
 }
 
+# Extra names are replaced.
 test_extra_names_are_replaced() {
     IMPACT_MASK_NAMES=(fileserver.example.org pc-042)
     assert_eq 'copy to <host>:/data' "$(mask 'copy to fileserver.example.org:/data')"
@@ -128,6 +135,7 @@ test_extra_names_are_replaced() {
     assert_eq 'bad name s/x/y/ x' "$(mask 'bad name s/x/y/ x')"
 }
 
+# Many lines and empty input.
 test_many_lines_and_empty_input() {
     local output
     output="$(printf 'one 192.0.2.1\n\ntwo 192.0.2.2\n' | impact_mask_text)"

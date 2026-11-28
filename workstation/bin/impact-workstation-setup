@@ -78,6 +78,9 @@
 #     sudo impact-workstation-setup --port-max 8830
 #   It writes the SSH rules for these values again. Removing the rules in
 #   this case would leave the members without any SSH restriction.
+#   When there were no SSH rules before the run (they were removed with
+#   --remove-ssh-rules), the line that removes them again comes after that
+#   command, because that command writes them.
 #   When a run is stopped by force (for example "kill -9") during the SSH
 #   step, the note /opt/impact/admin/ssh-rules-pending stays. The next run
 #   puts the previous rules file back first and repeats the change with all
@@ -121,6 +124,9 @@
 #   "${!LIST[@]}"        the positions (or the names) of the entries of a list
 #   shopt -s nullglob    a file pattern (*.conf) without a match gives an empty
 #                        list; "shopt -u" switches this off again
+#   < <(command)  <(command)   hand the output of a command to a loop, to
+#                        mapfile or to another program as if it were a file
+#                        ("process substitution")
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -130,7 +136,9 @@
 set -euo pipefail
 
 # Find this file's real place (the name in /usr/local/bin is a link) and load
-# the shared functions that lie next to it in ../lib.
+# the shared functions that lie next to it in ../lib. "${BASH_SOURCE[0]}" is
+# the path of this file as it was started; "readlink -f" resolves every
+# symbolic link in it.
 IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 # The two comment lines below tell the checking tool "shellcheck" where the
 # loaded file is.
@@ -612,20 +620,15 @@ settings_undo_command() {
     printf '%s\n' "$command"
 }
 
-# member_can_enter FOLDER
-#   Result: success when a member of the shared group can enter and list
-#   FOLDER: through the group rights when the folder belongs to the group,
-#   or through the rights of all others.
-member_can_enter() {
-    local facts mode group_name
-    facts="$(stat -c '%a %G' -- "$1" 2>/dev/null)" || return 1
-    mode="${facts%% *}"
-    group_name="${facts##* }"
-    # 8#005 is "read and enter for others", 8#050 the same for the group.
-    if (((8#$mode & 8#005) == 8#005)); then
-        return 0
-    fi
-    [[ "$group_name" == "$GROUP" ]] && (((8#$mode & 8#050) == 8#050))
+# member_blocks ROOT
+#   Prints the folders from / down to ROOT that members of the shared group
+#   cannot pass, each with the command that lets them pass (see
+#   impact_member_blocked_folders; the same check as in impact-check and
+#   impact-share-folder). Prints nothing while the group does not exist.
+member_blocks() {
+    local gid
+    gid="$(impact_group_gid "$GROUP" 2>/dev/null)" || return 0
+    impact_member_blocked_folders "$1" "$gid"
 }
 
 # setup_storage_roots
@@ -638,9 +641,14 @@ setup_storage_roots() {
     impact_split_list "${OLD[SHARED_ROOTS]:-}" known_roots
     for root in "${ROOTS[@]}"; do
         if [[ -d "$root" ]]; then
-            if ((GROUP_EXISTS == 1 || IMPACT_DRY_RUN == 0)) && ! member_can_enter "$root"; then
-                impact_warn "Members of '$GROUP' cannot enter $root (see: ls -ld $root). To allow it: sudo chgrp $GROUP $root && sudo chmod g+rx $root"
-            else
+            local folder fix blocked=0
+            # "IFS=$'\t' read -r A B" splits each line at its tab into A and B.
+            while IFS=$'\t' read -r folder fix; do
+                [[ -n "$folder" ]] || continue
+                blocked=1
+                impact_warn "Members of '$GROUP' cannot enter $folder (see: ls -ld $folder), so they cannot reach the storage root $root. To allow it: $fix"
+            done < <(member_blocks "$root")
+            if ((blocked == 0)); then
                 impact_ok "The storage root $root exists. It is left as it is."
             fi
         else
@@ -713,6 +721,51 @@ restore_settings_if_unconfirmed() {
         fi
     done
     IMPACT_UNDO=("${kept[@]}")
+    # The same for the step that was running when the command stopped, if
+    # it was the writing of the settings file.
+    if [[ "$IMPACT_CURRENT_STEP" == "$SETTINGS_TEXT" ]]; then
+        IMPACT_CURRENT_STEP=''
+    fi
+}
+
+# order_undo_of_new_rules
+#   "How to undo" is printed newest first (impact_undo_newest_first). When
+#   this run wrote the SSH rules where there were none before (an earlier
+#   run removed them with --remove-ssh-rules, or they were deleted by hand)
+#   and also changed settings, the line that puts the previous settings
+#   back writes the SSH rules again. Followed from top to bottom, the line
+#   that removes the rules must therefore come after it, or the rules would
+#   remain. This function moves the removal line in front of the settings
+#   line in the list (which puts it after that line in the printed list),
+#   with a text that says why. It changes nothing in every other case, for
+#   example at the first run (the settings file is removed then, and the
+#   removal of the rules comes first).
+order_undo_of_new_rules() {
+    local index settings_index=-1 remove_index=-1
+    local -a ordered=()
+    if [[ "$SETTINGS_UNDO" != *': sudo impact-workstation-setup '* ]]; then
+        return 0
+    fi
+    # "${!IMPACT_UNDO[@]}" gives the positions of the list: 0, 1, 2, ...
+    for index in "${!IMPACT_UNDO[@]}"; do
+        if [[ "${IMPACT_UNDO[index]}" == "$SETTINGS_UNDO" ]]; then
+            settings_index="$index"
+        elif [[ "${IMPACT_UNDO[index]}" == "$IMPACT_SSH_REMOVE_UNDO" ]]; then
+            remove_index="$index"
+        fi
+    done
+    if ((settings_index < 0 || remove_index < settings_index)); then
+        return 0
+    fi
+    for index in "${!IMPACT_UNDO[@]}"; do
+        if ((index == settings_index)); then
+            ordered+=("Then remove the SSH rules again (there were none before this run): sudo impact-workstation-setup --remove-ssh-rules")
+        fi
+        if ((index != remove_index)); then
+            ordered+=("${IMPACT_UNDO[index]}")
+        fi
+    done
+    IMPACT_UNDO=("${ordered[@]}")
 }
 
 # install_known_hosts
@@ -836,6 +889,7 @@ impact_ssh_rules_content "$GROUP" "${NEW[PORT_MIN]}" "${NEW[PORT_MAX]}" >"$RULES
 impact_ssh_rules_install "$RULES_FILE" "$GROUP" "${NEW[PORT_MIN]}" "${NEW[PORT_MAX]}"
 # The SSH step succeeded: the new settings file is confirmed.
 SETTINGS_PENDING=0
+order_undo_of_new_rules
 
 impact_summary
 if ((IMPACT_DRY_RUN == 0)); then

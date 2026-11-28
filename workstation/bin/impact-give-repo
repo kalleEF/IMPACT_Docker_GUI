@@ -14,6 +14,9 @@
 #       use the key. The output says which way was used.
 #   The GitHub name comes from the account record that impact-add-user
 #   wrote, or from --github-name.
+#   The messages of impact-get-repo appear inside a frame (lines marked
+#   "|"). After Ctrl+C the frame still shows what impact-get-repo reports
+#   about its own stop, and then this command reports its own.
 #
 # Who runs it
 #   The administrator, with sudo.
@@ -79,6 +82,7 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   2>&1                 send the error channel to the same place as the output
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -88,7 +92,9 @@
 set -euo pipefail
 
 # Find this file's real place (the name in /usr/local/bin is a link) and load
-# the shared functions that lie next to it in ../lib.
+# the shared functions that lie next to it in ../lib. "${BASH_SOURCE[0]}" is
+# the path of this file as it was started; "readlink -f" resolves every
+# symbolic link in it.
 IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/impact-common.sh
@@ -229,22 +235,49 @@ if ! impact_repo_base_is_ready "$ACCOUNT"; then
     impact_undo "Remove the repository folder while it is empty: sudo rmdir $REPO_BASE_DIR"
 fi
 
+# frame_lines
+#   Marks every line of its input with "    | " (the frame around the
+#   messages of impact-get-repo). The marking survives Ctrl+C, a closed
+#   terminal and a request to end: the terminal sends Ctrl+C to every
+#   program of the command, and a marking program that ended at once would
+#   swallow what impact-get-repo prints after it (its message "was
+#   interrupted", what it had done, its result line). "trap '' INT TERM
+#   HUP" makes this copy of the script ignore the three signals, and the
+#   programs it starts (sed, cat) inherit that. sed ends when
+#   impact-get-repo has ended and the pipe is closed. When the output can
+#   no longer be written (the terminal is gone), sed stops early; "cat"
+#   then reads the rest and throws it away, so impact-get-repo is never
+#   stopped by a broken pipe in the middle of its own clean-up.
+frame_lines() {
+    (
+        trap '' INT TERM HUP
+        sed -e 's/^/    | /'
+        cat >/dev/null
+    )
+}
+
 # run_get_repo
 #   Runs impact-get-repo as the person. Its messages (both channels) are
 #   shown inside a frame, each line marked with "|", so they cannot be
-#   mixed up with the steps of this command.
+#   mixed up with the steps of this command. A signal that arrives while
+#   impact-get-repo runs (Ctrl+C reaches impact-get-repo as well) takes
+#   effect after the frame is closed (impact_signals_hold): the reader sees
+#   every message of impact-get-repo, the closing line of the frame, and
+#   then the report of this command.
 #   Result: the exit code of impact-get-repo.
 run_get_repo() {
     local status=0
     printf '    --- messages of impact-get-repo, run as %s ---\n' "$ACCOUNT"
+    impact_signals_hold
     # "PIPESTATUS[0]" is the exit code of the first command of the pipe
-    # (impact-get-repo); sed only marks the lines.
-    if impact_run_as "$ACCOUNT" "$GET_REPO" "${GET_REPO_OPTIONS[@]}" -- "$MODEL" 2>&1 | sed -e 's/^/    | /'; then
+    # (impact-get-repo); frame_lines only marks the lines.
+    if impact_run_as "$ACCOUNT" "$GET_REPO" "${GET_REPO_OPTIONS[@]}" -- "$MODEL" 2>&1 | frame_lines; then
         status=0
     else
         status="${PIPESTATUS[0]}"
     fi
     printf '    --- end of the messages of impact-get-repo ---\n'
+    impact_signals_release
     return "$status"
 }
 

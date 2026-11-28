@@ -60,6 +60,9 @@
 #   $'\t'  $'\r'  $'\n'   a text with a special character: tab, carriage return,
 #                        new line (\xNN is the byte NN)
 #   2>&1                 send the error channel to the same place as the output
+#   printf -v NAME FORMAT TEXT   write the formatted text into the variable
+#                        NAME (nothing is printed)
+#   "${NAME:0:10}"       a part of the text: from position 0, 10 characters
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -178,11 +181,18 @@ impact_expand_repo_base_template() {
 # impact_valid_repo_base TEXT
 #   The REPO_BASE setting: letters, digits, ".", "_", "/", "-" and the two
 #   tokens "%h" (home folder) and "%u" (account name). After replacing the
-#   tokens the result must be an absolute path.
+#   tokens the result must be an absolute path. "%h" may appear once, at the
+#   start, followed by "/" or by the end of the text: the home folder is a
+#   whole path, and "%h%u" or "%hx" would name a folder beside the home
+#   folders (/home/alicealice).
 #   Example: impact_valid_repo_base %h/Repositories   succeeds
 impact_valid_repo_base() {
     local text="$1" rest expanded
     [[ "$text" =~ ^[A-Za-z0-9._/%-]+$ ]] || return 1
+    if [[ "$text" == *%h* ]]; then
+        [[ "$text" == '%h' || "$text" == %h/* ]] || return 1
+        [[ "${text:2}" != *%h* ]] || return 1
+    fi
     # Remove the two known tokens; any "%" that is left belongs to an
     # unknown token.
     rest="${text//[%]h/}"
@@ -230,25 +240,45 @@ impact_valid_user_number() {
 }
 
 # impact_valid_gui_version TEXT
-#   Three numbers with dots, for example 2.1.0.
+#   Three numbers with dots, for example 2.1.0. Each number has one to five
+#   digits and no leading zero (0 itself is allowed), as every other number
+#   in the settings file: so "2.01.0" and the same version "2.1.0" can never
+#   both appear, and every number fits the version comparison.
 impact_valid_gui_version() {
-    [[ "$1" =~ ^[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}$ ]]
+    local part='(0|[1-9][0-9]{0,4})'
+    [[ "$1" =~ ^$part\.$part\.$part$ ]]
 }
 
 # impact_valid_container_pattern TEXT
 #   One name pattern for containers: letters, digits, "_", ".", "-" and the
-#   wildcards "*" (any text) and "?" (one character).
+#   wildcards "*" (any text) and "?" (one character). A pattern made of
+#   wildcards only (for example "*") is refused: it would accept every
+#   container, and the check for containers that publish ports to the
+#   network would then never warn.
 impact_valid_container_pattern() {
-    [[ "$1" =~ ^[A-Za-z0-9_.*?-]{1,128}$ ]]
+    [[ "$1" =~ ^[A-Za-z0-9_.*?-]{1,128}$ ]] || return 1
+    [[ "$1" =~ [A-Za-z0-9_.-] ]]
 }
 
 # impact_valid_contact TEXT
-#   A contact text for messages: 1 to 80 characters, valid UTF-8 (so names
-#   with accents work), no control characters such as tabs or line breaks.
+#   A contact text for messages. The exact rule (the GUI applies the same):
+#     - valid UTF-8 (so names with accents work), 1 to 80 characters,
+#       counted as Unicode code points (an emoji is one character);
+#     - no control character (U+0000 to U+001F, U+007F to U+009F: tabs,
+#       line breaks and the like), no line or paragraph separator (U+2028,
+#       U+2029), no noncharacter U+FFFE or U+FFFF, and no invisible format
+#       character (Unicode category Cf, for example the zero-width space
+#       U+200B or the direction marks U+202A to U+202E, which can reverse
+#       the text that follows them on a screen);
+#     - at least one character that is no space, and no space at the start
+#       or the end. "Space" means every Unicode space character (U+0020,
+#       U+00A0, U+1680, U+2000 to U+200A, U+202F, U+205F, U+3000).
 #   Example: impact_valid_contact "Alice Example (alice@example.org)"
 impact_valid_contact() {
-    local text="$1"
+    local text="$1" index char code
     [[ -n "$text" ]] || return 1
+    # In the C locale of the commands, [[:cntrl:]] is the bytes 0 to 31
+    # and 127.
     if [[ "$text" =~ [[:cntrl:]] ]]; then
         return 1
     fi
@@ -258,10 +288,104 @@ impact_valid_contact() {
     # Count characters, not bytes: for this function only, switch bash to a
     # UTF-8 locale. "local" limits the change to this function.
     local LC_ALL=C.UTF-8
-    if [[ "$text" =~ [[:cntrl:]] ]]; then
-        return 1
-    fi
-    ((${#text} <= 80))
+    ((${#text} <= 80)) || return 1
+    # Look at each character. "${text:index:1}" is the character at the
+    # position index; printf '%d' "'X" prints the number of the character X
+    # (its Unicode code point in this locale) into the variable code.
+    for ((index = 0; index < ${#text}; index++)); do
+        char="${text:index:1}"
+        printf -v code '%d' "'$char"
+        if impact__char_is_refused "$code"; then
+            return 1
+        fi
+    done
+    # The first and the last character must be no space. "${text: -1}" is
+    # the last character (the blank before -1 is needed).
+    printf -v code '%d' "'${text:0:1}"
+    impact__char_is_space "$code" && return 1
+    printf -v code '%d' "'${text: -1}"
+    impact__char_is_space "$code" && return 1
+    return 0
+}
+
+# impact__char_is_refused CODE_POINT
+#   Internal: success for a code point that a contact text must not hold:
+#   control characters, line and paragraph separators, the noncharacters
+#   U+FFFE and U+FFFF, and every format character (Unicode 15, category Cf).
+impact__char_is_refused() {
+    local c="$1"
+    # "((...))" with "||" between the tests: true when one test is true.
+    # 0x... are numbers written in hexadecimal, as Unicode lists them.
+    ((c <= 0x1F || (c >= 0x7F && c <= 0x9F) || c == 0x2028 || c == 0x2029 ||
+        c == 0xFFFE || c == 0xFFFF || c == 0xAD || (c >= 0x600 && c <= 0x605) ||
+        c == 0x61C || c == 0x6DD || c == 0x70F || c == 0x890 || c == 0x891 ||
+        c == 0x8E2 || c == 0x180E || (c >= 0x200B && c <= 0x200F) ||
+        (c >= 0x202A && c <= 0x202E) || (c >= 0x2060 && c <= 0x2064) ||
+        (c >= 0x2066 && c <= 0x206F) || c == 0xFEFF || (c >= 0xFFF9 && c <= 0xFFFB) ||
+        c == 0x110BD || c == 0x110CD || (c >= 0x13430 && c <= 0x1343F) ||
+        (c >= 0x1BCA0 && c <= 0x1BCA3) || (c >= 0x1D173 && c <= 0x1D17A) ||
+        c == 0xE0001 || (c >= 0xE0020 && c <= 0xE007F)))
+}
+
+# impact__char_is_space CODE_POINT
+#   Internal: success for a Unicode space character (category Zs).
+impact__char_is_space() {
+    local c="$1"
+    ((c == 0x20 || c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
+        c == 0x202F || c == 0x205F || c == 0x3000))
+}
+
+# impact_valid_shared_roots TEXT
+#   The SHARED_ROOTS setting, as a rule of the file format (the GUI applies
+#   the same): one or more absolute paths (impact_valid_abs_path) separated
+#   by commas, without spaces; no path twice; no path inside another one of
+#   the list; no path that is a system folder or lies inside one (/bin,
+#   /boot, /dev, /etc, /lib, /lib32, /lib64, /libx32, /proc, /root, /run,
+#   /sbin, /snap, /sys, /tmp, /usr, /var, /opt/impact), no path that is
+#   /home or lies inside it, and none of the top folders /, /media, /mnt,
+#   /opt, /srv, /lost+found itself. These are text rules: symbolic links are
+#   not followed here. impact-workstation-setup also checks the real
+#   folders (links resolved, home folders outside /home, the file system).
+#   Result: success or failure; the reason in IMPACT_CHECK_REASON.
+#   Example: impact_valid_shared_roots /mnt/disk_a/shared,/mnt/disk_b/shared
+impact_valid_shared_roots() {
+    local value="$1" entry other folder count
+    local -a entries=()
+    IMPACT_CHECK_REASON="expected one or more absolute paths separated by commas, without spaces, each made of letters, digits and . _ / - only"
+    impact_split_list "$value" entries
+    ((${#entries[@]} >= 1)) || return 1
+    for entry in "${entries[@]}"; do
+        impact_valid_abs_path "$entry" || return 1
+    done
+    for entry in "${entries[@]}"; do
+        count=0
+        for other in "${entries[@]}"; do
+            if [[ "$entry" == "$other" ]]; then
+                count=$((count + 1))
+            elif impact_path_is_below "$entry" "$other"; then
+                IMPACT_CHECK_REASON="the storage root $entry lies inside the storage root $other; give separate folders"
+                return 1
+            fi
+        done
+        if ((count > 1)); then
+            IMPACT_CHECK_REASON="the storage root $entry is listed twice"
+            return 1
+        fi
+        for folder in /media /mnt /opt /srv /lost+found; do
+            if [[ "$entry" == "$folder" ]]; then
+                IMPACT_CHECK_REASON="the storage root $entry is a top folder of the system; give a folder on a storage disk, for example /mnt/disk_a/shared"
+                return 1
+            fi
+        done
+        for folder in /bin /boot /dev /etc /home /lib /lib32 /lib64 /libx32 /proc /root /run /sbin /snap /sys /tmp /usr /var /opt/impact; do
+            if [[ "$entry" == "$folder" ]] || impact_path_is_below "$entry" "$folder"; then
+                IMPACT_CHECK_REASON="the storage root $entry is the system or home folder $folder or lies inside it; give a folder on a storage disk, for example /mnt/disk_a/shared"
+                return 1
+            fi
+        done
+    done
+    IMPACT_CHECK_REASON=''
+    return 0
 }
 
 # impact_valid_fingerprint TEXT
@@ -324,13 +448,40 @@ impact_parse_github_address() {
 # Reader for KEY=value files
 # =============================================================================
 
+# impact_kv_trim TEXT
+#   Prints TEXT without blanks at both ends. In the KEY=value format a
+#   "blank" is a space or a tab, nothing else: a form feed, a carriage
+#   return or a non-breaking space is a character like any other there, so
+#   every reader of the format (these commands and the GUI) finds exactly
+#   the same keys and values. In the C locale, [[:blank:]] is exactly space
+#   and tab; "local LC_ALL=C" makes sure of that inside this function.
+impact_kv_trim() {
+    local LC_ALL=C text="$1"
+    text="${text#"${text%%[![:blank:]]*}"}"
+    text="${text%"${text##*[![:blank:]]}"}"
+    printf '%s' "$text"
+}
+
 # impact_kv_parse FILE VALUES_NAME ORDER_NAME ERRORS_NAME
-#   Reads a file of KEY=value lines as text. Rules:
-#     empty lines and lines whose first visible character is "#" are skipped;
-#     every other line is KEY=value; KEY is upper-case letters, digits and
-#     "_" and starts with a letter; blanks around key and value are removed;
-#     the value is everything after the first "="; no quotes, no escapes, no
-#     variables, no comment at the end of a line.
+#   Reads a file of KEY=value lines as text. The exact rules (the GUI reads
+#   the settings file by the same rules; the shared test cases are in
+#   tests/workstation/vectors/):
+#     - The file is UTF-8 text; a byte order mark (EF BB BF) at its very
+#       start is allowed and skipped. A file with a zero byte (NUL) or with
+#       bytes that are no valid UTF-8 is refused as a whole.
+#     - A line ends with LF or with CR LF. A carriage return (CR) anywhere
+#       else, also in a comment, is an error: some readers would start a
+#       new line there.
+#     - Blanks are spaces and tabs only (impact_kv_trim).
+#     - Lines that are empty or hold only blanks, and lines whose first
+#       character after blanks is "#", are skipped.
+#     - Every other line is KEY=value. KEY matches ^[A-Z][A-Z0-9_]*$;
+#       blanks around key and value are removed; the value is everything
+#       after the first "="; no quotes, no escapes, no variables, no comment
+#       at the end of a line.
+#     - A key that appears twice is an error, also an unknown key.
+#   The rules for the values of each key are in impact_conf_check_value and
+#   impact_model_check_value.
 #   Parameters: the file, and the NAMES of three variables of the caller:
 #     an associative array for the values, an array for the keys in file
 #     order, and an array for error texts (a line that breaks the rules, a
@@ -352,7 +503,21 @@ impact_kv_parse() {
         impact__kv_errors+=("The file $file does not exist or cannot be read.")
         return 1
     fi
-    local line key value number=0
+    local line key value number=0 nul_count
+    # "read" cannot see a zero byte (it drops it without a word), so the
+    # file is checked for one first: "tr -dc '\000'" deletes every byte
+    # except the zero byte, and wc -c counts what is left.
+    nul_count="$(tr -dc '\000' <"$file" | wc -c)" || nul_count='?'
+    if [[ "$nul_count" != '0' ]]; then
+        impact__kv_errors+=("The file $file contains a zero byte (NUL) or could not be read. The format allows plain text only: save the file again as UTF-8 text.")
+        return 1
+    fi
+    # iconv converts between character sets; converting UTF-8 to UTF-8
+    # fails exactly when the file is no valid UTF-8.
+    if ! iconv -f UTF-8 -t UTF-8 <"$file" >/dev/null 2>&1; then
+        impact__kv_errors+=("The file $file is no valid UTF-8 text. Save it again with the encoding UTF-8.")
+        return 1
+    fi
     # "read -r" keeps backslashes as they are. "|| [[ -n $line ]]" also
     # handles a last line without a line end.
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -362,7 +527,14 @@ impact_kv_parse() {
         if ((number == 1)); then
             line="${line#$'\xef\xbb\xbf'}"
         fi
-        line="$(impact_trim "$line")"
+        # "read" ends a line at LF. A CR right before the LF belongs to the
+        # line end (Windows writes CR LF); any other CR is an error.
+        line="${line%$'\r'}"
+        if [[ "$line" == *$'\r'* ]]; then
+            impact__kv_errors+=("Line $number contains a carriage return (CR) inside the line. A line must end with LF or with CR LF: save the file again with one of these line ends.")
+            continue
+        fi
+        line="$(impact_kv_trim "$line")"
         if [[ -z "$line" || "$line" == '#'* ]]; then
             continue
         fi
@@ -370,8 +542,8 @@ impact_kv_parse() {
             impact__kv_errors+=("Line $number is neither a comment nor KEY=value: '$(impact_display "$line")'")
             continue
         fi
-        key="$(impact_trim "${line%%=*}")"     # before the first "="
-        value="$(impact_trim "${line#*=}")"    # after the first "="
+        key="$(impact_kv_trim "${line%%=*}")"     # before the first "="
+        value="$(impact_kv_trim "${line#*=}")"    # after the first "="
         if ! [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
             impact__kv_errors+=("Line $number: '$(impact_display "$key")' is no valid key (upper-case letters, digits and _).")
             continue
@@ -409,13 +581,15 @@ impact__kv_render() {
             if ((number == 1)); then
                 line="${line#$'\xef\xbb\xbf'}"
             fi
-            trimmed="$(impact_trim "$line")"
+            # The same reading as impact_kv_parse: without the CR of a CR LF
+            # line end, blanks are spaces and tabs.
+            trimmed="$(impact_kv_trim "${line%$'\r'}")"
             if [[ -z "$trimmed" || "$trimmed" == '#'* || "$trimmed" != *=* ]]; then
                 printf '%s\n' "$line"
                 continue
             fi
-            key="$(impact_trim "${trimmed%%=*}")"
-            value="$(impact_trim "${trimmed#*=}")"
+            key="$(impact_kv_trim "${trimmed%%=*}")"
+            value="$(impact_kv_trim "${trimmed#*=}")"
             if ! impact_in_list "$key" "${impact__render_keys[@]}" || [[ ! -v impact__render_values[$key] ]]; then
                 printf '%s\n' "$line"
                 continue
@@ -524,7 +698,7 @@ impact_conf_check_value() {
             ;;
         MIN_GUI_VERSION)
             impact_valid_gui_version "$value" && return 0
-            IMPACT_CHECK_REASON="expected three numbers with dots, for example 2.1.0"
+            IMPACT_CHECK_REASON="expected three numbers with dots, for example 2.1.0, each with one to five digits and without a leading zero"
             ;;
         ACCESS_MODE)
             [[ "$value" == 'tunnel' || "$value" == 'direct' ]] && return 0
@@ -532,7 +706,7 @@ impact_conf_check_value() {
             ;;
         REPO_BASE)
             impact_valid_repo_base "$value" && return 0
-            IMPACT_CHECK_REASON="expected a path that is absolute after replacing %h (home folder) and %u (account name), made of letters, digits and . _ / - only, for example %h/Repositories"
+            IMPACT_CHECK_REASON="expected a path that is absolute after replacing %h (home folder) and %u (account name), made of letters, digits and . _ / - only, with %h at most once and only at the start, followed by / or the end, for example %h/Repositories"
             ;;
         MODEL_DIR)
             impact_valid_abs_path "$value" && return 0
@@ -543,14 +717,7 @@ impact_conf_check_value() {
             IMPACT_CHECK_REASON="expected a group name: a lower-case letter, then up to 31 lower-case letters, digits, - or _"
             ;;
         SHARED_ROOTS)
-            IMPACT_CHECK_REASON="expected one or more absolute paths separated by commas, without spaces, each made of letters, digits and . _ / - only"
-            impact_split_list "$value" entries
-            ((${#entries[@]} >= 1)) || return 1
-            for entry in "${entries[@]}"; do
-                impact_valid_abs_path "$entry" || return 1
-            done
-            IMPACT_CHECK_REASON=''
-            return 0
+            impact_valid_shared_roots "$value" && return 0
             ;;
         MIN_FREE_GB)
             impact_valid_whole_number "$value" 0 100000 && return 0
@@ -562,7 +729,7 @@ impact_conf_check_value() {
             ;;
         KNOWN_DIRECT_CONTAINERS)
             [[ -z "$value" ]] && return 0
-            IMPACT_CHECK_REASON="expected nothing, or container name patterns separated by commas, made of letters, digits and _ . - * ? only"
+            IMPACT_CHECK_REASON="expected nothing, or container name patterns separated by commas, made of letters, digits and _ . - * ? only, each with at least one letter, digit or _ . - (a pattern of wildcards only would accept every container)"
             impact_split_list "$value" entries
             for entry in "${entries[@]}"; do
                 impact_valid_container_pattern "$entry" || return 1
@@ -572,12 +739,12 @@ impact_conf_check_value() {
             ;;
         ADMIN_CONTACT)
             impact_valid_contact "$value" && return 0
-            IMPACT_CHECK_REASON="expected a text of 1 to 80 characters without control characters"
+            IMPACT_CHECK_REASON="expected a text of 1 to 80 characters with at least one visible character, without control characters, without invisible format characters (zero-width or direction marks) and without a space at the start or the end"
             ;;
         DEPUTY_CONTACT)
             [[ -z "$value" ]] && return 0
             impact_valid_contact "$value" && return 0
-            IMPACT_CHECK_REASON="expected nothing, or a text of at most 80 characters without control characters"
+            IMPACT_CHECK_REASON="expected nothing, or a text of at most 80 characters with at least one visible character, without control characters, without invisible format characters (zero-width or direction marks) and without a space at the start or the end"
             ;;
         *)
             IMPACT_CHECK_REASON="unknown key"
@@ -608,6 +775,21 @@ impact_conf_validate() {
             IMPACT_CONF_ERRORS+=("$key has the value '$(impact_display "${impact__validate_values[$key]}")': $IMPACT_CHECK_REASON.")
         fi
     done
+    # MODEL_DIR is written by the administrator only, so it never lies on
+    # the shared storage (both values must be valid for this test).
+    local root
+    local -a roots=()
+    if [[ -v impact__validate_values[MODEL_DIR] && -v impact__validate_values[SHARED_ROOTS] ]] &&
+        impact_valid_abs_path "${impact__validate_values[MODEL_DIR]}" &&
+        impact_valid_shared_roots "${impact__validate_values[SHARED_ROOTS]}"; then
+        impact_split_list "${impact__validate_values[SHARED_ROOTS]}" roots
+        for root in "${roots[@]}"; do
+            if [[ "${impact__validate_values[MODEL_DIR]}" == "$root" ]] ||
+                impact_path_is_below "${impact__validate_values[MODEL_DIR]}" "$root"; then
+                IMPACT_CONF_ERRORS+=("MODEL_DIR (${impact__validate_values[MODEL_DIR]}) lies inside the storage root $root; the model folder belongs outside the shared storage.")
+            fi
+        done
+    fi
     # The range check needs two valid numbers.
     if [[ -v impact__validate_values[PORT_MIN] && -v impact__validate_values[PORT_MAX] ]] &&
         impact_valid_port "${impact__validate_values[PORT_MIN]}" &&
@@ -716,6 +898,10 @@ impact__conf_header() {
 # Format: one KEY=value per line. The value is everything after the first
 # "=". Write it without quotes. A comment needs its own line and starts
 # with "#". The file is read as text and is never executed.
+# Exact rules: UTF-8 text (a byte order mark at the start is allowed);
+# each line ends with LF or CR LF, and no other carriage return or zero
+# byte may appear; spaces and tabs around key and value are removed (they
+# are the only blanks); each key may appear only once.
 #
 # Change a value with the setup command, for example:
 #   sudo impact-workstation-setup --min-free-gb 300
@@ -976,7 +1162,7 @@ impact_model_load() {
         return 2
     }
     # A person outside the shared group cannot enter MODEL_DIR at all, so
-    # every model would look missing. Say the real cause instead.
+    # every model would look missing. The message names the real cause.
     if ((EUID != 0)) && ! impact__process_in_group "${IMPACT_CONF[SHARED_GROUP]}"; then
         IMPACT_MODEL_ERRORS=("The account '$(id -un)' is no member of the group '${IMPACT_CONF[SHARED_GROUP]}' in this login, so it cannot read the model files.")
         return 3
@@ -1008,7 +1194,10 @@ impact_require_model() {
     if ((status == 1)); then
         # One clear message: the first problem found is the cause.
         IMPACT_RESULT_REASON='unknown_model'
-        cause="${IMPACT_MODEL_ERRORS[0]:-The model '$(impact_display "$1")' is not available on this workstation.}"
+        cause="${IMPACT_MODEL_ERRORS[0]:-}"
+        if [[ -z "$cause" ]]; then
+            cause="The model '$(impact_display "$1")' is not available on this workstation."
+        fi
         if ((EUID == 0)); then
             # The administrator reads this (impact-give-repo, impact-check-model).
             impact_die "$IMPACT_EXIT_FAILED" "$cause" \

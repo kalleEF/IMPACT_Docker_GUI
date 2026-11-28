@@ -13,7 +13,8 @@
 #   log in with the key, a password login is refused, a tunnel reaches a
 #   port of the range and no other port; the three key sources; adopting an
 #   existing account; protected accounts; symbolic links and foreign owners
-#   in a home folder; the option --uid.
+#   in a home folder; the option --uid; a run stopped by a signal while
+#   useradd runs leaves an account that a second run continues.
 #
 # Who runs it
 #   tests/workstation/run-tests.sh system   (root, disposable system only)
@@ -23,8 +24,9 @@
 #
 # What it changes on the system
 #   The installed commands and their settings, test accounts, an SSH server
-#   process, stand-in programs "curl" in /usr/local/sbin for the GitHub test
-#   (removed again), and the storage roots below /mnt/disk_a and /mnt/disk_b.
+#   process, stand-in programs "curl" and "useradd" in /usr/local/sbin for
+#   the GitHub test and the signal test (removed again), and the storage
+#   roots below /mnt/disk_a and /mnt/disk_b.
 #
 # How to undo
 #   The file removes everything it created (suite_teardown).
@@ -55,6 +57,11 @@ WATCHED=(/etc/impact /opt/impact /srv/impact /home /etc/ssh/sshd_config.d /mnt/d
 # Stand-in curl for the GitHub test (first folder of the commands' PATH).
 FAKE_CURL=/usr/local/sbin/curl
 FAKE_MARKER='# impact-test stand-in for curl'
+# Stand-in useradd for the signal test, and the file that says which signal
+# it sends.
+FAKE_USERADD=/usr/local/sbin/useradd
+FAKE_USERADD_MARKER='# impact-test stand-in for useradd'
+FAKE_USERADD_MODE=/run/impact-test-useradd.mode
 
 suite_setup() {
     sys_clean_slate
@@ -64,18 +71,19 @@ suite_setup() {
     sys_sshd_start
     sys_setup
     local name
-    for name in alice alice2 carol dave erin1 erin2 bob frank gina henry ivan; do
+    for name in alice alice2 carol dave erin1 erin2 bob frank gina henry ivan kate liam; do
         sys_keypair "$name"
     done
     # A key of another type, for the refusal test.
     ssh-keygen -q -t rsa -b 2048 -N '' -C 'rsa@example-pc' -f "$TEST_SUITE_TMP/keys/rsa"
-    for name in "$ACC" bob carol dave erin-example frank gina hacker henry ivan julia-example u1alice; do
+    for name in "$ACC" bob carol dave erin-example frank gina hacker henry ivan julia-example u1alice kate liam; do
         sys_register_account "$name"
     done
 }
 
 suite_teardown() {
     remove_fake_curl
+    remove_fake_useradd
     rm -rf /srv/impact-test-target
     sys_clean_slate
 }
@@ -155,6 +163,54 @@ remove_fake_curl() {
     rm -rf /run/impact-test-github
 }
 
+# install_fake_useradd MODE
+#   Puts a stand-in "useradd" first in the commands' PATH. It runs the real
+#   /usr/sbin/useradd and, when it created an account (not for "useradd
+#   -D"), sends a signal while it still runs, so the
+#   signal arrives while the command waits for useradd: MODE term-command
+#   sends TERM to the command (its parent process), as "kill <number>" from
+#   another window does; int-group sends INT to the whole process group of
+#   the command, as Ctrl+C on a terminal does (the command must run in a
+#   group of its own: setsid).
+install_fake_useradd() {
+    printf '%s\n' "$1" >"$FAKE_USERADD_MODE"
+    cat >"$FAKE_USERADD" <<'END'
+#!/bin/bash
+# impact-test stand-in for useradd
+/usr/sbin/useradd "$@" || exit "$?"
+# "useradd -D" only prints the defaults (the command asks for the home
+# folder base that way); the signal belongs to the creation of an account.
+if [[ "${1:-}" == '-D' ]]; then
+    exit 0
+fi
+case "$(cat /run/impact-test-useradd.mode 2>/dev/null)" in
+    term-command) kill -TERM "$PPID" ;;
+    # "ps -o pgid= -p N" prints the number of the process group of N; "tr"
+    # drops the blanks around it. "kill -s INT -- -G" signals group G.
+    int-group) kill -s INT -- "-$(ps -o pgid= -p "$$" | tr -d ' ')" ;;
+esac
+sleep 0.3
+exit 0
+END
+    chmod 755 "$FAKE_USERADD"
+}
+
+# remove_fake_useradd
+#   Removes the stand-in useradd, when it is there.
+remove_fake_useradd() {
+    if [[ -f "$FAKE_USERADD" ]] && grep -q -F -- "$FAKE_USERADD_MARKER" "$FAKE_USERADD"; then
+        rm -f -- "$FAKE_USERADD"
+    fi
+    rm -f -- "$FAKE_USERADD_MODE"
+}
+
+# teardown
+#   Runs after every test of this file: a stand-in useradd never outlives
+#   the test that installed it, also when that test fails.
+teardown() {
+    remove_fake_useradd
+}
+
 # refused_without_change EXPECTED_CODE COMMAND...
 #   Runs COMMAND, fails unless it ends with EXPECTED_CODE and leaves the
 #   watched folders, the accounts and the groups unchanged.
@@ -181,6 +237,7 @@ refused_with_input_without_change() {
 # Before the first enrolment
 # ----------------------------------------------------------------------------
 
+# Help works for everyone and the command needs root.
 test_help_works_for_everyone_and_the_command_needs_root() {
     run_cmd runuser -u "$SYS_ADMIN" -- "$ADD" --help
     assert_status 0
@@ -191,6 +248,7 @@ test_help_works_for_everyone_and_the_command_needs_root() {
     assert_output_contains 'must run with administrator rights'
 }
 
+# Wrong and hostile input is refused before any change.
 test_wrong_and_hostile_input_is_refused_before_any_change() {
     local key
     key="$(pub alice)"
@@ -224,6 +282,7 @@ test_wrong_and_hostile_input_is_refused_before_any_change() {
     assert_missing /tmp/impact-test-hostile
 }
 
+# Unaccepted key lines are refused before any change.
 test_unaccepted_key_lines_are_refused_before_any_change() {
     local good rsa
     good="$(cat -- "$(pub alice)")"
@@ -260,6 +319,7 @@ test_unaccepted_key_lines_are_refused_before_any_change() {
     assert_output_not_contains 'root:'
 }
 
+# Names that conflict are refused before any change.
 test_names_that_conflict_are_refused_before_any_change() {
     # A GitHub name that is the name of an existing group.
     refused_without_change 4 sys_as_admin "$ADD" docker --key-file "$(pub alice)"
@@ -284,6 +344,7 @@ test_names_that_conflict_are_refused_before_any_change() {
     assert_output_contains "in use by the account '$SYS_ADMIN'"
 }
 
+# A second command on accounts waits for the first.
 test_a_second_command_on_accounts_waits_for_the_first() {
     # Another command holds the lock "accounts" (impact-add-user, impact-key
     # and impact-remove-user share it).
@@ -300,6 +361,7 @@ test_a_second_command_on_accounts_waits_for_the_first() {
 # The first enrolment
 # ----------------------------------------------------------------------------
 
+# Dry run changes nothing.
 test_dry_run_changes_nothing() {
     refused_without_change 0 sys_as_admin "$ADD" "$GH" --key-file "$(pub alice)" --fingerprint "$(print_of alice)" --dry-run
     assert_output_contains 'DRY RUN'
@@ -313,6 +375,7 @@ test_dry_run_changes_nothing() {
     assert_missing "/home/$ACC"
 }
 
+# The fingerprint must be confirmed.
 test_the_fingerprint_must_be_confirmed() {
     # --yes does not answer the fingerprint question, and there is no
     # terminal to ask on.
@@ -339,6 +402,7 @@ test_the_fingerprint_must_be_confirmed() {
     assert_contains "$output" 'not confirmed'
 }
 
+# First run enrols the person.
 test_first_run_enrols_the_person() {
     run_cmd sys_as_admin "$ADD" "$GH" --key-file "$(pub alice)" --fingerprint "$(print_of alice)"
     assert_status 0
@@ -382,6 +446,7 @@ impact_valid_user_number_test() {
     [[ "$1" =~ ^[0-9]+$ ]] && (($1 >= 1000 && $1 <= 60000))
 }
 
+# The log holds the fingerprint and never the key.
 test_the_log_holds_the_fingerprint_and_never_the_key() {
     assert_file_contains "$LOG_FILE" "command: impact-add-user $GH --key-file"
     assert_file_contains "$LOG_FILE" "key fingerprint: $(print_of alice)"
@@ -392,6 +457,7 @@ test_the_log_holds_the_fingerprint_and_never_the_key() {
     assert_eq 1 "$(grep -c '^command: impact-add-user' "$LOG_FILE")" "log blocks of impact-add-user"
 }
 
+# Second run changes nothing.
 test_second_run_changes_nothing() {
     snapshot_unchanged_by --content --exclude /opt/impact/admin/log "${WATCHED[@]}" -- \
         sys_as_admin "$ADD" "$GH" --key-file "$(pub alice)" --fingerprint "$(print_of alice)"
@@ -410,6 +476,7 @@ test_second_run_changes_nothing() {
 # The new member on the real SSH server
 # ----------------------------------------------------------------------------
 
+# The member gets the restricted ssh values.
 test_the_member_gets_the_restricted_ssh_values() {
     local effective
     effective="$(sys_effective_ssh "$ACC")"
@@ -425,6 +492,7 @@ test_the_member_gets_the_restricted_ssh_values() {
     assert_contains "$effective" 'clientaliveinterval 60'
 }
 
+# Key login works and password login is refused.
 test_key_login_works_and_password_login_is_refused() {
     run_cmd sys_ssh_key "$ACC" alice id -un
     assert_status 0
@@ -442,6 +510,7 @@ test_key_login_works_and_password_login_is_refused() {
     assert_status 255
 }
 
+# A tunnel reaches the port range and no other port.
 test_a_tunnel_reaches_the_port_range_and_no_other_port() {
     if ! command -v python3 >/dev/null 2>&1; then
         skip "python3 is needed for the small web servers of this test"
@@ -476,6 +545,7 @@ test_a_tunnel_reaches_the_port_range_and_no_other_port() {
 # Further key sources and accounts
 # ----------------------------------------------------------------------------
 
+# The terminal confirmation enrols a person.
 test_the_terminal_confirmation_enrols_a_person() {
     if ! command -v script >/dev/null 2>&1; then
         skip "the tool script (package bsdutils) is not installed"
@@ -487,6 +557,7 @@ test_the_terminal_confirmation_enrols_a_person() {
     assert_eq "ssh-ed25519 $(blob_of carol) carol@example-pc" "$(cat /home/carol/.ssh/authorized_keys)" "key of carol"
 }
 
+# The key on standard input is accepted.
 test_the_key_on_standard_input_is_accepted() {
     # Windows line ends and blanks around the line are tolerated.
     run_cmd_with_input "  $(cat -- "$(pub dave)")"$'\r' sys_as_admin "$ADD" dave --fingerprint "$(print_of dave)"
@@ -495,6 +566,8 @@ test_the_key_on_standard_input_is_accepted() {
     assert_eq "ssh-ed25519 $(blob_of dave) dave@example-pc" "$(cat /home/dave/.ssh/authorized_keys)" "key of dave"
 }
 
+# With --github the ed25519 keys of the GitHub account are listed; with
+# several, --fingerprint chooses one.
 test_keys_from_github() {
     install_fake_curl
     {
@@ -522,6 +595,7 @@ test_keys_from_github() {
     assert_eq "ssh-ed25519 $(blob_of erin2) erin-example" "$(cat /home/erin-example/.ssh/authorized_keys)" "key of erin"
 }
 
+# An existing account is adopted.
 test_an_existing_account_is_adopted() {
     sys_account_add bob
     sys_set_password bob 'Bob-Test-Pass-44'
@@ -550,6 +624,7 @@ test_an_existing_account_is_adopted() {
     assert_output_contains 'Nothing to do'
 }
 
+# Protected accounts are refused.
 test_protected_accounts_are_refused() {
     local name
     # The administrator itself, root, a system account.
@@ -568,6 +643,7 @@ test_protected_accounts_are_refused() {
     refused_without_change 4 sys_as_admin "$ADD" someone-else --account "$ACC" --key-file "$(pub frank)"
 }
 
+# Links and foreign owners in the home folder are refused.
 test_links_and_foreign_owners_in_the_home_folder_are_refused() {
     sys_account_add frank
     mkdir -p /srv/impact-test-target
@@ -600,6 +676,7 @@ test_links_and_foreign_owners_in_the_home_folder_are_refused() {
     assert_file_facts /home/frank/.ssh/authorized_keys 600 frank frank
 }
 
+# The user number can be given.
 test_the_user_number_can_be_given() {
     local number=41234
     while getent passwd "$number" >/dev/null || getent group "$number" >/dev/null; do
@@ -668,7 +745,7 @@ test_ssh_rules_that_do_not_apply_stop_before_the_key() {
 # For an account that the command created, "How to undo" names one command,
 # impact-remove-user, which takes the account out of the groups and moves the
 # key away as well. Separate lines for these steps would fail after it.
-# Followed literally (with --yes in place of the answer on the terminal),
+# Followed literally (with --yes as the answer to its question),
 # it closes the account.
 test_undo_of_a_new_account_is_one_working_command() {
     run_cmd sys_as_admin "$ADD" ivan --key-file "$(pub ivan)" --fingerprint "$(print_of ivan)"
@@ -686,6 +763,62 @@ test_undo_of_a_new_account_is_one_working_command() {
     assert_file_contains /opt/impact/admin/accounts/ivan.conf 'STATE=removed'
     run_cmd sys_ssh_key ivan ivan id -un
     assert_status 255
+}
+
+# A signal that arrives while useradd runs (TERM to the command from another
+# window, Ctrl+C on the terminal of the command) takes effect after the
+# account record is written: the report lists the new account with its one
+# working undo line, the record says "enrolling", the same command run again
+# continues the enrolment without --existing, and impact-remove-user accepts
+# the account. (Without the hold, the record was missing: the second run
+# asked for --existing and impact-remove-user refused the account.)
+test_a_signal_during_useradd_leaves_an_account_that_a_second_run_continues() {
+    local name signal code
+    for name in kate liam; do
+        if [[ "$name" == 'kate' ]]; then
+            install_fake_useradd term-command
+            signal=TERM
+            code=143
+            run_cmd sys_as_admin "$ADD" kate --key-file "$(pub kate)" --fingerprint "$(print_of kate)"
+        else
+            install_fake_useradd int-group
+            signal=INT
+            code=130
+            # "setsid --wait": the command runs in a process group of its
+            # own, so the INT for the group reaches the command, useradd
+            # and nothing of the test runner.
+            run_cmd sys_as_admin setsid --wait "$ADD" liam --key-file "$(pub liam)" --fingerprint "$(print_of liam)"
+        fi
+        remove_fake_useradd
+        assert_status "$code"
+        assert_output_contains "was interrupted (signal $signal)"
+        assert_output_contains 'These steps had already run:'
+        assert_output_contains "  + Create the account '$name'"
+        assert_output_not_contains 'may have finished'
+        assert_output_contains 'How to undo them:'
+        assert_output_contains ": sudo impact-remove-user $name"
+        assert_output_contains 'The command is safe to run again'
+        assert_output_not_contains "Add '$name' to the group"
+        assert_success getent passwd "$name"
+        assert_file_contains "/opt/impact/admin/accounts/$name.conf" 'STATE=enrolling'
+        assert_file_contains "/opt/impact/admin/accounts/$name.conf" "USER_NUMBER=$(id -u "$name")"
+    done
+    # The printed undo line works for this state (dry run here; it ends
+    # with 1 only because no Docker daemon answers in this file).
+    run_cmd sys_as_admin impact-remove-user liam --dry-run
+    assert_output_contains "record state 'enrolling'"
+    assert_output_contains "[dry run] Set the account 'liam' to expired"
+    # The same command again continues the enrolment.
+    for name in kate liam; do
+        run_cmd sys_as_admin "$ADD" "$name" --key-file "$(pub "$name")" --fingerprint "$(print_of "$name")"
+        assert_status 0
+        assert_output_contains 'this run continues the enrolment'
+        assert_output_contains "Add '$name' to the group 'docker'"
+        assert_file_contains "/opt/impact/admin/accounts/$name.conf" 'STATE=enrolled'
+    done
+    run_cmd sys_ssh_key kate kate id -un
+    assert_status 0
+    assert_eq 'kate' "$RUN_OUTPUT"
 }
 
 # One key pair belongs to one person: the key of an enrolled colleague is

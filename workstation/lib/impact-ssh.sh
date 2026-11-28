@@ -67,6 +67,10 @@
 #   2>&1                 send the error channel to the same place as the output
 #   "${NAME:0:10}"       a part of the text: from position 0, 10 characters
 #   "${NAME,,}"          the text in lower case
+#   declare -A NAME  local -A NAME   a list whose entries are found by a name
+#                        (an "associative array"): NAME[key]=value, "${NAME[key]}"
+#   BASH_REMATCH         after [[ text =~ pattern ]]: the matched text (entry 0)
+#                        and the parts in round brackets (entries 1, 2, ...)
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -81,6 +85,12 @@ IMPACT_SSH_OUTPUT=''          # what sshd printed in the last test
 IMPACT_SSH_RELOAD_STATE=''    # reloaded | waiting | none (see impact_ssh_reload)
 IMPACT_SSH_RELOAD_TEXT=''     # the same in plain words
 IMPACT_SSH_RULES_CHANGED=0    # 1 when the last procedure changed the rules file
+
+# The "How to undo" line of a run that wrote the rules file where there was
+# none. impact-workstation-setup looks for this exact text when it puts the
+# lines of "How to undo" in the order that works (see order_undo_of_new_rules
+# there).
+readonly IMPACT_SSH_REMOVE_UNDO='Remove the SSH rules: sudo impact-workstation-setup --remove-ssh-rules'
 
 # Internal state of the procedure.
 IMPACT__SSH_PENDING=0         # 1 while a change of the rules file is unconfirmed
@@ -707,6 +717,11 @@ impact__ssh_rules_restore() {
     # first n entries of a list.
     IMPACT_CHANGES=("${IMPACT_CHANGES[@]:0:IMPACT__SSH_CHANGES_BEFORE}")
     IMPACT_UNDO=("${IMPACT_UNDO[@]:0:IMPACT__SSH_UNDO_BEFORE}")
+    # A step that was running when the command stopped (the write or the
+    # reload) belongs to the procedure as well; its effect was taken back
+    # above, so the report and the log do not name it as "may have
+    # finished".
+    IMPACT_CURRENT_STEP=''
 }
 
 # impact__ssh_rules_procedure MODE CONTENT_FILE GROUP PORT_MIN PORT_MAX
@@ -1006,7 +1021,7 @@ impact__ssh_rules_procedure() {
 impact__ssh_add_undo() {
     if [[ "$1" == 'install' ]]; then
         if [[ "$2" != '1' ]]; then
-            impact_undo "Remove the SSH rules: sudo impact-workstation-setup --remove-ssh-rules"
+            impact_undo "$IMPACT_SSH_REMOVE_UNDO"
         fi
     else
         impact_undo "Write the SSH rules again: sudo impact-workstation-setup"

@@ -125,6 +125,7 @@ docker_unchanged_by() {
     snapshot_assert_same "$TEST_TMP/docker-before" "$TEST_TMP/docker-after" "the images or containers changed: $*"
 }
 
+# Wrong input is refused.
 test_wrong_input_is_refused() {
     docker_unchanged_by sys_as_admin "$CLEAN" extra
     assert_status 2
@@ -138,6 +139,7 @@ test_wrong_input_is_refused() {
     assert_status 2
 }
 
+# The list changes nothing and shows each decision.
 test_the_list_changes_nothing_and_shows_each_decision() {
     # The list writes nothing: no log block, no file in a home folder.
     snapshot_take "$TEST_TMP/files-before" --content /opt/impact /home
@@ -165,6 +167,7 @@ test_the_list_changes_nothing_and_shows_each_decision() {
     assert_output_contains 'Nothing was removed. To remove the 4 images marked REMOVE: sudo impact-clean-images --remove'
 }
 
+# Remove with dry run removes nothing.
 test_remove_with_dry_run_removes_nothing() {
     docker_unchanged_by sys_as_admin "$CLEAN" --remove --dry-run
     assert_status 0
@@ -172,6 +175,7 @@ test_remove_with_dry_run_removes_nothing() {
     assert_output_contains 'A real run asks here: Remove 4 images'
 }
 
+# Remove without terminal and without yes removes nothing.
 test_remove_without_terminal_and_without_yes_removes_nothing() {
     # setsid starts the command without a terminal, so nobody can answer.
     docker_unchanged_by timeout 60 setsid --wait runuser -u "$SYS_ADMIN" -- sudo -n -- "$CLEAN" --remove
@@ -180,6 +184,7 @@ test_remove_without_terminal_and_without_yes_removes_nothing() {
     assert_output_contains 'Nothing was removed'
 }
 
+# Remove with yes removes exactly the marked images.
 test_remove_with_yes_removes_exactly_the_marked_images() {
     run_cmd sys_as_admin "$CLEAN" --remove --yes
     assert_status 0
@@ -193,6 +198,7 @@ test_remove_with_yes_removes_exactly_the_marked_images() {
     assert_file_contains /opt/impact/admin/log/impact-admin.log 'impact-clean-images --remove --yes'
 }
 
+# Second run removes nothing.
 test_second_run_removes_nothing() {
     docker_unchanged_by sys_as_admin "$CLEAN" --remove --yes
     assert_status 0

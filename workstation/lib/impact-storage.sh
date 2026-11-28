@@ -77,6 +77,8 @@
 #                        ":") into the variables A and B; with -a LIST into a list
 #   while IFS= read -r line   read input line by line, exactly as written:
 #                        "IFS=" keeps blanks at both ends, -r keeps backslashes
+#   <<<"$text"           hand a text to a command as its input ("here-string")
+#   "${NAME:0:10}"       a part of the text: from position 0, 10 characters
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -218,6 +220,106 @@ impact_is_system_path() {
     return 1
 }
 
+# impact__perm_number TEXT
+#   Internal: prints the number of a rights text such as "r-x" (r 4, w 2,
+#   x 1; "r-x" is 5).
+impact__perm_number() {
+    local text="$1" number=0
+    [[ "${text:0:1}" == 'r' ]] && number=$((number + 4))
+    [[ "${text:1:1}" == 'w' ]] && number=$((number + 2))
+    [[ "${text:2:1}" == 'x' ]] && number=$((number + 1))
+    printf '%s' "$number"
+}
+
+# impact_member_can_use FOLDER GID RIGHTS
+#   Read-only: success when a member of the group with the number GID has
+#   RIGHTS on FOLDER (1: enter; 5: enter and list), counting the member as
+#   neither the owner of FOLDER nor a member of other groups. The rule is
+#   the one of the kernel: when FOLDER belongs to that group, or has an ACL
+#   entry for it, the group rights decide (each entry limited by the ACL
+#   "mask"), and the rights of all others count only when no group entry
+#   applies. So a folder of the group with mode 705 locks members out,
+#   although all others may enter it.
+#   Example: impact_member_can_use /mnt/disk_a/shared 1005 5
+impact_member_can_use() {
+    local folder="$1" gid="$2" need="$3" facts mode group line
+    local owning other named='' mask='' matched=0
+    facts="$(stat -c '%a %g' -- "$folder" 2>/dev/null)" || return 1
+    mode="${facts%% *}"
+    group="${facts##* }"
+    # From the mode alone (exact for a folder without an ACL): "8#" reads
+    # the number as octal; ">> 3" moves the group rights to the last digit,
+    # "& 7" keeps that digit.
+    owning=$(((8#$mode >> 3) & 7))
+    other=$((8#$mode & 7))
+    if impact_have_tool getfacl; then
+        # getfacl -n prints numbers for owners and groups; --omit-header
+        # leaves out the "# file:" lines. A comment "#effective:..." after
+        # an entry is cut off (the mask is applied below).
+        while IFS= read -r line; do
+            line="${line%%[[:space:]]*}"
+            case "$line" in
+                group::*) owning="$(impact__perm_number "${line#group::}")" ;;
+                "group:$gid:"*) named="$(impact__perm_number "${line#group:"$gid":}")" ;;
+                mask::*) mask="$(impact__perm_number "${line#mask::}")" ;;
+                other::*) other="$(impact__perm_number "${line#other::}")" ;;
+                *) ;;
+            esac
+        done < <(getfacl -n -p --omit-header -- "$folder" 2>/dev/null)
+    fi
+    if [[ -n "$mask" ]]; then
+        owning=$((owning & mask))
+        [[ -z "$named" ]] || named=$((named & mask))
+    fi
+    if [[ "$group" == "$gid" ]]; then
+        matched=1
+        (((owning & need) == need)) && return 0
+    fi
+    if [[ -n "$named" ]]; then
+        matched=1
+        (((named & need) == need)) && return 0
+    fi
+    ((matched == 0)) && (((other & need) == need))
+}
+
+# impact_member_blocked_folders PATH GID
+#   Read-only: prints the folders from / down to PATH that a member of the
+#   group with the number GID cannot pass (impact_member_can_use): the
+#   folders above PATH need the right to enter, PATH itself the rights to
+#   enter and to list. Each line: the folder, a tab, and the command that
+#   gives members that right.
+#   Example: impact_member_blocked_folders /mnt/disk_a/shared 1005
+impact_member_blocked_folders() {
+    local path="$1" gid="$2" current='' part need fix group_name group
+    local -a parts=()
+    group_name="$(impact_group_by_gid "$gid" 2>/dev/null)" || group_name="$gid"
+    # Split the path at "/" into its parts.
+    IFS='/' read -r -a parts <<<"${path#/}"
+    for part in '' "${parts[@]}"; do
+        if [[ -n "$part" ]]; then
+            current="$current/$part"
+        fi
+        need=1
+        if [[ "${current:-/}" == "$path" ]]; then
+            need=5
+        fi
+        impact_member_can_use "${current:-/}" "$gid" "$need" && continue
+        group="$(stat -c '%g' -- "${current:-/}" 2>/dev/null)" || group=''
+        if ((need == 5)); then
+            if [[ "$group" == "$gid" ]]; then
+                fix="sudo chmod g+rx ${current:-/}"
+            else
+                fix="sudo chgrp $group_name ${current:-/} && sudo chmod g+rx ${current:-/}"
+            fi
+        elif [[ "$group" == "$gid" ]]; then
+            fix="sudo chmod g+x ${current:-/}"
+        else
+            fix="sudo chmod o+x ${current:-/}"
+        fi
+        printf '%s\t%s\n' "${current:-/}" "$fix"
+    done
+}
+
 # impact_is_home_path PATH
 #   Result: success when PATH is /home, lies inside /home, or is or lies
 #   inside the home folder of any person's account (user number 1000 or
@@ -345,7 +447,17 @@ impact_storage_check_target() {
         return 1
     fi
     if ! root="$(impact__root_holding "$real")"; then
-        IMPACT_STORAGE_ERROR="$real lies inside none of the storage roots (${IMPACT_CONF[SHARED_ROOTS]:-none are set}). The storage root itself is not accepted either: give a folder inside it."
+        # The storage root itself gets its own message: it is in the list,
+        # and only the folders inside it are accepted.
+        local listed roots_list=()
+        impact_split_list "${IMPACT_CONF[SHARED_ROOTS]:-}" roots_list
+        for listed in "${roots_list[@]}"; do
+            if [[ "$(impact_storage_real_root "$listed" 2>/dev/null)" == "$real" ]]; then
+                IMPACT_STORAGE_ERROR="$real is a storage root. Give the folder of one model inside it, for example $real/<storage name>."
+                return 1
+            fi
+        done
+        IMPACT_STORAGE_ERROR="$real lies inside none of the storage roots (${IMPACT_CONF[SHARED_ROOTS]:-none are set}). Give a folder inside one of them."
         return 1
     fi
     if impact_is_mount_point "$real"; then

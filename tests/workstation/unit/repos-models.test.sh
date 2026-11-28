@@ -57,6 +57,8 @@ assert_last_line_is_result() {
 # Names of extras
 # ----------------------------------------------------------------------------
 
+# These extra paths are accepted: blanks inside names, dots in front of names,
+# several folder levels.
 test_valid_extra_paths() {
     local path
     for path in a.csv 'inputs/tables/small table.csv' .Renviron 'x/y_z-1+2@(3),=.txt' \
@@ -65,6 +67,8 @@ test_valid_extra_paths() {
     done
 }
 
+# Extra paths that leave the copy, touch git's own files or have unsafe names
+# are refused.
 test_invalid_extra_paths() {
     local path long_part long_path
     long_part="$(printf 'a%.0s' {1..256})"
@@ -85,6 +89,8 @@ test_invalid_extra_paths() {
     done
 }
 
+# The lines for .git/info/exclude start with the mark and name each extra from
+# the top of the copy.
 test_exclude_lines() {
     local text
     text="$(impact_extras_exclude_lines 'inputs/tables/small table.csv' a.csv)"
@@ -93,6 +99,7 @@ test_exclude_lines() {
     assert_eq "$IMPACT_EXCLUDE_MARK" "$text" "no files"
 }
 
+# Extras scan lists files and folders and names problems.
 test_extras_scan_lists_files_and_folders_and_names_problems() {
     local extras="$TEST_TMP/extras"
     mkdir -p "$extras/inputs/tables" "$extras/empty"
@@ -116,6 +123,7 @@ test_extras_scan_lists_files_and_folders_and_names_problems() {
     assert_fails impact_extras_scan "$extras"
 }
 
+# Extras scan of a missing or linked folder.
 test_extras_scan_of_a_missing_or_linked_folder() {
     assert_success impact_extras_scan "$TEST_TMP/none"
     assert_eq 0 "${#IMPACT_EXTRAS_FILES[@]}" "files of a missing folder"
@@ -125,6 +133,7 @@ test_extras_scan_of_a_missing_or_linked_folder() {
     assert_contains "${IMPACT_EXTRAS_PROBLEMS[0]}" 'is no real folder'
 }
 
+# Extras scan reports unreadable entries.
 test_extras_scan_reports_unreadable_entries() {
     if ((EUID == 0)); then
         skip "root can read every file; this case needs a normal account"
@@ -140,6 +149,7 @@ test_extras_scan_reports_unreadable_entries() {
     chmod 700 "$TEST_TMP/extras/closed"
 }
 
+# Large extras are listed.
 test_large_extras_are_listed() {
     mkdir -p "$TEST_TMP/extras/inputs"
     truncate -s 51M "$TEST_TMP/extras/inputs/large.bin"
@@ -151,6 +161,7 @@ test_large_extras_are_listed() {
 # Storage roots and folders
 # ----------------------------------------------------------------------------
 
+# Storage folders and roots union.
 test_storage_folders_and_roots_union() {
     assert_eq $'/r/E\n/r/E/outputs\n/r/E/inputs\n/r/E/inputs/synthpop' "$(impact_models_storage_folders /r/E)"
     assert_eq '/a' "$(impact_models_roots_union '' /a)"
@@ -171,6 +182,8 @@ classify() {
     printf '%s %s' "$IMPACT_GIT_ERROR_CODE" "$IMPACT_GIT_ERROR_REASON"
 }
 
+# Each typical git error is mapped to its exit code and reason word (host key,
+# key refused, no access, network).
 test_git_error_classification() {
     assert_eq '1 host_key' "$(classify 'Host key verification failed.
 fatal: Could not read from remote repository.')"
@@ -204,6 +217,7 @@ fatal: Remote branch dev not found in upstream origin')"
     assert_contains "$IMPACT_GIT_ERROR_CAUSE" 'could not reach GitHub'
 }
 
+# Same repository in both address forms.
 test_same_repository_in_both_address_forms() {
     assert_success impact_git_same_repo git@github.com:o/r.git https://github.com/o/r
     assert_success impact_git_same_repo git@github.com:Example-Org/Repo.git git@github.com:example-org/repo.git
@@ -214,6 +228,7 @@ test_same_repository_in_both_address_forms() {
     assert_fails impact_git_same_repo 'git@github.com:o/r.git;id' git@github.com:o/r.git
 }
 
+# Ssh command for github.
 test_ssh_command_for_github() {
     local text
     text="$(impact_git_ssh_command /home/alice/.ssh/id_ed25519_alice-example)"
@@ -232,6 +247,7 @@ test_ssh_command_for_github() {
     assert_fails impact_git_ssh_command 'relative/key'
 }
 
+# Git environment is cleaned.
 test_git_environment_is_cleaned() {
     export GIT_DIR=/tmp/elsewhere GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no' \
         GIT_CONFIG_PARAMETERS="'core.sshCommand=x'" SSH_AUTH_SOCK=/tmp/agent GIT_WORK_TREE=/tmp OTHER_VALUE=kept
@@ -248,6 +264,8 @@ test_git_environment_is_cleaned() {
 # Key copies and the folder lock
 # ----------------------------------------------------------------------------
 
+# Only key copies with a valid GitHub name in the file name are found, in
+# lower case.
 test_key_copy_names() {
     local home="$TEST_TMP/home"
     mkdir -p "$home/.ssh"
@@ -258,6 +276,8 @@ test_key_copy_names() {
     assert_eq '' "$(impact_key_copy_names "$TEST_TMP/nobody")" "no .ssh folder"
 }
 
+# A key copy is usable only when no other account may read it (mode 600 or
+# 400).
 test_key_copy_usable() {
     local key="$TEST_TMP/id_ed25519_alice-example"
     printf 'key\n' >"$key"
@@ -278,6 +298,7 @@ test_key_copy_usable() {
     assert_fails impact_key_copy_usable "$TEST_TMP/folder"
 }
 
+# Folder lock allows one command at a time.
 test_folder_lock_allows_one_command_at_a_time() {
     mkdir "$TEST_TMP/repositories"
     assert_success impact_models_lock_dir "$TEST_TMP/repositories"
@@ -291,6 +312,7 @@ test_folder_lock_allows_one_command_at_a_time() {
 # The commands: help, wrong usage, the result line
 # ----------------------------------------------------------------------------
 
+# Every command shows its help.
 test_every_command_shows_its_help() {
     local command
     for command in impact-add-model impact-check-model impact-get-repo impact-give-repo impact-update-setup; do
@@ -303,6 +325,7 @@ test_every_command_shows_its_help() {
     done
 }
 
+# Administrator commands refuse wrong usage.
 test_administrator_commands_refuse_wrong_usage() {
     run_cmd "$WORKSTATION_DIR/bin/impact-add-model" Example-Model --unknown
     assert_status 2
@@ -316,6 +339,7 @@ test_administrator_commands_refuse_wrong_usage() {
     assert_output_contains 'was given twice'
 }
 
+# Administrator commands need root.
 test_administrator_commands_need_root() {
     if ((EUID == 0)); then
         skip "this test needs a normal account"
@@ -331,6 +355,7 @@ test_administrator_commands_need_root() {
     assert_output_contains 'must run with administrator rights'
 }
 
+# User commands end with the result line in every case.
 test_user_commands_end_with_the_result_line_in_every_case() {
     local command
     for command in impact-get-repo impact-update-setup; do

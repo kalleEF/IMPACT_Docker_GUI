@@ -121,6 +121,8 @@
 #                        ":") into the variables A and B; with -a LIST into a list
 #   "${NAME:+text}"      "text" when NAME has content, otherwise nothing
 #   "${!LIST[@]}"        the positions (or the names) of the entries of a list
+#   command || true      accept a failure of this command ("set -e" would
+#                        otherwise stop the script there)
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -130,7 +132,9 @@
 set -euo pipefail
 
 # Find this file's real place (the name in /usr/local/bin is a link) and load
-# the shared functions that lie next to it in ../lib.
+# the shared functions that lie next to it in ../lib. "${BASH_SOURCE[0]}" is
+# the path of this file as it was started; "readlink -f" resolves every
+# symbolic link in it.
 IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/impact-common.sh
@@ -373,9 +377,17 @@ finish_copy() {
     if [[ -e "$TARGET" || -L "$TARGET" ]]; then
         return 4
     fi
-    mv -n -T -- "$PARTIAL" "$TARGET" || return 1
-    if [[ -e "$PARTIAL" ]]; then
-        return 4
+    # "mv -n" never replaces an existing target. Whether it then reports a
+    # failure differs between coreutils 8.32 (Ubuntu 22.04: success) and 9.4
+    # (Ubuntu 24.04: failure), so the result is read from the folders
+    # themselves: the copy is still at its temporary name when the rename
+    # did not happen.
+    mv -n -T -- "$PARTIAL" "$TARGET" 2>/dev/null || true
+    if [[ -e "$PARTIAL" || -L "$PARTIAL" ]]; then
+        if [[ -e "$TARGET" || -L "$TARGET" ]]; then
+            return 4
+        fi
+        return 1
     fi
     CLONE_STARTED=0
 }

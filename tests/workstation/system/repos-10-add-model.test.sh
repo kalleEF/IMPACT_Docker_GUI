@@ -90,6 +90,8 @@ assert_shared_folder() {
 # Refusals before the first run
 # ----------------------------------------------------------------------------
 
+# impact-add-model and impact-check-model stop without root (exit code 2);
+# --help works without root.
 test_needs_root() {
     run_cmd runuser -u "$SYS_ADMIN" -- "$ADD" "$MODEL" "$ADDRESS" --storage "$SYS_ROOT_A" --storage-name Example --dry-run
     assert_status 2
@@ -101,6 +103,7 @@ test_needs_root() {
     assert_output_contains 'Usage'
 }
 
+# Wrong and hostile input is refused before any change.
 test_wrong_and_hostile_input_is_refused_before_any_change() {
     local before="$TEST_TMP/before" after="$TEST_TMP/after" index
     snapshot_take "$before" --content "${WATCHED[@]}"
@@ -150,6 +153,7 @@ test_wrong_and_hostile_input_is_refused_before_any_change() {
     assert_missing "$HOSTILE_MARK"
 }
 
+# Symbolic link where a folder is expected is refused.
 test_symbolic_link_where_a_folder_is_expected_is_refused() {
     local before="$TEST_TMP/before" after="$TEST_TMP/after"
     # A link in the place of the model's storage folder, and one in the
@@ -178,6 +182,7 @@ test_symbolic_link_where_a_folder_is_expected_is_refused() {
 # Dry run, first run, second run
 # ----------------------------------------------------------------------------
 
+# Dry run changes nothing.
 test_dry_run_changes_nothing() {
     snapshot_unchanged_by --content "${WATCHED[@]}" -- \
         sys_as_admin "$ADD" "$MODEL" "$ADDRESS" --storage "$SYS_ROOT_A" --storage-name Example --dry-run
@@ -188,6 +193,7 @@ test_dry_run_changes_nothing() {
     assert_output_contains 'Dry run: nothing was changed.'
 }
 
+# First run creates model folder file and storage folders.
 test_first_run_creates_model_folder_file_and_storage_folders() {
     local before_b="$TEST_TMP/before-b" after_b="$TEST_TMP/after-b"
     snapshot_take "$before_b" --content /mnt/disk_b
@@ -221,6 +227,7 @@ test_first_run_creates_model_folder_file_and_storage_folders() {
     assert_contains "$(getfacl -c -p -E "$SYS_ROOT_A/Example/outputs/run1/result.csv")" 'group::rw-' "access of a new file"
 }
 
+# Second run changes nothing.
 test_second_run_changes_nothing() {
     snapshot_unchanged_by --content --exclude /opt/impact/admin/log "${WATCHED[@]}" -- \
         sys_as_admin "$ADD" "$MODEL" "$ADDRESS" --storage "$SYS_ROOT_A" --storage-name Example
@@ -233,6 +240,7 @@ test_second_run_changes_nothing() {
     assert_output_contains 'Nothing to do'
 }
 
+# Values that differ from the model file are refused.
 test_values_that_differ_from_the_model_file_are_refused() {
     local before="$TEST_TMP/before" after="$TEST_TMP/after"
     snapshot_take "$before" --content --exclude /opt/impact/admin/log "${WATCHED[@]}"
@@ -249,6 +257,7 @@ test_values_that_differ_from_the_model_file_are_refused() {
     snapshot_assert_same "$before" "$after" "a refused call changed the system"
 }
 
+# Second storage adds a root and leaves the first alone.
 test_second_storage_adds_a_root_and_leaves_the_first_alone() {
     local before_a="$TEST_TMP/before-a" after_a="$TEST_TMP/after-a" folder
     snapshot_take "$before_a" --content --no-accounts /mnt/disk_a
@@ -269,6 +278,7 @@ test_second_storage_adds_a_root_and_leaves_the_first_alone() {
     assert_output_contains 'Nothing to do'
 }
 
+# Existing storage folder and its content are left alone.
 test_existing_storage_folder_and_its_content_are_left_alone() {
     local before="$TEST_TMP/before" after="$TEST_TMP/after"
     # An existing model folder on the storage from before the shared rules:
@@ -299,6 +309,7 @@ test_existing_storage_folder_and_its_content_are_left_alone() {
 # impact-check-model: model file, folders, extras
 # ----------------------------------------------------------------------------
 
+# Check model reports a correct model as ok.
 test_check_model_reports_a_correct_model_as_ok() {
     snapshot_unchanged_by --content "${WATCHED[@]}" -- sys_as_admin "$CHECK" "$MODEL"
     assert_status 0
@@ -309,6 +320,7 @@ test_check_model_reports_a_correct_model_as_ok() {
     assert_output_contains 'No member has a working copy'
 }
 
+# Check model refuses wrong input.
 test_check_model_refuses_wrong_input() {
     run_cmd sys_as_admin "$CHECK" '../Example-Model'
     assert_status 2
@@ -322,6 +334,7 @@ test_check_model_refuses_wrong_input() {
     assert_status 2
 }
 
+# Check model finds bad extras.
 test_check_model_finds_bad_extras() {
     local extras="$MODEL_FOLDER/extras"
     # A correct extra, then one of each kind of problem.
@@ -359,6 +372,29 @@ test_check_model_finds_bad_extras() {
     rm -f -- "$extras/inputs/large.bin"
 }
 
+# An extra put in place with "install -D": the new folder gets the mode
+# 2755 (readable for all others). impact-check-model and impact-check apply
+# the same rule (folders 2750, files 640) and both print the same command;
+# after it both are content.
+test_check_model_and_check_agree_on_the_rights_of_extras() {
+    local extras="$MODEL_FOLDER/extras" fix
+    install -D -m 640 -o root -g "$SYS_GROUP" /dev/null "$extras/more/table.csv"
+    assert_eq '2755' "$(stat -c '%a' -- "$extras/more")" "mode of a folder made by install -D"
+    fix="sudo chown -R root:$SYS_GROUP $extras && sudo find $extras -type d -exec chmod 2750 {} + && sudo find $extras -type f -exec chmod 640 {} +"
+    run_cmd sys_as_admin "$CHECK" "$MODEL"
+    assert_status 0
+    assert_output_contains "1 entries in $extras deviate from the rules (owner root, group '$SYS_GROUP', folders 2750, files 640). Correct the rights: $fix"
+    run_cmd sys_as_admin /usr/local/bin/impact-check
+    assert_output_contains "1 entries in $extras deviate from the rules (owner root, group '$SYS_GROUP', folders 2750, files 640)."
+    assert_output_contains "$fix"
+    chmod 2750 -- "$extras/more"
+    run_cmd sys_as_admin "$CHECK" "$MODEL"
+    assert_status 0
+    assert_output_not_contains 'deviate from the rules'
+    rm -r -- "$extras/more"
+}
+
+# Check model finds missing storage folders.
 test_check_model_finds_missing_storage_folders() {
     rmdir -- "$SYS_ROOT_B/Example/inputs/synthpop"
     run_cmd sys_as_admin "$CHECK" "$MODEL"
@@ -374,6 +410,7 @@ test_check_model_finds_missing_storage_folders() {
     assert_status 0
 }
 
+# Both storage roots in one run.
 test_both_storage_roots_in_one_run() {
     run_cmd sys_as_admin "$ADD" Both-Model git@github.com:example-org/Both-Model.git \
         --storage "$SYS_ROOT_A" --storage "$SYS_ROOT_B" --storage "$SYS_ROOT_A" --storage-name Both --branch dev-example

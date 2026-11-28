@@ -80,6 +80,7 @@ printf 'dry=%s yes=%s\n' "$IMPACT_DRY_RUN" "$IMPACT_ASSUME_YES"
 END
 }
 
+# Options flags values lists and arguments.
 test_options_flags_values_lists_and_arguments() {
     options_command
     run_cmd "$TEST_TMP/show-options" first --existing --account alice --uid=1005 second \
@@ -96,6 +97,7 @@ test_options_flags_values_lists_and_arguments() {
     assert_output_not_contains 'opt dry-run'
 }
 
+# Options default and empty value.
 test_options_default_and_empty_value() {
     options_command
     run_cmd "$TEST_TMP/show-options"
@@ -113,6 +115,7 @@ test_options_default_and_empty_value() {
     assert_output_contains 'opt account=[a=b c]'
 }
 
+# Options dry run and yes set the switches.
 test_options_dry_run_and_yes_set_the_switches() {
     options_command
     run_cmd "$TEST_TMP/show-options" --dry-run --yes
@@ -122,6 +125,7 @@ test_options_dry_run_and_yes_set_the_switches() {
     assert_output_contains 'Nothing is changed'
 }
 
+# Options double dash ends the options.
 test_options_double_dash_ends_the_options() {
     options_command
     run_cmd "$TEST_TMP/show-options" --account alice -- --existing -x --help
@@ -132,6 +136,7 @@ test_options_double_dash_ends_the_options() {
     assert_output_not_contains 'opt existing'
 }
 
+# Options refusals end with exit code 2.
 test_options_refusals_end_with_exit_code_2() {
     options_command
     local -a bad_calls=(
@@ -162,6 +167,7 @@ test_options_refusals_end_with_exit_code_2() {
     done
 }
 
+# Options control characters are refused.
 test_options_control_characters_are_refused() {
     options_command
     run_cmd "$TEST_TMP/show-options" $'alice\nresult: ok'
@@ -175,6 +181,7 @@ test_options_control_characters_are_refused() {
     assert_status 2
 }
 
+# Help prints the header and wins over other options.
 test_help_prints_the_header_and_wins_over_other_options() {
     options_command
     run_cmd "$TEST_TMP/show-options" --unknown --help
@@ -186,6 +193,8 @@ test_help_prints_the_header_and_wins_over_other_options() {
     assert_output_not_contains '#!/bin/bash'
 }
 
+# impact_require_arg_count stops with exit code 2 for too few or too many
+# arguments.
 test_argument_count() {
     make_command count-arguments <<'END'
 impact_parse_args '' '' '' "$@"
@@ -226,6 +235,7 @@ impact_summary
 END
 }
 
+# Real run executes and summarises.
 test_real_run_executes_and_summarises() {
     steps_command
     run_cmd "$TEST_TMP/do-steps"
@@ -247,6 +257,7 @@ test_real_run_executes_and_summarises() {
     assert_eq 2 "$(printf '%s\n' "$RUN_OUTPUT" | grep -c 'Create the file one')"
 }
 
+# Dry run prints the same steps and changes nothing.
 test_dry_run_prints_the_same_steps_and_changes_nothing() {
     steps_command
     run_cmd "$TEST_TMP/do-steps"
@@ -269,6 +280,7 @@ test_dry_run_prints_the_same_steps_and_changes_nothing() {
     assert_eq "$real_steps" "$dry_steps" "step lines of the real run and of the dry run"
 }
 
+# Nothing to do is said plainly.
 test_nothing_to_do_is_said_plainly() {
     make_command nothing <<'END'
 impact_parse_args 'dry-run' '' '' "$@"
@@ -284,6 +296,7 @@ END
     assert_output_contains 'A real run would change nothing either'
 }
 
+# Failing step reports what ran before.
 test_failing_step_reports_what_ran_before() {
     make_command fails-midway <<END
 impact_parse_args 'dry-run' '' '' "\$@"
@@ -305,6 +318,7 @@ END
     assert_output_not_contains 'What changed:'
 }
 
+# Die prints cause and next step.
 test_die_prints_cause_and_next_step() {
     make_command dies <<'END'
 impact_parse_args '' '' '' "$@"
@@ -318,6 +332,7 @@ END
     assert_output_not_contains 'not reached'
 }
 
+# Exit codes have the agreed values.
 test_exit_codes_have_the_agreed_values() {
     load_library
     assert_eq '0 1 2 3 4 5 6' "$IMPACT_EXIT_OK $IMPACT_EXIT_FAILED $IMPACT_EXIT_USAGE $IMPACT_EXIT_NOT_PREPARED $IMPACT_EXIT_CONFLICT $IMPACT_EXIT_NO_ACCESS $IMPACT_EXIT_NETWORK"
@@ -327,6 +342,7 @@ test_exit_codes_have_the_agreed_values() {
 # End-of-command work
 # ----------------------------------------------------------------------------
 
+# Temporary files are removed at the end.
 test_temporary_files_are_removed_at_the_end() {
     make_command temp-files <<END
 impact_parse_args '' 'how' '' "\$@"
@@ -359,6 +375,7 @@ END
     done
 }
 
+# Temporary files are private.
 test_temporary_files_are_private() {
     make_command temp-mode <<'END'
 impact_mktemp_file
@@ -372,6 +389,7 @@ END
     assert_output_contains 'dir 700'
 }
 
+# Exit handlers run in reverse order also after errors.
 test_exit_handlers_run_in_reverse_order_also_after_errors() {
     make_command handlers <<END
 first_handler() { echo "first handler, code \$1" >>"$TEST_TMP/handler-log"; }
@@ -385,6 +403,7 @@ END
     assert_eq $'second handler, code 5\nfirst handler, code 5' "$(cat "$TEST_TMP/handler-log")"
 }
 
+# Signal cleans up and ends with code 143.
 test_signal_cleans_up_and_ends_with_code_143() {
     # The signal TERM is used here. bash starts background commands of a
     # script with the signal INT (Ctrl+C) switched off, so INT cannot be
@@ -415,6 +434,7 @@ END
     assert_file_contains "$TEST_TMP/waits-output" 'was interrupted'
 }
 
+# Result line is the last line.
 test_result_line_is_the_last_line() {
     make_command result-ok <<'END'
 impact_result_enable
@@ -437,6 +457,7 @@ END
     assert_eq 'IMPACT_RESULT status=error code=5 path= reason=key_refused' "$(printf '%s\n' "$RUN_OUTPUT" | tail -n 1)"
 }
 
+# Result line has a default reason per exit code.
 test_result_line_has_a_default_reason_per_exit_code() {
     make_command result-default <<'END'
 impact_result_enable
@@ -456,6 +477,7 @@ END
     assert_eq 'IMPACT_RESULT status=error code=2 path= reason=usage' "$(printf '%s\n' "$RUN_OUTPUT" | tail -n 1)"
 }
 
+# Result line drops unsafe characters.
 test_result_line_drops_unsafe_characters() {
     make_command result-unsafe <<'END'
 impact_result_enable
@@ -469,6 +491,8 @@ END
 # Root checks, confirmation, log
 # ----------------------------------------------------------------------------
 
+# An administrator command stops without root and a user command stops with
+# root, each with exit code 2; --help works for everyone.
 test_root_checks() {
     make_command needs-root <<'END'
 impact_parse_args '' '' '' "$@"
@@ -492,6 +516,8 @@ END
         run_cmd "$TEST_TMP/needs-root"
         assert_status 2
         assert_output_contains 'sudo'
+        # The command is not installed: the hint names it by its path.
+        assert_output_contains "needs-root ..."
         run_cmd "$TEST_TMP/refuses-root"
         assert_status 0
     fi
@@ -500,6 +526,28 @@ END
     assert_status 0
 }
 
+# The root hint names the command the way it can be typed: a script inside
+# the current folder as ./name, any other script that is not installed with
+# its full path (quoted when it holds unusual characters). "sudo install.sh"
+# would fail with "command not found".
+test_typed_name_of_a_script_that_is_not_installed() {
+    load_library
+    mkdir -p "$TEST_TMP/unpacked/bin"
+    IMPACT_CMD='install.sh'
+    IMPACT_SELF="$TEST_TMP/unpacked/install.sh"
+    cd -- "$TEST_TMP/unpacked" || fail "cannot enter $TEST_TMP/unpacked"
+    assert_eq './install.sh' "$(impact_typed_name)"
+    IMPACT_CMD='impact-check'
+    IMPACT_SELF="$TEST_TMP/unpacked/bin/impact-check"
+    assert_eq './bin/impact-check' "$(impact_typed_name)"
+    cd / || fail "cannot enter /"
+    assert_eq "$TEST_TMP/unpacked/bin/impact-check" "$(impact_typed_name)"
+    IMPACT_CMD='uninstall.sh'
+    IMPACT_SELF="/srv/my folder/uninstall.sh"
+    assert_eq "'/srv/my folder/uninstall.sh'" "$(impact_typed_name)"
+}
+
+# Confirm with yes dry run and without terminal.
 test_confirm_with_yes_dry_run_and_without_terminal() {
     make_command asks <<'END'
 impact_parse_args 'dry-run yes' '' '' "$@"
@@ -551,6 +599,85 @@ END
     assert_output_not_contains 'Make the third change'
 }
 
+# Signals held around a step and its undo line (impact_signals_hold, as
+# impact-add-user does around useradd and the account record): a request to
+# end (TERM) to the command, and one to the program itself, arrive while the
+# step's program runs. The program ignores its signal and finishes
+# (impact_run_uninterrupted); the command stops at impact_signals_release.
+# The report then lists the step as done, with its undo line, and never as
+# "may have finished"; the step after the release does not run.
+test_held_signals_take_effect_after_the_step_and_its_undo_line() {
+    make_command holds <<'END'
+impact_parse_args 'dry-run' '' '' "$@"
+impact_signals_hold
+impact_do "Make the first change" impact_run_uninterrupted bash -c 'kill -TERM "$PPID"; kill -TERM "$$"; sleep 0.3; echo "program finished"'
+impact_undo "Undo the first change: sudo undo-it"
+impact_signals_release
+impact_do "Make the second change" true
+impact_summary
+END
+    run_cmd "$TEST_TMP/holds"
+    assert_status 143
+    assert_output_contains 'program finished'
+    assert_output_contains 'was interrupted (signal TERM)'
+    assert_output_contains 'These steps had already run:'
+    assert_output_contains '  + Make the first change'
+    assert_output_contains 'How to undo them:'
+    assert_output_contains 'Undo the first change: sudo undo-it'
+    assert_output_not_contains 'may have finished'
+    assert_output_not_contains 'Make the second change'
+}
+
+# Without a signal, impact_signals_release changes nothing: the command
+# goes on, and a signal after the release takes effect at once again.
+test_release_without_a_signal_lets_the_command_go_on() {
+    make_command holds-quietly <<'END'
+impact_parse_args 'dry-run' '' '' "$@"
+impact_signals_hold
+impact_do "Make the first change" true
+impact_signals_release
+impact_do "Make the second change" bash -c 'kill -TERM "$PPID"; sleep 0.2'
+impact_do "Make the third change" true
+impact_summary
+END
+    run_cmd "$TEST_TMP/holds-quietly"
+    assert_status 143
+    assert_output_contains '  + Make the first change'
+    assert_output_contains '  ? Make the second change'
+    assert_output_not_contains 'Make the third change'
+}
+
+# A signal while a shell function runs whose error channel goes into a file
+# ("step 2>file", as impact-get-repo does for git): bash applies such a
+# redirection in the command itself, so the end-of-command messages would
+# land in the file. The library writes them to its own copies of the
+# channels, so the reader sees the message, the steps and the result line.
+test_signal_during_a_redirected_function_reaches_the_reader() {
+    make_command redirected <<END
+impact_result_enable
+impact_parse_args '' '' '' "\$@"
+impact_mktemp_file
+error_file="\$IMPACT_TMP"
+echo "\$error_file" >"$TEST_TMP/error-file-path"
+works() {
+    echo "message of the tool" >&2
+    kill -TERM "\$\$"
+    sleep 0.2
+}
+run_step() {
+    works 2>"\$error_file"
+}
+impact_do "Make the change" run_step
+impact_summary
+END
+    run_cmd "$TEST_TMP/redirected"
+    assert_status 143
+    assert_output_contains 'was interrupted (signal TERM)'
+    assert_output_contains '  ? Make the change'
+    assert_output_not_contains 'message of the tool'
+    assert_matches "$(tail -n 1 <<<"$RUN_OUTPUT")" '^IMPACT_RESULT status=error code=143 path= reason=interrupted$'
+}
+
 # A question that --yes does not answer (the command sets IMPACT_ASSUME_YES
 # to 0 for it) names its own way out when no terminal is available, and
 # never tells the reader to add --yes, which was perhaps given already.
@@ -573,6 +700,7 @@ END
     assert_output_contains 'not confirmed'
 }
 
+# Confirm reads the answer from the terminal.
 test_confirm_reads_the_answer_from_the_terminal() {
     if ! command -v script >/dev/null 2>&1; then
         skip "the tool script (package bsdutils) is not installed"
@@ -596,6 +724,7 @@ END
     assert_contains "$output" 'not confirmed'
 }
 
+# Log is not written without root or in a dry run.
 test_log_is_not_written_without_root_or_in_a_dry_run() {
     make_command logs <<'END'
 impact_parse_args 'dry-run' '' '' "$@"
@@ -619,6 +748,7 @@ END
     fi
 }
 
+# impact_invoking_account takes SUDO_USER only when it names a real account.
 test_invoking_account() {
     load_library
     assert_eq "$(id -un)" "$(SUDO_USER='' impact_invoking_account)"
@@ -628,6 +758,7 @@ test_invoking_account() {
     assert_eq 'root' "$(SUDO_USER='root' impact_invoking_account)"
 }
 
+# Dir and file facts.
 test_dir_and_file_facts() {
     load_library
     local me group
@@ -660,6 +791,7 @@ test_dir_and_file_facts() {
     assert_fails impact_file_has_content "$TEST_TMP/missing" "$TEST_TMP/a"
 }
 
+# Changed and undo without impact do.
 test_changed_and_undo_without_impact_do() {
     make_command records <<'END'
 impact_parse_args 'dry-run' '' '' "$@"
@@ -674,6 +806,7 @@ END
     assert_output_contains '  - Start them again by hand'
 }
 
+# Require conf stops with exit code 3 on an unprepared machine.
 test_require_conf_stops_with_exit_code_3_on_an_unprepared_machine() {
     if [[ -e /etc/impact/impact.conf ]]; then
         skip "this machine has a settings file"

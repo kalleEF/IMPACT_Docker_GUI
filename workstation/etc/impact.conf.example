@@ -5,6 +5,10 @@
 # Format: one KEY=value per line. The value is everything after the first
 # "=". Write it without quotes. A comment needs its own line and starts
 # with "#". The file is read as text and is never executed.
+# Exact rules: UTF-8 text (a byte order mark at the start is allowed);
+# each line ends with LF or CR LF, and no other carriage return or zero
+# byte may appear; spaces and tabs around key and value are removed (they
+# are the only blanks); each key may appear only once.
 #
 # Change a value with the setup command, for example:
 #   sudo impact-workstation-setup --min-free-gb 300

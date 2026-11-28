@@ -55,6 +55,8 @@ all_hostile_refused() {
     done
 }
 
+# Account names: a lower-case letter first, at most 32 characters; digits
+# first, upper case, dots and hostile texts are refused.
 test_account_name() {
     local name
     for name in alice a alice-example alice_example a1 user-2_x abcdefghijklmnopqrstuvwxyz012345; do
@@ -67,6 +69,7 @@ test_account_name() {
     all_hostile_refused impact_valid_account_name
 }
 
+# Group names follow the rule of account names.
 test_group_name() {
     assert_success impact_valid_group_name impact
     assert_success impact_valid_group_name impact-test_2
@@ -75,6 +78,8 @@ test_group_name() {
     all_hostile_refused impact_valid_group_name
 }
 
+# GitHub names: 1 to 39 letters, digits, - and _, with a letter or digit at
+# both ends, in any case.
 test_github_name() {
     local name
     for name in alice alice-example Alice-Example a 1alice alice_corp a-b-c abcdefghijklmnopqrstuvwxyz0123456789abc; do
@@ -87,6 +92,8 @@ test_github_name() {
     all_hostile_refused impact_valid_github_name
 }
 
+# Model names: 1 to 80 characters, no dot or - at the start, no "/", and no
+# ending .partial.
 test_model_name() {
     local name
     for name in Example-Model IMPACTncd_Germany model.v2 1model a; do
@@ -101,6 +108,7 @@ test_model_name() {
     all_hostile_refused impact_valid_model_name
 }
 
+# Storage names: 1 to 40 characters, no dot at the start.
 test_storage_name() {
     assert_success impact_valid_storage_name Example
     assert_success impact_valid_storage_name Model_1.b-c
@@ -110,6 +118,8 @@ test_storage_name() {
     all_hostile_refused impact_valid_storage_name
 }
 
+# Absolute paths: only letters, digits and . _ / -; no "/" alone or at the
+# end, no "//", no "." or ".." part.
 test_abs_path() {
     local path
     for path in /mnt/disk_a/shared /srv/impact/models /a /a.b/c-d/e_f /home/alice/Repositories; do
@@ -125,6 +135,8 @@ test_abs_path() {
     assert_success impact_valid_abs_path /mnt/.hidden
 }
 
+# REPO_BASE: absolute after replacing %h and %u; unknown tokens, ".." and
+# blanks are refused.
 test_repo_base() {
     local value
     for value in '%h/Repositories' '%h/work/%u' '/srv/repos/%u' '/srv/repos' '%h'; do
@@ -136,6 +148,7 @@ test_repo_base() {
     done
 }
 
+# Repo base template expansion.
 test_repo_base_template_expansion() {
     assert_eq '/home/alice/Repositories' "$(impact_expand_repo_base_template '%h/Repositories' /home/alice alice)"
     assert_eq '/srv/repos/alice' "$(impact_expand_repo_base_template '/srv/repos/%u' /home/alice alice)"
@@ -144,6 +157,8 @@ test_repo_base_template_expansion() {
     assert_eq '/home/a&b/R' "$(impact_expand_repo_base_template '%h/R' '/home/a&b' x)"
 }
 
+# Branch names follow the safe subset of git's rules: no "..", "//", ".lock",
+# "HEAD", blanks or special characters.
 test_branch_name() {
     local name
     for name in main dev-v2.1 feature/new-inputs release_1 a 1.x; do
@@ -155,6 +170,7 @@ test_branch_name() {
     all_hostile_refused impact_valid_branch_name
 }
 
+# Whole number and port.
 test_whole_number_and_port() {
     assert_success impact_valid_whole_number 0 0 10
     assert_success impact_valid_whole_number 10 0 10
@@ -173,6 +189,7 @@ test_whole_number_and_port() {
     all_hostile_refused impact_valid_port
 }
 
+# User and group numbers for --uid and --gid: 1000 to 60000 only.
 test_user_number() {
     assert_success impact_valid_user_number 1000
     assert_success impact_valid_user_number 60000
@@ -182,6 +199,8 @@ test_user_number() {
     all_hostile_refused impact_valid_user_number
 }
 
+# MIN_GUI_VERSION: three numbers with dots (further cases, such as leading
+# zeros, are in vectors/settings-values.vectors).
 test_gui_version() {
     assert_success impact_valid_gui_version 2.1.0
     assert_success impact_valid_gui_version 10.20.30
@@ -192,6 +211,8 @@ test_gui_version() {
     all_hostile_refused impact_valid_gui_version
 }
 
+# Container name patterns: letters, digits, _ . - and the wildcards * and ?;
+# nothing else, and never empty.
 test_container_pattern() {
     assert_success impact_valid_container_pattern 'data_preparation_*'
     assert_success impact_valid_container_pattern 'prep-?.x'
@@ -200,6 +221,8 @@ test_container_pattern() {
     assert_fails impact_valid_container_pattern ''
 }
 
+# Contact texts: 1 to 80 characters (an accented letter counts as one), no
+# line breaks, tabs or other control characters.
 test_contact() {
     assert_success impact_valid_contact 'Alice Example (alice@example.org)'
     assert_success impact_valid_contact 'A'
@@ -217,6 +240,8 @@ test_contact() {
     assert_eq 'C' "$LC_ALL"
 }
 
+# Fingerprints: "SHA256:" and 43 characters; the old MD5 form and short texts
+# are refused.
 test_fingerprint_form() {
     assert_success impact_valid_fingerprint 'SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU'
     assert_fails impact_valid_fingerprint '+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU'
@@ -225,6 +250,7 @@ test_fingerprint_form() {
     all_hostile_refused impact_valid_fingerprint
 }
 
+# Github address ssh form.
 test_github_address_ssh_form() {
     assert_success impact_parse_github_address 'git@github.com:example-org/Example-Model.git'
     assert_eq 'example-org' "$IMPACT_GH_OWNER"
@@ -236,6 +262,7 @@ test_github_address_ssh_form() {
     assert_eq 'git@github.com:example-org/Example-Model.git' "$IMPACT_GH_SSH_URL"
 }
 
+# Github address https form.
 test_github_address_https_form() {
     local address
     for address in 'https://github.com/example-org/Example-Model' 'https://github.com/example-org/Example-Model.git' \
@@ -249,6 +276,8 @@ test_github_address_https_form() {
     assert_eq 'model_1.2' "$IMPACT_GH_REPO"
 }
 
+# Only the two GitHub address forms are accepted: other hosts, look-alike
+# hosts, user names and missing parts are refused.
 test_github_address_refusals() {
     local address
     for address in \
@@ -278,6 +307,7 @@ test_github_address_refusals() {
     done
 }
 
+# Repo url stored form.
 test_repo_url_stored_form() {
     assert_success impact_valid_repo_url 'git@github.com:example-org/Example-Model.git'
     # Only the exact stored form is valid in a model file.

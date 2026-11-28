@@ -26,7 +26,7 @@
 #
 # Examples
 #   sudo env IMPACT_TEST_DISPOSABLE=yes bash tests/workstation/scenario.sh
-#   Install from an unpacked delivery archive in place of the working copy:
+#   Install from an unpacked delivery archive (this tests the archive):
 #     sudo env IMPACT_TEST_DISPOSABLE=yes bash tests/workstation/scenario.sh \
 #          --from /root/impact-workstation-2.1.0
 #   Keep the state at the end, to look at it:
@@ -274,7 +274,7 @@ assert_check_block() {
 }
 
 # -----------------------------------------------------------------------------
-# The steps, in the order of the administrator's walk-through
+# The steps, in the order in which an administrator sets up a workstation
 # -----------------------------------------------------------------------------
 
 # Step: a clean machine with a stand-in administrator, test disks and an SSH
@@ -291,7 +291,7 @@ test_prepare_the_machine() {
     assert_success test -s "$TEST_SUITE_TMP/admin-ssh-before"
 }
 
-# Step: the first step of the walk-through. The health check runs from the
+# Step: the first thing an administrator runs. The health check runs from the
 # unpacked folder on the untouched machine, reports all 15 blocks, ends with
 # FAIL (nothing is set up) and changes nothing.
 test_health_check_on_the_untouched_machine() {

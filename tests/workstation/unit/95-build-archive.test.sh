@@ -55,6 +55,7 @@ expected_entries() {
     } | LC_ALL=C sort
 }
 
+# The archive holds exactly the delivered files.
 test_the_archive_holds_exactly_the_delivered_files() {
     run_cmd bash "$BUILD" --output-dir "$TEST_TMP"
     assert_status 0
@@ -68,6 +69,7 @@ test_the_archive_holds_exactly_the_delivered_files() {
     assert_not_contains "$(tar --list --gzip --file="$archive")" 'build-archive.sh'
 }
 
+# Owner and modes inside the archive.
 test_owner_and_modes_inside_the_archive() {
     run_cmd bash "$BUILD" --output-dir "$TEST_TMP"
     assert_status 0
@@ -86,6 +88,7 @@ test_owner_and_modes_inside_the_archive() {
     assert_ne 0 "$line" "the archive is not empty"
 }
 
+# Checksum file matches and two builds are equal.
 test_checksum_file_matches_and_two_builds_are_equal() {
     mkdir -p "$TEST_TMP/first" "$TEST_TMP/second"
     run_cmd bash "$BUILD" --output-dir "$TEST_TMP/first"
@@ -103,6 +106,7 @@ test_checksum_file_matches_and_two_builds_are_equal() {
     assert_contains "$(bash "$BUILD" --output-dir "$TEST_TMP/first")" "$(cut -d' ' -f1 "$TEST_TMP/first/$name.sha256")"
 }
 
+# The unpacked archive passes the checks of install.
 test_the_unpacked_archive_passes_the_checks_of_install() {
     run_cmd bash "$BUILD" --output-dir "$TEST_TMP"
     assert_status 0
@@ -119,6 +123,7 @@ test_the_unpacked_archive_passes_the_checks_of_install() {
     assert_success cmp -s "$WORKSTATION_DIR/lib/impact-common.sh" "$folder/lib/impact-common.sh"
 }
 
+# Wrong usage is refused.
 test_wrong_usage_is_refused() {
     run_cmd bash "$BUILD" --no-such-option
     assert_status 2
