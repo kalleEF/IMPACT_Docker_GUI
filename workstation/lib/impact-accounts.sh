@@ -56,6 +56,20 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   < <(command)  <(command)   hand the output of a command to a loop, to
+#                        mapfile or to another program as if it were a file
+#                        ("process substitution")
+#   <<<"$text"           hand a text to a command as its input ("here-string")
+#   declare -A NAME  local -A NAME   a list whose entries are found by a name
+#                        (an "associative array"): NAME[key]=value, "${NAME[key]}"
+#   IFS=: read -r A B    split one line at the character after "IFS=" (here
+#                        ":") into the variables A and B; with -a LIST into a list
+#   while IFS= read -r line   read input line by line, exactly as written:
+#                        "IFS=" keeps blanks at both ends, -r keeps backslashes
+#   "${NAME:0:10}"       a part of the text: from position 0, 10 characters
+#   "${NAME,,}"          the text in lower case
+#   shopt -s nullglob    a file pattern (*.conf) without a match gives an empty
+#                        list; "shopt -u" switches this off again
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -356,7 +370,7 @@ impact_repo_base_create() {
 #   ACCOUNT=alice
 #   GITHUB_NAME=alice-example        (always stored in lower case)
 #   USER_NUMBER=1005
-#   STATE=enrolled                   (or: removed)
+#   STATE=enrolled                   (or: enrolling, removed)
 #   CHANGED=2026-01-31T14:05:09Z     (time of the last change, UTC)
 # A command may add lines with keys of its own; the writer keeps them.
 
@@ -393,7 +407,11 @@ impact__account_record_header() {
 
 # impact_account_record_write ACCOUNT GITHUB_NAME STATE
 #   Writes or updates the record of ACCOUNT in one step (mode 600, owner
-#   root). STATE is "enrolled" or "removed". The GitHub name is stored in
+#   root). STATE is "enrolled", "enrolling" or "removed". "enrolling" marks
+#   an account that impact-add-user created and whose enrolment is not
+#   finished yet (for example because the run was interrupted): a second
+#   run of impact-add-user continues it, and impact-remove-user can close
+#   it. The GitHub name is stored in
 #   lower case, the user number is read from the account, and the time of
 #   the change is set to now. Lines with other keys in an existing record
 #   are kept. Needs root rights; the account must exist.
@@ -414,8 +432,8 @@ impact_account_record_write() {
         impact_error "'$(impact_display "$github_name")' is no valid GitHub name."
         return 1
     fi
-    if [[ "$state" != 'enrolled' && "$state" != 'removed' ]]; then
-        impact_error "The state of an account record must be 'enrolled' or 'removed'."
+    if [[ "$state" != 'enrolled' && "$state" != 'enrolling' && "$state" != 'removed' ]]; then
+        impact_error "The state of an account record must be 'enrolled', 'enrolling' or 'removed'."
         return 1
     fi
     values=(
@@ -476,8 +494,8 @@ impact_account_record_load() {
         if ! [[ "${parsed[USER_NUMBER]}" =~ ^[0-9]{1,10}$ ]]; then
             IMPACT_ACCOUNT_RECORD_ERRORS+=("USER_NUMBER in $file is no number.")
         fi
-        if [[ "${parsed[STATE]}" != 'enrolled' && "${parsed[STATE]}" != 'removed' ]]; then
-            IMPACT_ACCOUNT_RECORD_ERRORS+=("STATE in $file is neither enrolled nor removed.")
+        if [[ "${parsed[STATE]}" != 'enrolled' && "${parsed[STATE]}" != 'enrolling' && "${parsed[STATE]}" != 'removed' ]]; then
+            IMPACT_ACCOUNT_RECORD_ERRORS+=("STATE in $file is none of enrolled, enrolling and removed.")
         fi
         if ! [[ "${parsed[CHANGED]}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
             IMPACT_ACCOUNT_RECORD_ERRORS+=("CHANGED in $file is no time such as 2026-01-31T14:05:09Z.")

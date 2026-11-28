@@ -63,6 +63,17 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   mapfile -t LIST <FILE     read the lines of FILE into the list LIST, one
+#                        entry per line (-t drops the line ends)
+#   < <(command)  <(command)   hand the output of a command to a loop, to
+#                        mapfile or to another program as if it were a file
+#                        ("process substitution")
+#   while IFS= read -r line   read input line by line, exactly as written:
+#                        "IFS=" keeps blanks at both ends, -r keeps backslashes
+#   command || true      accept a failure of this command ("set -e" would
+#                        otherwise stop the script there)
+#   shopt -s nullglob    a file pattern (*.conf) without a match gives an empty
+#                        list; "shopt -u" switches this off again
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 

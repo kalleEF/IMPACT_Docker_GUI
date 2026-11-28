@@ -63,6 +63,15 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   mapfile -t LIST <FILE     read the lines of FILE into the list LIST, one
+#                        entry per line (-t drops the line ends)
+#   < <(command)  <(command)   hand the output of a command to a loop, to
+#                        mapfile or to another program as if it were a file
+#                        ("process substitution")
+#   IFS=: read -r A B    split one line at the character after "IFS=" (here
+#                        ":") into the variables A and B; with -a LIST into a list
+#   while IFS= read -r line   read input line by line, exactly as written:
+#                        "IFS=" keeps blanks at both ends, -r keeps backslashes
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -114,6 +123,7 @@ account_state() {
         enrolled:1) printf 'enrolled, but the account has expired: no login possible\n' ;;
         removed:1) printf 'removed (account closed, user number kept)\n' ;;
         removed:0) printf 'removed, but the account has not expired: run impact-remove-user again\n' ;;
+        enrolling:*) printf 'enrolment not finished (impact-add-user stopped early): run the same impact-add-user command again, or close the account with impact-remove-user\n' ;;
         *) printf '%s\n' "$2" ;;
     esac
 }
@@ -176,7 +186,7 @@ show_account() {
         return 0
     fi
     state="${IMPACT_ACCOUNT_RECORD[STATE]}"
-    if [[ "$state" == 'enrolled' ]]; then
+    if [[ "$state" == 'enrolled' || "$state" == 'enrolling' ]]; then
         COUNT_ENROLLED=$((COUNT_ENROLLED + 1))
     else
         COUNT_REMOVED=$((COUNT_REMOVED + 1))

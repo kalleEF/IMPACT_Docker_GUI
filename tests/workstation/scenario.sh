@@ -101,6 +101,11 @@
 #                        process number
 #   ( ... )              run the commands inside in a copy of the script: a
 #                        step that fails ends only its copy
+#   $'\t'  $'\r'  $'\n'   a text with a special character: tab, carriage return,
+#                        new line (\xNN is the byte NN)
+#   command || true      accept a failure of this command ("set -e" would
+#                        otherwise stop the script there)
+#   2>&1                 send the error channel to the same place as the output
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 

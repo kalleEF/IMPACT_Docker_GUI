@@ -80,6 +80,15 @@
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
 #   trap 'command' EXIT  run the command when the script ends, for any reason
+#   while IFS= read -r line   read input line by line, exactly as written:
+#                        "IFS=" keeps blanks at both ends, -r keeps backslashes
+#   $'\t'  $'\r'  $'\n'   a text with a special character: tab, carriage return,
+#                        new line (\xNN is the byte NN)
+#   command || true      accept a failure of this command ("set -e" would
+#                        otherwise stop the script there)
+#   2>&1                 send the error channel to the same place as the output
+#   shopt -s nullglob    a file pattern (*.conf) without a match gives an empty
+#                        list; "shopt -u" switches this off again
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 

@@ -65,11 +65,23 @@
 #   rules file and the previous settings file are put back.
 #
 # How to undo
-#   SSH rules:      sudo impact-workstation-setup --remove-ssh-rules
-#   Settings file:  set the old value again with the same option, or remove
-#                   /etc/impact/impact.conf
-#   Group:          sudo groupdel <group>   (after its members were removed)
-#   The command prints the matching lines at its end.
+#   The command prints the matching lines at its end, in an order that works
+#   from top to bottom: the SSH rules first, the group last.
+#   After the first run:
+#     SSH rules:      sudo impact-workstation-setup --remove-ssh-rules
+#     Settings file:  sudo rm /etc/impact/impact.conf
+#     Folders:        sudo rmdir <folder>   (while it is empty)
+#     Group:          sudo groupdel <group>   (after its members and the
+#                     folders that use it were removed)
+#   After a later run that changed values: one command that sets the
+#   previous values again, for example
+#     sudo impact-workstation-setup --port-max 8830
+#   It writes the SSH rules for these values again. Removing the rules in
+#   this case would leave the members without any SSH restriction.
+#   When a run is stopped by force (for example "kill -9") during the SSH
+#   step, the note /opt/impact/admin/ssh-rules-pending stays. The next run
+#   puts the previous rules file back first and repeats the change with all
+#   checks; impact-check warns while the note exists.
 #
 # Exit codes
 #   0 done or nothing to do; 1 a check or a step failed; 2 wrong usage;
@@ -102,6 +114,13 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   declare -A NAME  local -A NAME   a list whose entries are found by a name
+#                        (an "associative array"): NAME[key]=value, "${NAME[key]}"
+#   while IFS= read -r line   read input line by line, exactly as written:
+#                        "IFS=" keeps blanks at both ends, -r keeps backslashes
+#   "${!LIST[@]}"        the positions (or the names) of the entries of a list
+#   shopt -s nullglob    a file pattern (*.conf) without a match gives an empty
+#                        list; "shopt -u" switches this off again
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -142,6 +161,7 @@ declare -A OPTION_KEY=(
 SETTINGS_PENDING=0     # 1 while a new settings file waits for the SSH step
 SETTINGS_BACKUP=''     # copy of the previous settings file ('' = there was none)
 SETTINGS_TEXT=''       # the step text of the settings file, for the summary
+SETTINGS_UNDO=''       # the undo line of the settings file, for the summary
 declare -A OLD=()      # the values of the existing settings file
 declare -A NEW=()      # the values this run will write
 FIRST_RUN=0            # 1 when no settings file exists yet
@@ -532,17 +552,64 @@ create_group() {
     fi
 }
 
-# ensure_dir PATH MODE OWNER GROUP TEXT
+# ensure_dir PATH MODE OWNER GROUP TEXT [UNDO]
 #   Creates one folder, corrects owner, group and mode of an existing one, or
 #   says that it is in order. The folder's content is never touched.
+#   With UNDO "undo", the matching line for "How to undo" is added: remove
+#   the new folder while it is empty, or set the previous owner, group and
+#   mode again.
 ensure_dir() {
+    local old_facts
     if impact_dir_is "$1" "$2" "$3" "$4"; then
         impact_ok "$1 is in order."
     elif [[ -d "$1" && ! -L "$1" ]]; then
+        # %U owner, %G group, %a mode (as an octal number) of the folder.
+        old_facts="$(stat -c '%U %G %a' -- "$1")"
         impact_do "Correct the folder $1 ($5) to owner $3, group $4, mode $2" impact_make_dir "$1" "$2" "$3" "$4"
+        if [[ "${6:-}" == 'undo' ]]; then
+            # "read -r A B C <<<text" splits the three facts into A, B and C.
+            local old_owner old_group old_mode
+            read -r old_owner old_group old_mode <<<"$old_facts"
+            impact_undo "Set the previous owner, group and mode of $1 again: sudo chown $old_owner:$old_group $1 && sudo chmod $old_mode $1"
+        fi
     else
         impact_do "Create the folder $1 ($5; owner $3, group $4, mode $2)" impact_make_dir "$1" "$2" "$3" "$4"
+        if [[ "${6:-}" == 'undo' ]]; then
+            impact_undo "Remove the folder $1 while it is empty: sudo rmdir $1"
+        fi
     fi
+}
+
+# shell_word TEXT
+#   Prints TEXT as one word that can be typed after a command: unchanged when
+#   it holds only safe characters, otherwise inside single quotes (a single
+#   quote within the text is written as '\'' there). An empty text becomes ''.
+shell_word() {
+    local text="$1" quote="'"
+    if [[ "$text" =~ ^[A-Za-z0-9_.,/%:@+=-]+$ ]]; then
+        printf '%s' "$text"
+    else
+        # "${text//$quote/...}" replaces every single quote in the text.
+        printf "'%s'" "${text//$quote/$quote\\$quote$quote}"
+    fi
+}
+
+# settings_undo_command
+#   Prints the one command that puts every changed value of the settings
+#   file back, for example: sudo impact-workstation-setup --port-max 8830
+#   That command also writes the SSH rules for these values again.
+settings_undo_command() {
+    local option key command='sudo impact-workstation-setup'
+    # The options are walked in a fixed order, so the line is always the
+    # same for the same change.
+    for option in shared-roots admin-contact deputy-contact access-mode repo-base model-dir shared-group \
+        min-free-gb port-min port-max known-direct-containers min-gui-version; do
+        key="${OPTION_KEY[$option]}"
+        if [[ "${OLD[$key]}" != "${NEW[$key]}" ]]; then
+            command+=" --$option $(shell_word "${OLD[$key]}")"
+        fi
+    done
+    printf '%s\n' "$command"
 }
 
 # member_can_enter FOLDER
@@ -641,7 +708,7 @@ restore_settings_if_unconfirmed() {
     IMPACT_CHANGES=("${kept[@]}")
     kept=()
     for text in "${IMPACT_UNDO[@]}"; do
-        if [[ "$text" != *"$IMPACT_CONF_FILE"* && "$text" != 'Set '*' back to its previous value '* ]]; then
+        if [[ "$text" != "$SETTINGS_UNDO" ]]; then
             kept+=("$text")
         fi
     done
@@ -680,6 +747,11 @@ fi
 # The steps of a normal run
 # -----------------------------------------------------------------------------
 
+# Undo works backwards: the last change is undone first. So the SSH rules
+# come first in "How to undo", and the group comes last, after every folder
+# that uses it.
+impact_undo_newest_first
+
 impact_step "Read the current settings and the options"
 read_settings_and_options
 check_input_rules
@@ -708,21 +780,21 @@ else
     else
         impact_do "Create the group '$GROUP' (the system chooses a free number from 1000 on)" create_group
     fi
-    impact_undo "Remove the group while it has no members: sudo groupdel $GROUP"
+    impact_undo "Remove the group while it has no members (after the folders above): sudo groupdel $GROUP"
     if ((IMPACT_DRY_RUN == 0)); then
-        impact_info "The group '$GROUP' has the number $(impact_group_gid "$GROUP"). Note it in the site record; a rebuilt workstation needs it (--gid)."
+        impact_info "The group '$GROUP' has the number $(impact_group_gid "$GROUP"). Write this number down with your notes about this workstation; a rebuilt workstation needs it (--gid)."
     fi
 fi
 
 impact_step "Folders"
-ensure_dir "$IMPACT_CONF_DIR" 755 root root 'settings'
+ensure_dir "$IMPACT_CONF_DIR" 755 root root 'settings' undo
 ensure_dir "$IMPACT_ADMIN_DIR" 700 root root 'administrator files, readable by root only'
 ensure_dir "$IMPACT_LOG_DIR" 700 root root 'the log of the commands'
 ensure_dir "$IMPACT_KEYS_DIR" 700 root root 'received and removed public keys'
 ensure_dir "$IMPACT_ACCOUNTS_DIR" 700 root root 'records of the enrolled accounts'
 ensure_dir "$IMPACT_ACL_BACKUP_DIR" 700 root root 'saved access rights of the shared storage'
 ensure_dir "$IMPACT_STATE_DIR" 700 root root 'exported states for a rebuild'
-ensure_dir "${NEW[MODEL_DIR]}" 2750 root "$GROUP" 'one subfolder per model; members may read'
+ensure_dir "${NEW[MODEL_DIR]}" 2750 root "$GROUP" 'one subfolder per model; members may read' undo
 setup_storage_roots
 
 impact_step "Settings file $IMPACT_CONF_FILE"
@@ -731,13 +803,15 @@ if impact_conf_needs_write "$IMPACT_CONF_FILE" NEW; then
     impact_on_exit restore_settings_if_unconfirmed
     impact_do "$SETTINGS_TEXT" write_settings
     if ((FIRST_RUN == 1)); then
-        impact_undo "Remove the settings file: sudo rm $IMPACT_CONF_FILE"
+        SETTINGS_UNDO="Remove the settings file: sudo rm $IMPACT_CONF_FILE"
+    elif [[ "$(settings_undo_command)" != 'sudo impact-workstation-setup' ]]; then
+        SETTINGS_UNDO="Put the previous settings back (this also writes the SSH rules for them again): $(settings_undo_command)"
     else
-        for key in "${IMPACT_CONF_KEYS[@]}"; do
-            if [[ "${OLD[$key]}" != "${NEW[$key]}" ]]; then
-                impact_undo "Set $key back to its previous value '${OLD[$key]}' with the matching option of this command."
-            fi
-        done
+        # Only comments or the order of lines differ: nothing to set back.
+        SETTINGS_UNDO=''
+    fi
+    if [[ -n "$SETTINGS_UNDO" ]]; then
+        impact_undo "$SETTINGS_UNDO"
     fi
 else
     impact_ok "The settings file already holds these values."

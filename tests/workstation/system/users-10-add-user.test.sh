@@ -64,12 +64,12 @@ suite_setup() {
     sys_sshd_start
     sys_setup
     local name
-    for name in alice alice2 carol dave erin1 erin2 bob frank gina; do
+    for name in alice alice2 carol dave erin1 erin2 bob frank gina henry ivan; do
         sys_keypair "$name"
     done
     # A key of another type, for the refusal test.
     ssh-keygen -q -t rsa -b 2048 -N '' -C 'rsa@example-pc' -f "$TEST_SUITE_TMP/keys/rsa"
-    for name in "$ACC" bob carol dave erin-example frank gina hacker; do
+    for name in "$ACC" bob carol dave erin-example frank gina hacker henry ivan julia-example u1alice; do
         sys_register_account "$name"
     done
 }
@@ -264,9 +264,14 @@ test_names_that_conflict_are_refused_before_any_change() {
     # A GitHub name that is the name of an existing group.
     refused_without_change 4 sys_as_admin "$ADD" docker --key-file "$(pub alice)"
     assert_output_contains '--account'
-    # A GitHub name that cannot be a Linux name.
+    # A GitHub name that cannot be a Linux name. The suggested account name
+    # follows the rules (a letter first, at most 32 characters).
     refused_without_change 2 sys_as_admin "$ADD" 1Alice-Example --key-file "$(pub alice)"
-    assert_output_contains '--account'
+    assert_output_contains 'for example --account u1alice-example'
+    refused_without_change 2 sys_as_admin "$ADD" 1alice --key-file "$(pub alice)"
+    assert_output_contains 'for example --account u1alice.'
+    refused_without_change 2 sys_as_admin "$ADD" "1$(printf 'a%.0s' {1..37})" --key-file "$(pub alice)"
+    assert_output_contains "for example --account u1$(printf 'a%.0s' {1..30})."
     # The home folder of a new account exists already.
     mkdir /home/erin-example
     refused_without_change 4 sys_as_admin "$ADD" erin-example --key-file "$(pub erin1)"
@@ -313,6 +318,10 @@ test_the_fingerprint_must_be_confirmed() {
     # terminal to ask on.
     refused_without_change 1 sys_as_admin "$ADD" "$GH" --key-file "$(pub alice)" --yes
     assert_output_contains 'fingerprint of the key was not confirmed'
+    # The hint names the option that answers this question, and does not
+    # send the administrator to --yes, which was given.
+    assert_output_contains 'or add --fingerprint <the fingerprint the person sent>'
+    assert_output_not_contains 'add the option --yes after checking'
     # A fingerprint that belongs to another key.
     refused_without_change 1 sys_as_admin "$ADD" "$GH" --key-file "$(pub alice)" --fingerprint "$(print_of alice2)"
     assert_output_contains "has the fingerprint $(print_of alice2)"
@@ -605,4 +614,84 @@ test_the_user_number_can_be_given() {
     snapshot_unchanged_by --content --exclude /opt/impact/admin/log "${WATCHED[@]}" -- \
         sys_as_admin "$ADD" gina --uid "$number" --key-file "$(pub gina)" --fingerprint "$(print_of gina)"
     assert_status 0
+}
+
+# ----------------------------------------------------------------------------
+# An SSH setting that overrides the rules, and an enrolment that continues
+# ----------------------------------------------------------------------------
+
+# A file that sshd reads before 60-impact.conf gives the new account free
+# forwarding. The command must notice it (sshd -T) before the login key is
+# installed, name that file, and stop: the account then has no key and
+# cannot log in. The account record says "enrolling", so the same command
+# continues later without --existing, and impact-remove-user accepts the
+# account in the meantime.
+test_ssh_rules_that_do_not_apply_stop_before_the_key() {
+    printf 'Match User henry\n    AllowTcpForwarding yes\n    PermitOpen any\n' >/etc/ssh/sshd_config.d/10-test-site.conf
+    run_cmd sys_as_admin "$ADD" henry --key-file "$(pub henry)" --fingerprint "$(print_of henry)"
+    assert_status 1
+    assert_output_contains "The SSH rules do not apply to 'henry' as expected"
+    assert_output_contains 'No login key was installed, so the account cannot log in yet.'
+    assert_output_contains '/etc/ssh/sshd_config.d/10-test-site.conf'
+    assert_output_contains 'allowtcpforwarding: expected "local", effective "yes"'
+    assert_output_not_contains 'Install the key'
+    assert_missing /home/henry/.ssh/authorized_keys
+    assert_file_contains /opt/impact/admin/accounts/henry.conf 'STATE=enrolling'
+    # The partial summary names one undo line that works for this state.
+    assert_output_contains 'sudo impact-remove-user henry'
+    assert_output_not_contains 'gpasswd'
+    # The list of accounts shows the unfinished enrolment; impact-key
+    # refuses the account until the enrolment is finished.
+    run_cmd sys_as_admin impact-list-users
+    assert_output_contains 'enrolment not finished'
+    run_cmd sys_as_admin impact-key add henry --key-file "$(pub henry)" --fingerprint "$(print_of henry)"
+    assert_status 4
+    assert_output_contains 'is not finished'
+    # impact-remove-user accepts the account (dry run here; it ends with 1
+    # only because no Docker daemon answers in this file).
+    run_cmd sys_as_admin impact-remove-user henry --dry-run
+    assert_output_contains "record state 'enrolling'"
+    assert_output_contains "[dry run] Set the account 'henry' to expired"
+    # After the cause is fixed, the same command continues the enrolment.
+    rm -f /etc/ssh/sshd_config.d/10-test-site.conf
+    run_cmd sys_as_admin "$ADD" henry --key-file "$(pub henry)" --fingerprint "$(print_of henry)"
+    assert_status 0
+    assert_output_contains 'this run continues the enrolment'
+    assert_output_contains "sshd -T: 'henry' gets the restricted values"
+    assert_output_contains 'Install the key'
+    assert_file_contains /opt/impact/admin/accounts/henry.conf 'STATE=enrolled'
+    run_cmd sys_ssh_key henry henry id -un
+    assert_status 0
+    assert_eq 'henry' "$RUN_OUTPUT"
+}
+
+# For an account that the command created, "How to undo" names one command,
+# impact-remove-user, which takes the account out of the groups and moves the
+# key away as well. Separate lines for these steps would fail after it.
+# Followed literally (with --yes in place of the answer on the terminal),
+# it closes the account.
+test_undo_of_a_new_account_is_one_working_command() {
+    run_cmd sys_as_admin "$ADD" ivan --key-file "$(pub ivan)" --fingerprint "$(print_of ivan)"
+    assert_status 0
+    local undo
+    undo="$(sed -n -e '/^How to undo:$/,/^[^ ]/p' <<<"$RUN_OUTPUT" | grep '^  - ' || true)"
+    assert_eq 1 "$(printf '%s\n' "$undo" | grep -c .)" "number of undo lines"
+    assert_contains "$undo" ': sudo impact-remove-user ivan'
+    assert_not_contains "$undo" 'gpasswd'
+    assert_not_contains "$undo" 'impact-key remove'
+    # (Exit code 1 only because no Docker daemon answers in this file; every
+    # other step runs.)
+    run_cmd sys_as_admin impact-remove-user ivan --yes
+    assert_output_contains "Note the state 'removed'"
+    assert_file_contains /opt/impact/admin/accounts/ivan.conf 'STATE=removed'
+    run_cmd sys_ssh_key ivan ivan id -un
+    assert_status 255
+}
+
+# One key pair belongs to one person: the key of an enrolled colleague is
+# refused for another account (exit code 4), before anything changes.
+test_the_key_of_another_account_is_refused() {
+    refused_without_change 4 sys_as_admin "$ADD" julia-example --key-file "$(pub alice)" --fingerprint "$(print_of alice)"
+    assert_output_contains "is a login key of the account $ACC already"
+    assert_fails getent passwd julia-example
 }

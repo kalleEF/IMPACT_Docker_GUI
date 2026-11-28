@@ -70,7 +70,8 @@
 #   0 done, or nothing to do; 1 a check or a step failed, or the fingerprint
 #   was not confirmed; 2 wrong usage, or a key line that is not accepted;
 #   3 the workstation is not prepared; 4 the account is not enrolled, or the
-#   request conflicts with its keys; 5 GitHub has no account of that name;
+#   request conflicts with its keys (also: the new key is a login key of
+#   another account); 5 GitHub has no account of that name;
 #   6 GitHub could not be reached.
 # =============================================================================
 
@@ -99,6 +100,13 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   < <(command)  <(command)   hand the output of a command to a loop, to
+#                        mapfile or to another program as if it were a file
+#                        ("process substitution")
+#   IFS=: read -r A B    split one line at the character after "IFS=" (here
+#                        ":") into the variables A and B; with -a LIST into a list
+#   command || true      accept a failure of this command ("set -e" would
+#                        otherwise stop the script there)
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -229,6 +237,10 @@ check_account() {
         if [[ "$state" == 'removed' ]]; then
             impact_die "$IMPACT_EXIT_CONFLICT" "The account '$ACCOUNT' was removed with impact-remove-user." \
                 "Bring the person back with the line that impact-remove-user printed (sudo impact-add-user ... --existing)."
+        fi
+        if [[ "$state" == 'enrolling' ]]; then
+            impact_die "$IMPACT_EXIT_CONFLICT" "The enrolment of '$ACCOUNT' is not finished (impact-add-user stopped early), so the SSH restrictions of the account are not confirmed yet." \
+                "Run the same impact-add-user command again to finish it, or close the account: sudo impact-remove-user $ACCOUNT"
         fi
         if ! impact_users_check_changeable "$ACCOUNT"; then
             impact_die "$IMPACT_EXIT_CONFLICT" "$IMPACT_USERS_REASON" "Choose the account of the colleague."
@@ -405,6 +417,14 @@ get_new_key() {
         NEW_PRESENT=1
     fi
     impact_log_note "new key fingerprint: $NEW_PRINT (from $IMPACT_USERS_KEY_SOURCE)"
+    # One key pair belongs to one person: a key that is a login key of
+    # another account would let that person log in here as well.
+    local owners
+    owners="$(impact_users_fingerprint_owners "$NEW_PRINT" "$ACCOUNT" | tr '\n' ' ')"
+    if [[ -n "${owners// /}" ]]; then
+        impact_die "$IMPACT_EXIT_CONFLICT" "The key $NEW_PRINT is a login key of the account ${owners% } already. One key pair belongs to one person, so the same key is never installed for two accounts." \
+            "Check that you took the public key of the right person (compare the fingerprint with the one the person sent)."
+    fi
 }
 
 # save_received
@@ -494,6 +514,10 @@ case "$ACTION" in
         COUNT="$(impact_users_count_keys "$IMPACT_USERS_AK_TEXT")"
         get_new_key
         OLD_PRINT=''
+        # DONE_EARLIER: 1 when an earlier run replaced the key already. That
+        # run may have stopped before its last steps (the key copy for git,
+        # the reminder about GitHub), so these steps run again.
+        DONE_EARLIER=0
         if impact_opt_given old-fingerprint; then
             OLD_PRINT="$(impact_opt old-fingerprint)"
             if [[ "$OLD_PRINT" == "$NEW_PRINT" ]]; then
@@ -501,16 +525,14 @@ case "$ACTION" in
             fi
             if ! impact_users_text_has_fingerprint "$IMPACT_USERS_AK_TEXT" "$OLD_PRINT"; then
                 if ((NEW_PRESENT == 1)); then
+                    impact_ok "The key $OLD_PRINT is no login key of '$ACCOUNT' any more, and the new key $NEW_PRINT is one: the replacement was done earlier. The last steps are checked again."
+                    DONE_EARLIER=1
+                else
                     impact_step "Login keys of '$ACCOUNT'"
                     print_keys
-                    impact_summary
-                    impact_say "The key $OLD_PRINT is no login key of '$ACCOUNT' any more, and the new key $NEW_PRINT is one: the replacement was done earlier."
-                    exit "$IMPACT_EXIT_OK"
+                    impact_die "$IMPACT_EXIT_CONFLICT" "No login key of '$ACCOUNT' has the fingerprint $OLD_PRINT (see the list above)." \
+                        "Give the fingerprint of the key to replace with --old-fingerprint, or add the new key with: sudo impact-key add $ACCOUNT ..."
                 fi
-                impact_step "Login keys of '$ACCOUNT'"
-                print_keys
-                impact_die "$IMPACT_EXIT_CONFLICT" "No login key of '$ACCOUNT' has the fingerprint $OLD_PRINT (see the list above)." \
-                    "Give the fingerprint of the key to replace with --old-fingerprint, or add the new key with: sudo impact-key add $ACCOUNT ..."
             fi
         else
             if ((COUNT == 0)); then
@@ -524,42 +546,45 @@ case "$ACTION" in
             fi
             OLD_PRINT="$(impact_users_key_entries "$IMPACT_USERS_AK_TEXT" | cut -d'|' -f2)"
             if [[ "$OLD_PRINT" == "$NEW_PRINT" ]]; then
-                impact_step "Login keys of '$ACCOUNT'"
-                print_keys
-                impact_summary
-                impact_say "The only login key of '$ACCOUNT' is the new key $NEW_PRINT already: the replacement was done earlier."
-                exit "$IMPACT_EXIT_OK"
-            fi
-            if [[ "$OLD_PRINT" == '?' ]]; then
+                impact_ok "The only login key of '$ACCOUNT' is the new key $NEW_PRINT already: the replacement was done earlier. The last steps are checked again."
+                # The old key is not known any more.
+                OLD_PRINT=''
+                DONE_EARLIER=1
+            elif [[ "$OLD_PRINT" == '?' ]]; then
                 impact_die "$IMPACT_EXIT_FAILED" "The only line of the login keys of '$ACCOUNT' holds no readable key." \
                     "Look at it: sudo impact-key list $ACCOUNT"
             fi
         fi
-        impact_log_note "old key fingerprint: $OLD_PRINT"
-        OLD_BLOB="$(blob_of_fingerprint "$OLD_PRINT")"
+        NEW_TEXT="$IMPACT_USERS_AK_TEXT"
+        if ((DONE_EARLIER == 0)); then
+            impact_log_note "old key fingerprint: $OLD_PRINT"
+            OLD_BLOB="$(blob_of_fingerprint "$OLD_PRINT")"
 
-        impact_step "Confirmation"
-        impact_info "Old key: $OLD_PRINT"
-        if ((NEW_PRESENT == 1)); then
-            impact_ok "The new key $NEW_PRINT is a login key of '$ACCOUNT' already; nothing to confirm."
-        else
-            impact_users_confirm_key "$GITHUB"
-        fi
+            impact_step "Confirmation"
+            impact_info "Old key: $OLD_PRINT"
+            if ((NEW_PRESENT == 1)); then
+                impact_ok "The new key $NEW_PRINT is a login key of '$ACCOUNT' already; nothing to confirm."
+            else
+                impact_users_confirm_key "$GITHUB"
+            fi
 
-        impact_step "Replace the key"
-        archive_lines "$OLD_PRINT"
-        NEW_TEXT="$(impact_users_text_without_fingerprint "$IMPACT_USERS_AK_TEXT" "$OLD_PRINT")"
-        if ((NEW_PRESENT == 0)); then
-            NEW_TEXT="$(impact_users_text_with_line "$NEW_TEXT" "$NEW_LINE")"
-        fi
-        install_text "$NEW_TEXT" \
-            "Replace the login key $OLD_PRINT of '$ACCOUNT' by $NEW_PRINT ($HOME_DIR/.ssh/authorized_keys, written with the rights of '$ACCOUNT')"
-        if [[ -n "$OLD_BLOB" ]]; then
-            impact_undo "Put the old key back: sudo impact-key replace $ACCOUNT --old-fingerprint $NEW_PRINT --key-file $ARCHIVE_DIR/key-1.pub --fingerprint $OLD_PRINT"
-        else
-            impact_undo "The old line is kept in $ARCHIVE_DIR; put it back by hand if it is needed."
+            impact_step "Replace the key"
+            archive_lines "$OLD_PRINT"
+            NEW_TEXT="$(impact_users_text_without_fingerprint "$IMPACT_USERS_AK_TEXT" "$OLD_PRINT")"
+            if ((NEW_PRESENT == 0)); then
+                NEW_TEXT="$(impact_users_text_with_line "$NEW_TEXT" "$NEW_LINE")"
+            fi
+            install_text "$NEW_TEXT" \
+                "Replace the login key $OLD_PRINT of '$ACCOUNT' by $NEW_PRINT ($HOME_DIR/.ssh/authorized_keys, written with the rights of '$ACCOUNT')"
+            if [[ -n "$OLD_BLOB" ]]; then
+                impact_undo "Put the old key back: sudo impact-key replace $ACCOUNT --old-fingerprint $NEW_PRINT --key-file $ARCHIVE_DIR/key-1.pub --fingerprint $OLD_PRINT"
+            else
+                impact_undo "The old line is kept in $ARCHIVE_DIR; put it back by hand if it is needed."
+            fi
         fi
         save_received
+        # A key copy whose key is no login key any more is deleted, also
+        # when an earlier run replaced the key and stopped before this step.
         impact_step "Key copy for git"
         handle_key_copy "$NEW_TEXT"
         ;;
@@ -574,9 +599,17 @@ else
 fi
 
 impact_summary
+# The reminder about GitHub is printed after every replacement, also on a
+# run that finds the replacement done: the earlier run may have stopped
+# before it printed the reminder.
 if [[ "$ACTION" == 'replace' ]]; then
     impact_say ''
-    impact_say "Important: the old key $OLD_PRINT also opens the person's GitHub account until it is deleted there."
-    impact_say "Ask $GITHUB to delete it on GitHub: github.com, Settings, SSH and GPG keys, the key with the fingerprint $OLD_PRINT."
+    if [[ -n "$OLD_PRINT" ]]; then
+        impact_say "Important: the old key $OLD_PRINT also opens the person's GitHub account until it is deleted there."
+        impact_say "Ask $GITHUB to delete it on GitHub: github.com, Settings, SSH and GPG keys, the key with the fingerprint $OLD_PRINT."
+    else
+        impact_say "Important: the replaced key also opens the person's GitHub account until it is deleted there."
+        impact_say "Ask $GITHUB to delete it on GitHub: github.com, Settings, SSH and GPG keys, every key that is no longer in use (the new key is $NEW_PRINT)."
+    fi
     impact_say "Only the person can do this. The new key must be registered on GitHub too (the GUI guides through it)."
 fi

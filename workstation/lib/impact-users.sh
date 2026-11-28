@@ -65,6 +65,22 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   mapfile -t LIST <FILE     read the lines of FILE into the list LIST, one
+#                        entry per line (-t drops the line ends)
+#   < <(command)  <(command)   hand the output of a command to a loop, to
+#                        mapfile or to another program as if it were a file
+#                        ("process substitution")
+#   <<<"$text"           hand a text to a command as its input ("here-string")
+#   IFS=: read -r A B    split one line at the character after "IFS=" (here
+#                        ":") into the variables A and B; with -a LIST into a list
+#   while IFS= read -r line   read input line by line, exactly as written:
+#                        "IFS=" keeps blanks at both ends, -r keeps backslashes
+#   command || true      accept a failure of this command ("set -e" would
+#                        otherwise stop the script there)
+#   "${!LIST[@]}"        the positions (or the names) of the entries of a list
+#   "${NAME,,}"          the text in lower case
+#   shopt -s nullglob    a file pattern (*.conf) without a match gives an empty
+#                        list; "shopt -u" switches this off again
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -411,7 +427,8 @@ impact_users_confirm_key() {
     # "local" gives this function its own IMPACT_ASSUME_YES with the value 0.
     # impact_confirm reads that one, so --yes cannot answer this question.
     local IMPACT_ASSUME_YES=0
-    if ! impact_confirm "Compare this fingerprint with the one $who sent you (the GUI shows it at the first REMOTE start): $IMPACT_KEY_FINGERPRINT  Is it exactly the same?"; then
+    if ! impact_confirm "Compare this fingerprint with the one $who sent you (the GUI shows it at the first REMOTE start): $IMPACT_KEY_FINGERPRINT  Is it exactly the same?" yes \
+        "Run the command in a terminal, or add --fingerprint <the fingerprint the person sent> after comparing it (the option --yes does not answer this question)."; then
         impact_die "$IMPACT_EXIT_FAILED" "Stopped: the fingerprint of the key was not confirmed. Nothing was changed." \
             "Compare the fingerprint with the person, then run the command again in a terminal, or add --fingerprint <the fingerprint the person sent>."
     fi
@@ -547,6 +564,28 @@ impact_users_text_has_fingerprint() {
         fi
     done < <(impact_users_key_entries "$1")
     return 1
+}
+
+# impact_users_fingerprint_owners FINGERPRINT [EXCEPT_ACCOUNT]
+#   Prints every account with an IMPACT record (any state) whose login keys
+#   contain the key with FINGERPRINT, one per line, leaving out
+#   EXCEPT_ACCOUNT. One key pair belongs to one person: a key that is a
+#   login key of another account already usually means that the .pub file
+#   of the wrong colleague was taken. The keys are read with the rights of
+#   each person; an account whose keys cannot be read is left out. Root.
+#   The login keys of the caller (IMPACT_USERS_AK_TEXT) stay as they were.
+#   Example: impact_users_fingerprint_owners SHA256:abc... alice
+impact_users_fingerprint_owners() {
+    local print="$1" except="${2:-}" other saved_text="$IMPACT_USERS_AK_TEXT"
+    while IFS= read -r other; do
+        [[ -n "$other" && "$other" != "$except" ]] || continue
+        impact_account_exists "$other" || continue
+        if impact_users_read_authorized_keys "$other" 2>/dev/null &&
+            impact_users_text_has_fingerprint "$IMPACT_USERS_AK_TEXT" "$print"; then
+            printf '%s\n' "$other"
+        fi
+    done < <(impact_account_records)
+    IMPACT_USERS_AK_TEXT="$saved_text"
 }
 
 # impact_users_text_with_line TEXT LINE
@@ -718,7 +757,9 @@ impact_users_save_key_lines() {
 #   Prints the path of a new archive folder for keys that are taken away
 #   now: <archive>/<KIND>-removed-<UTC time>, for example
 #   /opt/impact/admin/keys/alice/account-removed-20260131T140509Z.
-#   KIND is "account" (impact-remove-user) or "key" (impact-key).
+#   KIND is "account" (impact-remove-user), "key" (impact-key), "jobs" (the
+#   scheduled jobs that impact-remove-user takes away) or the name of a
+#   further login key file such as "authorized_keys2".
 impact_users_new_archive_name() {
     printf '%s/%s-removed-%s\n' "$(impact_users_keys_dir "$1")" "$2" "$(date -u '+%Y%m%dT%H%M%SZ')"
 }
@@ -985,6 +1026,116 @@ impact_users_end_processes() {
     impact_error "Some processes of the user number $uid are still running:"
     impact_users_processes "$uid" | head -n 10 >&2
     return 1
+}
+
+# =============================================================================
+# Work of a person that runs without a login: lingering, cron, at
+# =============================================================================
+# Three ways let programs of a person run while the person is not logged in.
+# An expired account cannot log in, and pkill ends what runs now; these ways
+# could start programs again later, so impact-remove-user switches them off.
+#   Lingering: systemd starts the person's own service manager
+#     ("systemd --user", the unit user@<number>.service) at boot and keeps
+#     it running, with every service the person set up in
+#     ~/.config/systemd/user. The mark is the file
+#     /var/lib/systemd/linger/<account> ("loginctl enable-linger").
+#   cron: a table of commands that run at set times ("crontab").
+#   at: commands that run once at a set time ("at", listed by "atq").
+
+# impact_users_linger_file ACCOUNT
+#   Prints the path of the lingering mark of ACCOUNT.
+impact_users_linger_file() {
+    printf '/var/lib/systemd/linger/%s\n' "$1"
+}
+
+# impact_users_is_lingering ACCOUNT
+#   Result: success when lingering is switched on for ACCOUNT. Read-only.
+impact_users_is_lingering() {
+    [[ -e "$(impact_users_linger_file "$1")" ]]
+}
+
+# impact_users_disable_linger ACCOUNT
+#   Switches lingering off: with "loginctl disable-linger" where systemd
+#   runs; elsewhere (no systemd, for example in a container) the mark file
+#   is removed, which is what loginctl does. Call it inside impact_do.
+impact_users_disable_linger() {
+    if [[ -d /run/systemd/system ]] && impact_have_tool loginctl; then
+        loginctl disable-linger -- "$1" || return 1
+    fi
+    rm -f -- "$(impact_users_linger_file "$1")"
+}
+
+# impact_users_user_manager_active USER_NUMBER
+#   Result: success when systemd runs and the person's own service manager
+#   (user@<number>.service) is active. Read-only.
+impact_users_user_manager_active() {
+    impact_valid_user_number "$1" || return 1
+    [[ -d /run/systemd/system ]] && impact_have_tool systemctl &&
+        systemctl is-active --quiet "user@$1.service" 2>/dev/null
+}
+
+# impact_users_crontab ACCOUNT
+#   Prints the cron table of ACCOUNT. Read-only; root.
+#   Result: failure when the account has none or cron is not installed.
+impact_users_crontab() {
+    impact_have_tool crontab || return 1
+    crontab -u "$1" -l 2>/dev/null
+}
+
+# impact_users_at_jobs ACCOUNT
+#   Prints the numbers of the waiting "at" jobs of ACCOUNT, one per line.
+#   atq, run by root, lists the jobs of all accounts; the owner is the last
+#   word of each line. Read-only; nothing is printed when "at" is not
+#   installed.
+impact_users_at_jobs() {
+    impact_have_tool atq || return 0
+    atq 2>/dev/null | awk -v owner="$1" '$NF == owner && $1 ~ /^[0-9]+$/ { print $1 }' || true
+}
+
+# impact_users_save_and_remove_jobs FOLDER ACCOUNT
+#   Saves the cron table of ACCOUNT as FOLDER/crontab and each "at" job as
+#   FOLDER/at-<number>.job (FOLDER is created in the archive, mode 700),
+#   then removes them, so they cannot start programs any more. Root; call
+#   it inside impact_do.
+impact_users_save_and_remove_jobs() {
+    local folder="$1" account="$2" table job
+    impact__users_archive_dir "$folder" || return 1
+    if table="$(impact_users_crontab "$account")"; then
+        printf '%s\n' "$table" | impact_write_file_atomic "$folder/crontab" 600 root root || return 1
+        crontab -u "$account" -r || return 1
+    fi
+    while IFS= read -r job; do
+        [[ -n "$job" ]] || continue
+        # "at -c" prints the whole job: the environment and the commands.
+        at -c "$job" 2>/dev/null | impact_write_file_atomic "$folder/at-$job.job" 600 root root || return 1
+        atrm "$job" || return 1
+    done < <(impact_users_at_jobs "$account")
+}
+
+# impact_users_further_key_files ACCOUNT HOME
+#   Prints every file other than <home>/.ssh/authorized_keys from which sshd
+#   reads login keys for ACCOUNT ("AuthorizedKeysFile"; Ubuntu also reads
+#   ~/.ssh/authorized_keys2), as absolute paths, one per line. The tokens
+#   %h (home folder), %u (account name) and %% are replaced; a path without
+#   "/" in front is inside the home folder. Read-only; root.
+impact_users_further_key_files() {
+    local account="$1" home="$2" settings value path
+    local -a paths=()
+    settings="$(impact_ssh_effective "$account" 2>/dev/null)" || return 0
+    value="$(awk '$1 == "authorizedkeysfile" { $1 = ""; print }' <<<"$settings")"
+    # "read -a" splits the value at blanks into the list "paths".
+    read -r -a paths <<<"$value" || true
+    for path in "${paths[@]}"; do
+        path="${path//%h/$home}"
+        path="${path//%u/$account}"
+        path="${path//%%/%}"
+        if [[ "$path" != /* ]]; then
+            path="$home/$path"
+        fi
+        if [[ "$path" != "$home/.ssh/authorized_keys" ]]; then
+            printf '%s\n' "$path"
+        fi
+    done
 }
 
 # impact_users_containers ACCOUNT

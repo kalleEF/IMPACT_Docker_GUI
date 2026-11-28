@@ -125,20 +125,41 @@ test_no_long_dashes_in_any_file() {
     done < <(all_files)
 }
 
+# The values of the real site never appear in this repository, not even in
+# this test. The test reads them from a file outside the repository: the
+# environment variable IMPACT_SITE_VALUES_FILE names it, one value per line
+# (empty lines and lines that start with "#" are ignored). The delivery check
+# of the project sets the variable; without it the test is skipped.
+# The test proves: no file below workstation/ and tests/workstation/
+# contains one of these values.
 test_no_site_values_in_any_file() {
-    # The forbidden texts are put together from two halves, so this file
-    # does not contain them itself.
-    local -a forbidden=(
-        'php-work''station'
-        '/mnt/Stor''age_'
-        'IMPACT_Stor''age'
-    )
-    local file text
+    local values_file="${IMPACT_SITE_VALUES_FILE:-}" line file text
+    local -a forbidden=()
+    if [[ -z "$values_file" ]]; then
+        skip "IMPACT_SITE_VALUES_FILE is not set (it names a file with the site values, kept outside the repository)"
+    fi
+    if [[ ! -f "$values_file" || ! -r "$values_file" ]]; then
+        fail "IMPACT_SITE_VALUES_FILE names '$values_file', which is no readable file"
+    fi
+    # "while IFS= read -r line" reads the file line by line, exactly as
+    # written. "|| [[ -n $line ]]" keeps a last line without a line end.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        if [[ -z "$line" || "$line" == '#'* ]]; then
+            continue
+        fi
+        forbidden+=("$line")
+    done <"$values_file"
+    if ((${#forbidden[@]} == 0)); then
+        fail "$values_file holds no value"
+    fi
     while IFS= read -r file; do
         for text in "${forbidden[@]}"; do
+            # -F compares the text exactly, as a plain text (no pattern).
             if grep -q -F -- "$text" "$file"; then
-                grep -n -F -- "$text" "$file" | head -n 5 >&2
-                fail "$file contains the site value '$text'; the repository is public"
+                # The value itself is not printed: the test output may be
+                # public as well (for example the log of an automatic check).
+                fail "$file contains a value of the real site (line $(grep -n -F -- "$text" "$file" | head -n 1 | cut -d: -f1)); the repository is public"
             fi
         done
     done < <(all_files)

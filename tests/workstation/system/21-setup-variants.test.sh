@@ -285,3 +285,50 @@ test_existing_folders_with_other_rights_are_corrected() {
     assert_file_facts /srv/impact/models/Existing-Model 755 root root
     assert_exists /srv/impact/models/Existing-Model/keep-me
 }
+
+# A storage root that refuses access control lists (ACLs) is refused: the
+# shared group rules depend on them. A stand-in setfacl that always fails
+# plays such a file system. /usr/local/bin comes first in the fixed PATH of
+# the commands, so the stand-in is used.
+test_storage_root_without_acls_is_refused() {
+    printf '#!/bin/sh\n# impact-test stand-in\necho "setfacl: Operation not supported" >&2\nexit 1\n' >/usr/local/bin/setfacl
+    chmod 755 /usr/local/bin/setfacl
+    run_cmd sys_as_admin "$SETUP" --shared-roots "$SYS_ROOT_A" --admin-contact "$SYS_ADMIN_CONTACT"
+    rm -f /usr/local/bin/setfacl
+    assert_status 1
+    assert_output_contains "The storage root $SYS_ROOT_A does not accept access control lists."
+    assert_missing "$CONF"
+    assert_missing "$RULES"
+    # The probe folder was removed again.
+    assert_eq '' "$(find "$SYS_ROOT_A" -mindepth 1 -name '.impact-acl-test.*' 2>/dev/null)"
+}
+
+# The "How to undo" lines of a first run, followed from top to bottom as
+# printed, remove everything the run created: the SSH rules come first and
+# the group comes last, after the folders that use it. Only the folders of
+# the administrator files stay (they hold the log of the run).
+test_undo_lines_of_the_first_run_work_in_the_printed_order() {
+    local line
+    local -a commands=()
+    run_cmd sys_as_admin "$SETUP" --shared-roots "$SYS_ROOT_A,$SYS_ROOT_B" --admin-contact "$SYS_ADMIN_CONTACT"
+    assert_status 0
+    printf '%s\n' "$RUN_OUTPUT" >"$TEST_TMP/first-run-output"
+    mapfile -t commands < <(sed -n -e '/^How to undo:$/,/^[^ ]/p' "$TEST_TMP/first-run-output" |
+        sed -n -e 's/^  - [^:]*: \(sudo .*\)$/\1/p')
+    assert_contains "${commands[0]}" '--remove-ssh-rules' "first undo line"
+    assert_contains "${commands[${#commands[@]} - 1]}" 'groupdel impact' "last undo line"
+    assert_contains "$(printf '%s\n' "${commands[@]}")" 'sudo rmdir /srv/impact/models'
+    assert_contains "$(printf '%s\n' "${commands[@]}")" 'sudo rmdir /etc/impact'
+    for line in "${commands[@]}"; do
+        run_cmd runuser -u "$SYS_ADMIN" -- bash -c "cd / && $line"
+        if [[ "$RUN_STATUS" != 0 ]]; then
+            fail "the undo line '$line' failed: $RUN_OUTPUT"
+        fi
+    done
+    assert_missing "$RULES"
+    assert_missing /etc/impact
+    assert_missing /srv/impact/models
+    assert_missing "$SYS_ROOT_A"
+    assert_missing "$SYS_ROOT_B"
+    assert_fails getent group "$SYS_GROUP"
+}

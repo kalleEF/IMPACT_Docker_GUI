@@ -66,6 +66,25 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   mapfile -t LIST <FILE     read the lines of FILE into the list LIST, one
+#                        entry per line (-t drops the line ends)
+#   < <(command)  <(command)   hand the output of a command to a loop, to
+#                        mapfile or to another program as if it were a file
+#                        ("process substitution")
+#   <<<"$text"           hand a text to a command as its input ("here-string")
+#   declare -A NAME  local -A NAME   a list whose entries are found by a name
+#                        (an "associative array"): NAME[key]=value, "${NAME[key]}"
+#   IFS=: read -r A B    split one line at the character after "IFS=" (here
+#                        ":") into the variables A and B; with -a LIST into a list
+#   while IFS= read -r line   read input line by line, exactly as written:
+#                        "IFS=" keeps blanks at both ends, -r keeps backslashes
+#   $'\t'  $'\r'  $'\n'   a text with a special character: tab, carriage return,
+#                        new line (\xNN is the byte NN)
+#   command || true      accept a failure of this command ("set -e" would
+#                        otherwise stop the script there)
+#   2>&1                 send the error channel to the same place as the output
+#   "${NAME:0:10}"       a part of the text: from position 0, 10 characters
+#   "${NAME,,}"          the text in lower case
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -184,6 +203,8 @@ IMPACT_FAIL_COUNT=0                # number of failed checks printed so far
 IMPACT_HTTP_STATUS=''              # HTTP status code of the last impact_https_get
 IMPACT_CHANGES=()                  # texts of the changing steps that ran
 IMPACT_UNDO=()                     # texts for the "How to undo" list
+IMPACT_UNDO_NEWEST_FIRST=0         # 1: print "How to undo" from the last entry to the first
+IMPACT_CURRENT_STEP=''             # text of the impact_do step that is running now
 IMPACT_SUMMARY_DONE=0              # 1 once the final summary was printed
 IMPACT_LOG_ENABLED=0               # 1 after impact_log_enable
 IMPACT_LOG_ARGS=()                 # the arguments of the command, for the log
@@ -197,6 +218,8 @@ IMPACT_EXITING=0                   # 1 while the end-of-command work runs
 IMPACT_MASK_NAMES=()               # extra host names for impact_mask_text
 IMPACT__LOCK_FD=''                 # open handle of the lock file (impact_lock)
 IMPACT__MASK_PID=''                # process number of the masking filter (impact_mask_output_start)
+IMPACT__OUT=''                     # handle of the command's own output channel (impact_init)
+IMPACT__ERR=''                     # handle of the command's own error channel (impact_init)
 
 # "declare -A" creates an associative array: a list whose entries are found
 # by a name. "-g" makes it global even though the line may be read inside a
@@ -227,6 +250,20 @@ impact_init() {
     # could point the "docker" program to another machine.
     unset -v DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
 
+    # Keep a second handle on the output and the error channel as they are
+    # now. "exec {NAME}>&2" opens a copy of channel 2 under a free number
+    # and stores the number in NAME. A step such as
+    # "impact_git clone ... 2>file" sends the error channel of the whole
+    # function into the file, and a signal handled during that step would
+    # print its message there. The end-of-command handlers write to these
+    # copies, so their messages always reach the reader. (When a channel is
+    # closed, no copies are made and the handlers use the channels as they
+    # are.)
+    if ! { exec {IMPACT__OUT}>&1 {IMPACT__ERR}>&2; } 2>/dev/null; then
+        IMPACT__OUT=''
+        IMPACT__ERR=''
+    fi
+
     # "trap" tells bash to run a function at a certain event. EXIT is the end
     # of the script for whatever reason. INT is Ctrl+C, TERM a polite request
     # to end, HUP a closed terminal. After a signal the command ends with the
@@ -242,7 +279,7 @@ impact_init() {
 #   ends the command; the EXIT handler then cleans up and reports what was
 #   changed up to that moment.
 impact__on_signal() {
-    printf '\nERROR: %s was interrupted (signal %s).\n' "$IMPACT_CMD" "$1" >&2
+    printf '\nERROR: %s was interrupted (signal %s).\n' "$IMPACT_CMD" "$1" >&"${IMPACT__ERR:-2}"
     exit "$2"
 }
 
@@ -270,6 +307,11 @@ impact__on_exit() {
     # continue even when one of its steps fails.
     set +e
     IMPACT_EXITING=1
+    # Back to the command's own channels (see impact_init): the command may
+    # have ended inside a step whose channels were sent into a file.
+    if [[ -n "$IMPACT__OUT" && -n "$IMPACT__ERR" ]]; then
+        exec 1>&"$IMPACT__OUT" 2>&"$IMPACT__ERR"
+    fi
 
     local index
     # Walk through the registered handlers backwards (last registered first).
@@ -277,7 +319,7 @@ impact__on_exit() {
         "${IMPACT_EXIT_HANDLERS[index]}" "$code"
     done
 
-    if ((code != 0 && IMPACT_SUMMARY_DONE == 0 && ${#IMPACT_CHANGES[@]} > 0)); then
+    if ((code != 0 && IMPACT_SUMMARY_DONE == 0)) && { ((${#IMPACT_CHANGES[@]} > 0)) || [[ -n "$IMPACT_CURRENT_STEP" ]]; }; then
         impact__print_partial_summary "$code"
     fi
 
@@ -507,10 +549,18 @@ impact_do() {
         return 0
     fi
     printf '  + %s\n' "$text"
-    local status=0
+    local status=0 previous_step="$IMPACT_CURRENT_STEP"
+    # While the step runs, its text is kept in IMPACT_CURRENT_STEP. When the
+    # command is stopped in the middle (Ctrl+C, a signal), the step may have
+    # finished or not; the end-of-command report and the log name it, so it
+    # is never lost.
+    if ((record == 1)); then
+        IMPACT_CURRENT_STEP="$text"
+    fi
     # "$@" is the command with all its arguments, each kept as one word.
     # "|| status=$?" stores a failure code and keeps the script running.
     "$@" || status=$?
+    IMPACT_CURRENT_STEP="$previous_step"
     if ((status != 0)); then
         impact_error "This step failed (exit code $status): $text"
         return "$status"
@@ -533,6 +583,30 @@ impact_changed() {
 #   it belongs to, so the hint appears only when the step really ran.
 impact_undo() {
     IMPACT_UNDO+=("$1")
+}
+
+# impact_undo_newest_first
+#   Prints the "How to undo" list from its last entry to its first, for a
+#   command whose changes build on each other (a folder that uses a group,
+#   a file in a folder). Undoing then follows the reverse order of the
+#   changes, so every line works when the lines are followed from top to
+#   bottom.
+impact_undo_newest_first() {
+    IMPACT_UNDO_NEWEST_FIRST=1
+}
+
+# impact__undo_lines
+#   Internal: prints the "How to undo" list, one entry per line, in the
+#   order chosen with impact_undo_newest_first.
+impact__undo_lines() {
+    local index
+    if ((IMPACT_UNDO_NEWEST_FIRST == 1)); then
+        for ((index = ${#IMPACT_UNDO[@]} - 1; index >= 0; index--)); do
+            printf '  - %s\n' "${IMPACT_UNDO[index]}"
+        done
+    else
+        impact__print_list '-' "${IMPACT_UNDO[@]}"
+    fi
 }
 
 # impact__print_list MARK ITEM...
@@ -571,7 +645,7 @@ impact_summary() {
             else
                 impact_say 'How to undo:'
             fi
-            impact__print_list '-' "${IMPACT_UNDO[@]}"
+            impact__undo_lines
         fi
     fi
     if ((IMPACT_WARN_COUNT > 0)); then
@@ -588,11 +662,18 @@ impact__print_partial_summary() {
         if ((IMPACT_DRY_RUN == 1)); then
             printf 'This was a dry run: nothing was changed.\n'
         else
-            printf 'These steps had already run:\n'
-            impact__print_list '+' "${IMPACT_CHANGES[@]}"
+            if ((${#IMPACT_CHANGES[@]} > 0)); then
+                printf 'These steps had already run:\n'
+                impact__print_list '+' "${IMPACT_CHANGES[@]}"
+            fi
+            if [[ -n "$IMPACT_CURRENT_STEP" ]]; then
+                printf 'This step was running when the command stopped and may have finished:\n'
+                printf '  ? %s\n' "$IMPACT_CURRENT_STEP"
+                printf 'Check its result; a second run of the command sees what it finished.\n'
+            fi
             if ((${#IMPACT_UNDO[@]} > 0)); then
                 printf 'How to undo them:\n'
-                impact__print_list '-' "${IMPACT_UNDO[@]}"
+                impact__undo_lines
             fi
             printf 'The command is safe to run again after the cause is fixed.\n'
         fi
@@ -1348,7 +1429,7 @@ impact__write_log() {
     ((IMPACT_LOG_ENABLED == 1)) || return 0
     ((IMPACT_DRY_RUN == 0)) || return 0
     ((EUID == 0)) || return 0
-    if ((code != 0 && ${#IMPACT_CHANGES[@]} == 0)); then
+    if ((code != 0 && ${#IMPACT_CHANGES[@]} == 0)) && [[ -z "$IMPACT_CURRENT_STEP" ]]; then
         return 0
     fi
 
@@ -1395,6 +1476,10 @@ impact__write_log() {
                 printf '  + %s\n' "$(impact_display "$word" 2000)"
             done
         fi
+        if [[ -n "$IMPACT_CURRENT_STEP" ]]; then
+            printf 'interrupted during (may have finished):\n'
+            printf '  ? %s\n' "$(impact_display "$IMPACT_CURRENT_STEP" 2000)"
+        fi
         if ((${#IMPACT_LOG_NOTES[@]} > 0)); then
             printf 'notes:\n'
             for word in "${IMPACT_LOG_NOTES[@]}"; do
@@ -1413,17 +1498,22 @@ impact__write_log() {
 # Confirmation
 # =============================================================================
 
-# impact_confirm QUESTION [EXPECTED_ANSWER]
+# impact_confirm QUESTION [EXPECTED_ANSWER] [WITHOUT_TERMINAL]
 #   Asks the administrator to confirm before a step that is hard to undo.
 #   The answer is read from the terminal itself (/dev/tty), so the question
 #   also works when standard input carries data, for example a key.
-#   Parameters: the question, and the exact word to type (default "yes").
+#   Parameters: the question; the exact word to type (default "yes"); and
+#   the sentence that says what to do when no terminal is available. The
+#   default sentence names the option --yes. A question that --yes does not
+#   answer (the caller sets IMPACT_ASSUME_YES to 0 for it) passes its own
+#   sentence, for example the option that answers it.
 #   Result: success when the answer matches, when --yes was given, or in a
 #   dry run (which changes nothing and therefore asks nothing). Failure for
 #   any other answer and when no terminal is available.
 #   Example: impact_confirm "Remove the account alice?" || impact_die 1 "Stopped: no confirmation." ""
 impact_confirm() {
     local question="$1" expected="${2:-yes}" answer=''
+    local without_terminal="${3:-Run the command in a terminal, or add the option --yes after checking the request.}"
     if ((IMPACT_DRY_RUN == 1)); then
         impact_info "[dry run] A real run asks here: $question"
         return 0
@@ -1437,7 +1527,7 @@ impact_confirm() {
     # failure cannot end the command itself.
     if ! (: </dev/tty) 2>/dev/null; then
         impact_error "This step needs a confirmation and no terminal is available to ask on."
-        impact_error "Run the command in a terminal, or add the option --yes after checking the request."
+        impact_error "$without_terminal"
         return 1
     fi
     printf '\n%s\nType %s and press Enter to continue. Anything else stops here: ' "$question" "$expected" >/dev/tty
@@ -1593,6 +1683,13 @@ impact_mask_output_start() {
     # that command.
     exec > >(impact_mask_text) 2>&1
     IMPACT__MASK_PID=$!
+    # The command's own channels (impact_init) lead into the filter from
+    # now on, so the end-of-command messages are masked as well.
+    # "exec {NAME}>&-" closes the handle whose number NAME holds.
+    if [[ -n "$IMPACT__OUT" && -n "$IMPACT__ERR" ]]; then
+        exec {IMPACT__OUT}>&- {IMPACT__ERR}>&-
+        exec {IMPACT__OUT}>&1 {IMPACT__ERR}>&2
+    fi
 }
 
 # impact__mask_output_end
@@ -1602,6 +1699,13 @@ impact_mask_output_start() {
 impact__mask_output_end() {
     if [[ -z "$IMPACT__MASK_PID" ]]; then
         return 0
+    fi
+    # Every handle that leads into the filter is closed, so the filter sees
+    # the end of its input.
+    if [[ -n "$IMPACT__OUT" && -n "$IMPACT__ERR" ]]; then
+        exec {IMPACT__OUT}>&- {IMPACT__ERR}>&-
+        IMPACT__OUT=''
+        IMPACT__ERR=''
     fi
     exec 1>&3 2>&4 3>&- 4>&-
     wait "$IMPACT__MASK_PID" 2>/dev/null || true

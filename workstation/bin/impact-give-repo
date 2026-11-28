@@ -229,16 +229,34 @@ if ! impact_repo_base_is_ready "$ACCOUNT"; then
     impact_undo "Remove the repository folder while it is empty: sudo rmdir $REPO_BASE_DIR"
 fi
 
+# run_get_repo
+#   Runs impact-get-repo as the person. Its messages (both channels) are
+#   shown inside a frame, each line marked with "|", so they cannot be
+#   mixed up with the steps of this command.
+#   Result: the exit code of impact-get-repo.
+run_get_repo() {
+    local status=0
+    printf '    --- messages of impact-get-repo, run as %s ---\n' "$ACCOUNT"
+    # "PIPESTATUS[0]" is the exit code of the first command of the pipe
+    # (impact-get-repo); sed only marks the lines.
+    if impact_run_as "$ACCOUNT" "$GET_REPO" "${GET_REPO_OPTIONS[@]}" -- "$MODEL" 2>&1 | sed -e 's/^/    | /'; then
+        status=0
+    else
+        status="${PIPESTATUS[0]}"
+    fi
+    printf '    --- end of the messages of impact-get-repo ---\n'
+    return "$status"
+}
+
 impact_step "Working copy (impact-get-repo as $ACCOUNT)"
 get_status=0
-impact_do "Make the working copy $TARGET for $ACCOUNT $WAY" \
-    impact_run_as "$ACCOUNT" "$GET_REPO" "${GET_REPO_OPTIONS[@]}" -- "$MODEL" || get_status=$?
+impact_do "Make the working copy $TARGET for $ACCOUNT $WAY" run_get_repo || get_status=$?
 if ((get_status != 0)); then
     case "$get_status" in
         4 | 5 | 6) code="$get_status" ;;
         *) code="$IMPACT_EXIT_FAILED" ;;
     esac
-    impact_die "$code" "impact-get-repo did not make the copy for $ACCOUNT (exit code $get_status; its messages are above)." \
+    impact_die "$code" "impact-get-repo did not make the copy for $ACCOUNT (exit code $get_status; its messages are in the frame above)." \
         "Fix the cause it names, then run this command again."
 fi
 if ! impact_is_dry_run; then

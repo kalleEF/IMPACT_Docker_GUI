@@ -37,7 +37,7 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Reading help: bash constructs that appear in this file
+# Reading help: bash constructs that appear in this file and in the test files
 #   NAME=text            store a text in the variable NAME; "$NAME" reads it
 #   local NAME           a variable that exists only inside one function
 #   "$1" "$2" "$@" "$#"  first parameter, second parameter, all parameters,
@@ -61,6 +61,29 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   mapfile -t LIST <FILE     read the lines of FILE into the list LIST, one
+#                        entry per line (-t drops the line ends)
+#   < <(command)  <(command)   hand the output of a command to a loop, to
+#                        mapfile or to another program as if it were a file
+#                        ("process substitution")
+#   <<<"$text"           hand a text to a command as its input ("here-string")
+#   declare -A NAME  local -A NAME   a list whose entries are found by a name
+#                        (an "associative array"): NAME[key]=value, "${NAME[key]}"
+#   IFS=: read -r A B    split one line at the character after "IFS=" (here
+#                        ":") into the variables A and B; with -a LIST into a list
+#   while IFS= read -r line   read input line by line, exactly as written:
+#                        "IFS=" keeps blanks at both ends, -r keeps backslashes
+#   $'\t'  $'\r'  $'\n'   a text with a special character: tab, carriage return,
+#                        new line (\xNN is the byte NN)
+#   command || true      accept a failure of this command ("set -e" would
+#                        otherwise stop the script there)
+#   2>&1                 send the error channel to the same place as the output
+#   "${NAME:+text}"      "text" when NAME has content, otherwise nothing
+#   "${!LIST[@]}"        the positions (or the names) of the entries of a list
+#   "${NAME:0:10}"       a part of the text: from position 0, 10 characters
+#   "${NAME,,}"          the text in lower case
+#   shopt -s nullglob    a file pattern (*.conf) without a match gives an empty
+#                        list; "shopt -u" switches this off again
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 

@@ -635,10 +635,14 @@ test_model_file_that_others_can_change_is_refused() {
     chmod 640 "$file"
     assert_eq 2 "$status"
     assert_contains "${IMPACT_MODEL_ERRORS[*]}" 'not safe to use'
+    # As root (the administrator): one message, and a next step for the
+    # administrator, without "contact the administrator".
     run_cmd impact_require_model No-Such-Model
     assert_status 1
-    assert_output_contains 'is not available on this workstation'
-    assert_output_contains "$SYS_ADMIN_CONTACT"
+    assert_output_contains "The model 'No-Such-Model' is not set up on this workstation"
+    assert_eq 1 "$(grep -c '^ERROR:' <<<"$RUN_OUTPUT")" "number of ERROR lines"
+    assert_output_contains 'sudo impact-add-model --help'
+    assert_output_not_contains "$SYS_ADMIN_CONTACT"
     run_cmd impact_require_model '../Example-Model'
     assert_status 1
     run_cmd impact_require_model Example-Model
@@ -724,6 +728,33 @@ test_log_records_a_failure_after_a_change() {
     assert_contains "$block" '  + Pretend to enrol bob'
 }
 
+# A signal while the first change runs: no step had finished before, and
+# the log still gets a block that names the step as "interrupted during",
+# because the change may have been made.
+test_log_names_the_step_that_ran_at_a_signal() {
+    {
+        printf '#!/bin/bash\n# signal-test: a command made by a test\n'
+        printf 'set -euo pipefail\n'
+        printf 'IMPACT_SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"\n'
+        printf 'source /opt/impact/lib/impact-common.sh\n'
+        printf 'impact_init "$IMPACT_SELF"\n'
+        printf 'impact_parse_args "" "" "" "$@"\n'
+        printf 'impact_require_root\n'
+        printf 'impact_log_enable "$@"\n'
+        printf 'impact_do "Create the folder for the signal test" bash -c '\''kill -TERM "$PPID"; sleep 0.2'\''\n'
+        printf 'impact_summary\n'
+    } >"$TEST_SUITE_TMP/signal-test"
+    chmod 755 "$TEST_SUITE_TMP/signal-test"
+    run_cmd sys_as_admin "$TEST_SUITE_TMP/signal-test"
+    assert_status 143
+    local block
+    block="$(last_log_block)"
+    assert_contains "$block" 'command: signal-test'
+    assert_contains "$block" 'result:  FAILED with exit code 143'
+    assert_contains "$block" 'interrupted during (may have finished):'
+    assert_contains "$block" '  ? Create the folder for the signal test'
+}
+
 test_log_is_never_written_through_a_link() {
     log_command
     mv /opt/impact/admin/log /opt/impact/admin/log.aside
@@ -759,6 +790,24 @@ test_ssh_questions() {
     status=0
     impact_ssh_member_deviations 'alice,user=root' 8787 8830 >/dev/null || status=$?
     assert_eq 2 "$status"
+}
+
+# With "UsePAM no", sshd refuses the key login of an account whose password
+# is locked, which is every colleague's account. The member check reports
+# it although the twelve values of the rules file apply.
+test_member_check_requires_use_pam() {
+    mkdir -p /run/sshd
+    assert_success impact_ssh_member_deviations alice 8787 8830
+    # A file that sshd reads before 60-impact.conf; for UsePAM the first
+    # value that sshd reads applies.
+    printf 'UsePAM no\n' >/etc/ssh/sshd_config.d/10-test-usepam.conf
+    local status=0 output
+    output="$(impact_ssh_member_deviations alice 8787 8830)" || status=$?
+    rm -f /etc/ssh/sshd_config.d/10-test-usepam.conf
+    assert_eq 1 "$status" "status with UsePAM no"
+    assert_contains "$output" 'usepam: expected "yes", effective "no"'
+    assert_not_contains "$output" 'permitopen'
+    assert_success impact_ssh_member_deviations alice 8787 8830
 }
 
 # ----------------------------------------------------------------------------

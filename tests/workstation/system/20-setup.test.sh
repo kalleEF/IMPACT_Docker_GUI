@@ -498,12 +498,48 @@ test_changed_port_range_rewrites_the_permitopen_line() {
         assert_eq $((hups_before + 1)) "$(grep -c 'Received SIGHUP' "$SYS_SSHD_LOG" || true)" "the SSH server was reloaded once"
     fi
     assert_output_contains "How to undo:"
-    assert_output_contains "Set PORT_MAX back to its previous value '8830'"
+    # One command puts both previous values back; removing the rules would
+    # leave the members without restrictions, so that line is not offered.
+    assert_output_contains "sudo impact-workstation-setup --deputy-contact '' --port-max 8830"
+    assert_not_contains "$(sed -n -e '/^How to undo:$/,$p' <<<"$RUN_OUTPUT")" '--remove-ssh-rules' "the list How to undo"
     # The member can still log in with the key after the reload.
     run_cmd sys_ssh_key "$MEMBER" "$MEMBER" id -un
     assert_status 0
     run_cmd sys_as_admin "$SETUP"
     assert_output_contains 'Nothing to do'
+}
+
+# undo_commands OUTPUT_FILE
+#   Prints the commands of the "How to undo" list in OUTPUT_FILE, one per
+#   line, in the printed order: the part of each line from ": sudo " on.
+undo_commands() {
+    local line
+    sed -n -e '/^How to undo:$/,/^[^ ]/p' "$1" | while IFS= read -r line; do
+        if [[ "$line" == '  - '*': sudo '* ]]; then
+            printf 'sudo %s\n' "${line#*: sudo }"
+        fi
+    done
+}
+
+# A change of the port range, undone by following the printed lines
+# literally: the rules file and the settings file are exactly as before,
+# and the rules are never removed on the way.
+test_undo_of_a_port_change_restores_rules_and_settings() {
+    cp -p "$RULES" "$TEST_TMP/rules-before"
+    cp -p "$CONF" "$TEST_TMP/conf-before"
+    run_cmd sys_as_admin "$SETUP" --port-max 8800
+    assert_status 0
+    printf '%s\n' "$RUN_OUTPUT" >"$TEST_TMP/change-output"
+    local -a commands=()
+    mapfile -t commands < <(undo_commands "$TEST_TMP/change-output")
+    assert_eq 1 "${#commands[@]}" "number of undo commands"
+    assert_eq 'sudo impact-workstation-setup --port-max 8790' "${commands[0]}"
+    # The line is typed by the administrator; here bash reads it the same way.
+    run_cmd runuser -u "$SYS_ADMIN" -- bash -c "cd / && ${commands[0]}"
+    assert_status 0
+    assert_success cmp -s "$TEST_TMP/rules-before" "$RULES"
+    assert_success cmp -s "$TEST_TMP/conf-before" "$CONF"
+    assert_eq '127.0.0.1:8790' "$(sys_effective_ssh "$MEMBER" | grep '^permitopen ' | awk '{ print $NF }')"
 }
 
 test_administrator_inside_the_group_is_refused_before_any_change() {
@@ -732,7 +768,9 @@ test_failed_reload_puts_rules_and_settings_back() {
     : >/run/impact-test-reload-fails
     snapshot_take "$TEST_TMP/before" --content "${WATCHED[@]}"
     run_cmd sys_as_admin "$SETUP" --port-max 8793
-    snapshot_take "$TEST_TMP/after" --content "${WATCHED[@]}"
+    # The note of the unconfirmed change stays (checked below), so the
+    # comparison leaves it out.
+    snapshot_take "$TEST_TMP/after" --content --exclude /opt/impact/admin/ssh-rules-pending "${WATCHED[@]}"
     sys_fake_systemd_remove
     assert_status 1
     assert_output_contains 'The SSH service could not be reloaded'
@@ -743,6 +781,18 @@ test_failed_reload_puts_rules_and_settings_back() {
     assert_file_contains "$RULES" '127.0.0.1:8792'
     assert_file_not_contains "$RULES" '127.0.0.1:8793'
     assert_success /usr/sbin/sshd -t
+    # The reload failed also while the previous file was put back, so it is
+    # unknown which file the running server uses. The note stays, and the
+    # next run reloads the service although the files are in place.
+    assert_output_contains 'stays, so the next run of impact-workstation-setup repeats this work'
+    assert_exists /opt/impact/admin/ssh-rules-pending
+    run_cmd sys_as_admin "$SETUP"
+    assert_status 0
+    assert_output_contains 'Put back the SSH rules file that was in place before the interrupted change'
+    assert_output_contains 'Reload the SSH service'
+    assert_output_not_contains 'Write the SSH rules file'
+    assert_missing /opt/impact/admin/ssh-rules-pending
+    assert_file_contains "$RULES" '127.0.0.1:8792'
 }
 
 # ----------------------------------------------------------------------------
@@ -883,4 +933,60 @@ test_interrupted_ssh_step_puts_the_previous_rules_back() {
     snapshot_assert_same "$TEST_TMP/before" "$TEST_TMP/after" "the previous state was not put back"
     assert_eq '8792' "$(conf_value PORT_MAX)"
     assert_success /usr/sbin/sshd -t
+}
+
+# A run killed with "kill -9" (no handler can react) after the rules file
+# was renamed and before the SSH service read it: the note of the
+# unconfirmed change stays, impact-check and impact-add-user warn, and the
+# next run puts the previous file back, repeats the change with all checks
+# and reloads the service. A rerun never says "Nothing to do" in this state.
+test_killed_ssh_step_is_completed_by_the_next_run() {
+    sys_fake_systemd_install ssh.service
+    # "exec sleep" makes the waiting stand-in the sleep program itself, so
+    # one kill ends it and no further process keeps the lock of the command.
+    sed -i -e 's|^    reload)$|    reload)\n        if [ -e /run/impact-test-reload-slow ]; then echo $$ >/run/impact-test-reload-pid; exec sleep 30; fi|' "$SYS_FAKE_SYSTEMCTL"
+    : >/run/impact-test-reload-slow
+    cp -p "$RULES" "$TEST_TMP/rules-before"
+    sys_as_admin "$SETUP" --port-max 8796 >"$TEST_TMP/killed-output" 2>&1 &
+    for _ in $(seq 1 120); do
+        [[ -s /run/impact-test-reload-pid ]] && break
+        sleep 0.5
+    done
+    assert_exists /run/impact-test-reload-pid
+    pkill -KILL -f '^/bin/bash /usr/local/bin/impact-workstation-setup --port-max 8796' || true
+    kill "$(cat /run/impact-test-reload-pid)" 2>/dev/null || true
+    wait || true
+    rm -f /run/impact-test-reload-slow /run/impact-test-reload-pid
+    sys_fake_systemd_remove
+    # The kill left the new file and the note; the SSH server never read it.
+    assert_file_contains "$RULES" '127.0.0.1:8796'
+    assert_exists /opt/impact/admin/ssh-rules-pending
+    assert_file_facts /opt/impact/admin/ssh-rules-pending 600 root root
+    assert_file_contains /opt/impact/admin/ssh-rules-pending 'MODE=install'
+    assert_file_contains /opt/impact/admin/ssh-rules-pending 'PREVIOUS=file'
+    run_cmd sys_as_admin impact-check
+    assert_output_contains 'A change of the SSH rules was interrupted before the SSH service had read it'
+    local hups_before
+    hups_before="$(grep -c 'Received SIGHUP' "$SYS_SSHD_LOG" || true)"
+    run_cmd sys_as_admin "$SETUP" --port-max 8796
+    assert_status 0
+    assert_output_contains 'An earlier run stopped after it had changed'
+    assert_output_contains 'Put back the SSH rules file that was in place before the interrupted change'
+    assert_output_contains 'Write the SSH rules file'
+    assert_output_contains 'Reload the SSH service'
+    assert_output_not_contains 'Nothing to do: everything is already in the requested state'
+    assert_missing /opt/impact/admin/ssh-rules-pending
+    assert_file_contains "$RULES" '127.0.0.1:8796'
+    if [[ -s "$SYS_SSHD_LOG" ]]; then
+        assert_eq $((hups_before + 1)) "$(grep -c 'Received SIGHUP' "$SYS_SSHD_LOG" || true)" "the SSH server was reloaded once"
+    fi
+    run_cmd sys_ssh_key "$MEMBER" "$MEMBER" id -un
+    assert_status 0
+    # Now the change is confirmed: a further run has nothing to do.
+    run_cmd sys_as_admin "$SETUP" --port-max 8796
+    assert_status 0
+    assert_output_contains 'Nothing to do: everything is already in the requested state'
+    # Back to the range of the earlier tests.
+    run_cmd sys_as_admin "$SETUP" --port-max 8792
+    assert_status 0
 }

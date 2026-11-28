@@ -56,6 +56,17 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   < <(command)  <(command)   hand the output of a command to a loop, to
+#                        mapfile or to another program as if it were a file
+#                        ("process substitution")
+#   <<<"$text"           hand a text to a command as its input ("here-string")
+#   while IFS= read -r line   read input line by line, exactly as written:
+#                        "IFS=" keeps blanks at both ends, -r keeps backslashes
+#   command || true      accept a failure of this command ("set -e" would
+#                        otherwise stop the script there)
+#   2>&1                 send the error channel to the same place as the output
+#   "${NAME:0:10}"       a part of the text: from position 0, 10 characters
+#   "${NAME,,}"          the text in lower case
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -77,6 +88,15 @@ IMPACT__SSH_BACKUP=''         # copy of the previous rules file ('' = there was 
 IMPACT__SSH_RELOADED=0        # 1 when the service was reloaded with the new file
 IMPACT__SSH_CHANGES_BEFORE=0  # length of the "What changed" list before the procedure
 IMPACT__SSH_UNDO_BEFORE=0     # length of the "How to undo" list before the procedure
+IMPACT__SSH_PENDING_NOTE=''   # temporary file in which the note is put together
+
+# The note of a change of the rules file that is not confirmed yet (see
+# impact__ssh_pending_write). It lies in the folder of the administrator
+# files, which only root can read.
+readonly IMPACT_SSH_PENDING_FILE="$IMPACT_ADMIN_DIR/ssh-rules-pending"
+IMPACT_SSH_PENDING_MODE=''      # install | remove, after impact_ssh_pending_read
+IMPACT_SSH_PENDING_PREVIOUS=''  # file | none, after impact_ssh_pending_read
+IMPACT_SSH_PENDING_COPY=''      # temporary copy of the previous rules file
 
 # =============================================================================
 # The rules file
@@ -308,9 +328,15 @@ impact_ssh_effective() {
 
 # impact_ssh_member_deviations ACCOUNT PORT_MIN PORT_MAX [ADDRESS]
 #   Compares the effective settings of ACCOUNT with the twelve restricted
-#   values of the rules. Prints one line per setting that deviates. Read-only.
-#   Result: 0 when all twelve apply; 1 when at least one deviates; 2 when
-#   sshd could not be asked.
+#   values of the rules, and checks "usepam yes". Prints one line per
+#   setting that deviates. Read-only.
+#   Why UsePAM: the accounts of colleagues have a locked password ("!" in
+#   /etc/shadow). sshd lets such an account log in with a key only while
+#   UsePAM is yes (the setting of Ubuntu); with UsePAM no it refuses the
+#   login ("account is locked"). The rules file does not set it; it comes
+#   from /etc/ssh/sshd_config.
+#   Result: 0 when all apply; 1 when at least one deviates; 2 when sshd
+#   could not be asked.
 #   Example: if impact_ssh_member_deviations alice 8787 8830; then echo restricted; fi
 impact_ssh_member_deviations() {
     local account="$1" effective expected line name found deviations=0
@@ -330,21 +356,102 @@ impact_ssh_member_deviations() {
             fi
         fi
     done <<<"$expected"
+    found="$(printf '%s\n' "$effective" | grep -m 1 -E '^usepam( |$)' || true)"
+    if [[ "$found" != 'usepam yes' ]]; then
+        deviations=1
+        printf '    usepam: expected "yes", effective "%s" (with UsePAM no, sshd refuses the key login of an account with a locked password; set "UsePAM yes" in %s)\n' "${found#* }" "$IMPACT_SSHD_CONFIG"
+    fi
     return "$deviations"
+}
+
+# impact__sshd_T
+#   Internal: runs "sshd -T" (print the effective settings and stop) with a
+#   time limit of 30 seconds and prints its output. The tests of the library
+#   replace this one function by a stand-in that behaves like sshd.
+impact__sshd_T() {
+    timeout 30 "$IMPACT_SSHD" -T 2>/dev/null
+}
+
+# impact__sshd_config_values KEYWORD
+#   Internal: prints the value of every line "KEYWORD value" in the output
+#   of "sshd -T", one per line, in the order sshd prints them. KEYWORD is
+#   written in lower case, as sshd -T prints it (for example "port").
+#   The whole output of sshd is stored first and searched afterwards. A
+#   reader that stops early inside a pipe (for example awk with "exit")
+#   closes the pipe while sshd is still writing; sshd 8.9 (Ubuntu 22.04)
+#   then ends with the signal SIGPIPE, and "set -o pipefail" turns the whole
+#   answer into a failure, so the value would be lost.
+#   Result: failure when sshd could not be asked; success with no output
+#   when sshd has no such line.
+#   Example: impact__sshd_config_values pidfile    prints /run/sshd.pid
+impact__sshd_config_values() {
+    local keyword="$1" output
+    output="$(impact__sshd_T)" || return 1
+    # awk reads its input up to the end here: it reads the stored text, so
+    # stopping early would harm nobody, and it does not stop.
+    awk -v key="$keyword" '$1 == key { print $2 }' <<<"$output"
+}
+
+# impact__ssh_probe_targets
+#   Internal: prints the places where the SSH server should greet, one
+#   "address port" pair per line, at most eight. They come from the
+#   "listenaddress" lines of sshd -T (0.0.0.0 becomes 127.0.0.1 and ::
+#   becomes ::1, so the test stays on this machine) and from every "port"
+#   line, tried on 127.0.0.1 and ::1. Port 22 is the last fallback.
+impact__ssh_probe_targets() {
+    local value host port count=0 line
+    local -a ports=() addresses=() targets=()
+    mapfile -t addresses < <(impact__sshd_config_values listenaddress || true)
+    mapfile -t ports < <(impact__sshd_config_values port || true)
+    for value in "${addresses[@]}"; do
+        host=''
+        port=''
+        # sshd -T prints "listenaddress 192.0.2.5:22" or "[::1]:22".
+        if [[ "$value" =~ ^\[([0-9A-Fa-f:.]+)\]:([0-9]{1,5})$ ]]; then
+            host="${BASH_REMATCH[1]}"
+            port="${BASH_REMATCH[2]}"
+        elif [[ "$value" =~ ^([0-9.]+):([0-9]{1,5})$ ]]; then
+            host="${BASH_REMATCH[1]}"
+            port="${BASH_REMATCH[2]}"
+        fi
+        case "$host" in
+            '') continue ;;
+            0.0.0.0) host='127.0.0.1' ;;
+            ::) host='::1' ;;
+            *) ;;
+        esac
+        targets+=("$host $port")
+    done
+    for port in "${ports[@]}" 22; do
+        [[ "$port" =~ ^[0-9]{1,5}$ ]] || continue
+        targets+=("127.0.0.1 $port" "::1 $port")
+    done
+    # Print each pair once, keeping the order.
+    local -A seen=()
+    for line in "${targets[@]}"; do
+        if [[ -z "${seen[$line]:-}" ]] && ((count < 8)); then
+            seen[$line]=1
+            count=$((count + 1))
+            printf '%s\n' "$line"
+        fi
+    done
 }
 
 # impact_ssh_listening
 #   Result: success when an SSH server answers on this machine: a connection
-#   to its port on the loopback address delivers a greeting that starts with
-#   "SSH-". Read-only; one connection is opened and closed.
+#   to one of its ports delivers a greeting that starts with "SSH-". The
+#   ports and addresses come from sshd -T (see impact__ssh_probe_targets),
+#   so a server on another port than 22 is found too. Read-only; each try
+#   opens and closes one connection.
 impact_ssh_listening() {
-    local port greeting host
-    port="$("$IMPACT_SSHD" -T 2>/dev/null | awk '$1 == "port" { print $2; exit }')" || port=''
-    [[ "$port" =~ ^[0-9]{1,5}$ ]] || port=22
-    for host in 127.0.0.1 ::1; do
+    local host port greeting
+    while read -r host port; do
         # bash opens a network connection through the special path
-        # /dev/tcp/<host>/<port>. It runs in a separate bash with a time
-        # limit, so a server that does not answer cannot stall the command.
+        # /dev/tcp/<host>/<port>. "exec 3<>path" opens it for reading and
+        # writing as the handle number 3; "read -u 3" reads from that
+        # handle, "-t 4" waits at most four seconds. It runs in a separate
+        # bash with a time limit, so a server that does not answer cannot
+        # stall the command.
         # shellcheck disable=SC2016
         # Reason for SC2016 (no expansion in single quotes): the inner bash
         # must expand $1 and $2 itself; they are handed over as arguments.
@@ -352,7 +459,7 @@ impact_ssh_listening() {
         if [[ "$greeting" == SSH-* ]]; then
             return 0
         fi
-    done
+    done < <(impact__ssh_probe_targets)
     return 1
 }
 
@@ -399,7 +506,10 @@ impact_ssh_reload() {
         return 0
     fi
 
-    pid_file="$("$IMPACT_SSHD" -T 2>/dev/null | awk '$1 == "pidfile" { print $2; exit }')" || pid_file=''
+    # The first "pidfile" line of sshd -T names the file that holds the
+    # process number of the running server.
+    pid_file=''
+    IFS= read -r pid_file < <(impact__sshd_config_values pidfile || true) || pid_file=''
     if [[ -n "$pid_file" && -r "$pid_file" ]]; then
         IFS= read -r pid <"$pid_file" || pid=''
         if [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/comm" ]]; then
@@ -444,12 +554,114 @@ impact__ssh_record() {
     done
 }
 
+# impact__ssh_pending_write MODE
+#   Internal: writes the note IMPACT_SSH_PENDING_FILE before the rules file
+#   changes. The note says that a change (MODE "install" or "remove") is not
+#   confirmed yet, and it holds a copy of the rules file as it was before
+#   (IMPACT__SSH_BACKUP), or says that there was none. The SSH procedure
+#   removes the note once the SSH service has read the new file. When the
+#   command is killed in between (for example with "kill -9", which no
+#   command can catch), the note stays, and the next run first puts the
+#   previous file back and then repeats the change with all its checks.
+#   Result: failure when the note could not be written.
+impact__ssh_pending_write() {
+    local mode="$1"
+    if [[ -L "$IMPACT_ADMIN_DIR" ]]; then
+        return 1
+    fi
+    if [[ ! -d "$IMPACT_ADMIN_DIR" ]]; then
+        install -d -m 700 -o root -g root -- "$IMPACT_ADMIN_DIR" || return 1
+    fi
+    {
+        printf '# IMPACT: a change of %s that is not confirmed yet.\n' "$IMPACT_SSH_RULES_FILE"
+        printf 'MODE=%s\n' "$mode"
+        if [[ -n "$IMPACT__SSH_BACKUP" && -f "$IMPACT__SSH_BACKUP" ]]; then
+            printf 'PREVIOUS=file\n'
+            printf '# The rules file as it was before the change follows.\n'
+            cat -- "$IMPACT__SSH_BACKUP"
+        else
+            printf 'PREVIOUS=none\n'
+            printf '# There was no rules file before the change.\n'
+        fi
+    } >"$IMPACT__SSH_PENDING_NOTE" || return 1
+    impact_write_file_atomic "$IMPACT_SSH_PENDING_FILE" 600 root root <"$IMPACT__SSH_PENDING_NOTE"
+}
+
+# impact_ssh_pending_read
+#   Reads the note of an unconfirmed change (see impact__ssh_pending_write).
+#   Sets IMPACT_SSH_PENDING_MODE ("install" or "remove") and
+#   IMPACT_SSH_PENDING_PREVIOUS ("file" or "none"). With "file", the
+#   previous rules file is copied to a temporary file whose path is in
+#   IMPACT_SSH_PENDING_COPY. Read-only for the system.
+#   Result: 0 a note was read; 1 there is no note; 2 the note is unusable
+#   (reason in IMPACT_CHECK_REASON).
+impact_ssh_pending_read() {
+    local mode='' previous='' line number=0
+    IMPACT_SSH_PENDING_MODE=''
+    IMPACT_SSH_PENDING_PREVIOUS=''
+    IMPACT_SSH_PENDING_COPY=''
+    IMPACT_CHECK_REASON=''
+    if [[ ! -e "$IMPACT_SSH_PENDING_FILE" && ! -L "$IMPACT_SSH_PENDING_FILE" ]]; then
+        return 1
+    fi
+    impact_file_is_trusted "$IMPACT_SSH_PENDING_FILE" || return 2
+    while IFS= read -r line && ((number < 3)); do
+        number=$((number + 1))
+        case "$line" in
+            MODE=install | MODE=remove) mode="${line#MODE=}" ;;
+            PREVIOUS=file | PREVIOUS=none) previous="${line#PREVIOUS=}" ;;
+            *) ;;
+        esac
+    done <"$IMPACT_SSH_PENDING_FILE"
+    if [[ -z "$mode" || -z "$previous" ]]; then
+        IMPACT_CHECK_REASON="$IMPACT_SSH_PENDING_FILE does not have the expected lines MODE= and PREVIOUS=."
+        return 2
+    fi
+    IMPACT_SSH_PENDING_MODE="$mode"
+    IMPACT_SSH_PENDING_PREVIOUS="$previous"
+    if [[ "$previous" == 'file' ]]; then
+        impact_mktemp_file || return 2
+        IMPACT_SSH_PENDING_COPY="$IMPACT_TMP"
+        # "tail -n +5" prints the file from its fifth line on: the copy of
+        # the previous rules file starts there.
+        tail -n +5 -- "$IMPACT_SSH_PENDING_FILE" >"$IMPACT_SSH_PENDING_COPY" || return 2
+    fi
+    return 0
+}
+
+# impact__ssh_pending_clear
+#   Internal: removes the note of an unconfirmed change. Prints a warning
+#   when it cannot be removed (the next run then repeats the last checks).
+impact__ssh_pending_clear() {
+    if [[ -e "$IMPACT_SSH_PENDING_FILE" || -L "$IMPACT_SSH_PENDING_FILE" ]]; then
+        rm -f -- "$IMPACT_SSH_PENDING_FILE" ||
+            impact_warn "The note $IMPACT_SSH_PENDING_FILE could not be removed. The next run of impact-workstation-setup repeats the checks of the SSH rules."
+    fi
+    return 0
+}
+
+# impact__ssh_put_back_previous
+#   Internal: puts the rules file that IMPACT_SSH_PENDING_COPY holds back in
+#   place, or removes the rules file when there was none before
+#   (IMPACT_SSH_PENDING_PREVIOUS "none"). Used for a change that an earlier
+#   run left unconfirmed.
+impact__ssh_put_back_previous() {
+    if [[ "$IMPACT_SSH_PENDING_PREVIOUS" == 'file' ]]; then
+        impact_write_file_atomic "$IMPACT_SSH_RULES_FILE" 644 root root <"$IMPACT_SSH_PENDING_COPY"
+    else
+        rm -f -- "$IMPACT_SSH_RULES_FILE"
+    fi
+}
+
 # impact__ssh_rules_restore EXIT_CODE
 #   Internal: runs when the command ends. While a change of the rules file is
 #   unconfirmed, it puts the previous file back (or removes the new file when
 #   there was none before), checks the result with sshd -t, and reloads the
-#   service again when it had already read the new file.
+#   service again when it may have read the new file. When all of this
+#   worked, the note of the unconfirmed change is removed; otherwise it
+#   stays, so the next run repeats the work.
 impact__ssh_rules_restore() {
+    local settled=1
     ((IMPACT__SSH_PENDING == 1)) || return 0
     IMPACT__SSH_PENDING=0
     {
@@ -458,12 +670,14 @@ impact__ssh_rules_restore() {
             if impact_write_file_atomic "$IMPACT_SSH_RULES_FILE" 644 root root <"$IMPACT__SSH_BACKUP"; then
                 printf '  The previous file %s is back in place.\n' "$IMPACT_SSH_RULES_FILE"
             else
+                settled=0
                 printf '  FAILED to put the previous file back. Look at %s now.\n' "$IMPACT_SSH_RULES_FILE"
             fi
         else
             if rm -f -- "$IMPACT_SSH_RULES_FILE"; then
                 printf '  The new file %s was removed (there was none before).\n' "$IMPACT_SSH_RULES_FILE"
             else
+                settled=0
                 printf '  FAILED to remove %s. Remove it by hand now.\n' "$IMPACT_SSH_RULES_FILE"
             fi
         fi
@@ -477,9 +691,15 @@ impact__ssh_rules_restore() {
             if impact_ssh_reload; then
                 printf '  %s\n' "$IMPACT_SSH_RELOAD_TEXT"
             else
+                settled=0
                 printf '  The SSH service could not be reloaded: %s\n' "$IMPACT_SSH_RELOAD_TEXT"
                 printf '  Keep this session open and check the service: sudo systemctl status ssh\n'
             fi
+        fi
+        if ((settled == 1)); then
+            impact__ssh_pending_clear
+        else
+            printf '  The note %s stays, so the next run of impact-workstation-setup repeats this work.\n' "$IMPACT_SSH_PENDING_FILE"
         fi
     } >&2
     # The steps of the procedure are no longer true: remove them from the
@@ -496,7 +716,14 @@ impact__ssh_rules_procedure() {
     local mode="$1" content_file="$2" group="$3" port_min="$4" port_max="$5"
     local invoker client_address before after member='' candidate
     local -a accounts=()
-    local was_listening=0 write_text
+    local was_listening=0 write_text pending_status=0
+    # need_write: 1 when the rules file must change. reload_needed: 1 when
+    # the SSH service must read the files again although they may already
+    # be in place (an earlier run stopped before its change was confirmed).
+    # state_file / state_exists: the rules file as it is before this run's
+    # own change (in a dry run after an interrupted run: the file that a
+    # real run would put back first).
+    local need_write=1 reload_needed=0 state_file="$IMPACT_SSH_RULES_FILE" state_exists=0
     IMPACT_SSH_RULES_CHANGED=0
 
     # A symbolic link or a folder at the place of the rules file was made by
@@ -515,14 +742,53 @@ impact__ssh_rules_procedure() {
                 "Add this line near the top of $IMPACT_SSHD_CONFIG, above any line that starts with Match, then run the command again:  Include $IMPACT_SSH_RULES_DIR/*.conf"
         fi
         impact_ok "$IMPACT_SSHD_CONFIG reads the files in $IMPACT_SSH_RULES_DIR."
-        if impact_file_has_content "$IMPACT_SSH_RULES_FILE" "$content_file" &&
-            impact_file_is "$IMPACT_SSH_RULES_FILE" 644 root root; then
+    fi
+
+    # --- An earlier change that was never confirmed -------------------------
+    impact_ssh_pending_read || pending_status=$?
+    case "$pending_status" in
+        0)
+            impact_warn "An earlier run stopped after it had changed $IMPACT_SSH_RULES_FILE ($IMPACT_SSH_PENDING_MODE) and before the SSH service had read the change and answered again (note: $IMPACT_SSH_PENDING_FILE). The file that was in place before is put back first; then this run makes its change with all checks and reloads the SSH service."
+            if ((IMPACT_DRY_RUN == 1)); then
+                impact_do "Put back the SSH rules file that was in place before the interrupted change"
+                if [[ "$IMPACT_SSH_PENDING_PREVIOUS" == 'file' ]]; then
+                    state_file="$IMPACT_SSH_PENDING_COPY"
+                    state_exists=1
+                else
+                    state_file=''
+                fi
+            else
+                impact_do "Put back the SSH rules file that was in place before the interrupted change" impact__ssh_put_back_previous ||
+                    impact_die "$IMPACT_EXIT_FAILED" "The previous rules file could not be put back." \
+                        "Look at $IMPACT_SSH_RULES_FILE and at the note $IMPACT_SSH_PENDING_FILE (sudo cat it: the previous file follows its fourth line)."
+            fi
+            reload_needed=1
+            ;;
+        1) ;;
+        *)
+            impact_die "$IMPACT_EXIT_FAILED" "The note of an unconfirmed SSH change cannot be used: $IMPACT_CHECK_REASON" \
+                "Look at it (sudo cat $IMPACT_SSH_PENDING_FILE). It must belong to root with mode 600. Then run the command again."
+            ;;
+    esac
+    if [[ "$state_file" == "$IMPACT_SSH_RULES_FILE" && -f "$IMPACT_SSH_RULES_FILE" ]]; then
+        state_exists=1
+    fi
+
+    if [[ "$mode" == 'install' ]]; then
+        if ((state_exists == 1)) && impact_file_has_content "$state_file" "$content_file" &&
+            { [[ "$state_file" != "$IMPACT_SSH_RULES_FILE" ]] || impact_file_is "$IMPACT_SSH_RULES_FILE" 644 root root; }; then
+            need_write=0
+        fi
+        if ((need_write == 0 && reload_needed == 0)); then
             impact_ok "The rules file $IMPACT_SSH_RULES_FILE already has the requested content."
             return 0
         fi
         write_text="Write the SSH rules file $IMPACT_SSH_RULES_FILE (under a temporary name, then renamed)"
     else
-        if [[ ! -e "$IMPACT_SSH_RULES_FILE" && ! -L "$IMPACT_SSH_RULES_FILE" ]]; then
+        if ((state_exists == 0)); then
+            need_write=0
+        fi
+        if ((need_write == 0 && reload_needed == 0)); then
             impact_ok "There is no rules file $IMPACT_SSH_RULES_FILE. Nothing to remove."
             return 0
         fi
@@ -537,14 +803,14 @@ impact__ssh_rules_procedure() {
     client_address="$(impact_ssh_client_address)"
 
     if ((IMPACT_DRY_RUN == 1)); then
-        impact_info "A real run first records the effective SSH settings of: ${accounts[*]}."
-        impact_do "$write_text"
-        if [[ "$mode" == 'install' ]]; then
-            impact_undo "Remove the SSH rules: sudo impact-workstation-setup --remove-ssh-rules"
+        if ((need_write == 1)); then
+            impact_info "A real run first records the effective SSH settings of: ${accounts[*]}."
+            impact_do "$write_text"
+            impact__ssh_add_undo "$mode" "$state_exists"
+            impact_info "A real run then checks the configuration (sshd -t), confirms that the settings of ${accounts[*]} are unchanged, and puts the previous state back if any check fails."
         else
-            impact_undo "Write the SSH rules again: sudo impact-workstation-setup"
+            impact_info "The rules file is then in the requested state already. A real run checks the configuration (sshd -t) and puts the previous state back if a check fails."
         fi
-        impact_info "A real run then checks the configuration (sshd -t), confirms that the settings of ${accounts[*]} are unchanged, and puts the previous state back if any check fails."
         impact_do "Reload the SSH service (open sessions stay open)"
         return 0
     fi
@@ -557,13 +823,13 @@ impact__ssh_rules_procedure() {
     # The configuration must be free of errors before anything is changed.
     # When removing, an error may come from the rules file itself; then the
     # removal is the repair and the comparison of settings is skipped.
-    local compare=1
+    local compare="$need_write"
     if ! impact_ssh_config_test; then
         if [[ "$mode" == 'install' ]]; then
             impact_error "sshd reports an error in the current SSH configuration:"
             printf '%s\n' "$IMPACT_SSH_OUTPUT" >&2
             impact_die "$IMPACT_EXIT_FAILED" \
-                "The SSH configuration has an error before this command changed anything. Nothing was changed." \
+                "The SSH configuration has an error before this command changed the rules. The rules file was not changed by this step." \
                 "Correct the file that sshd names above. If it is $IMPACT_SSH_RULES_FILE, remove it with: sudo impact-workstation-setup --remove-ssh-rules"
         fi
         impact_warn "sshd reports an error in the current SSH configuration, so the settings before and after cannot be compared:"
@@ -575,6 +841,7 @@ impact__ssh_rules_procedure() {
     impact_mktemp_dir || impact_die "$IMPACT_EXIT_FAILED" "No temporary folder could be created." ""
     before="$IMPACT_TMP/before"
     after="$IMPACT_TMP/after"
+    IMPACT__SSH_PENDING_NOTE="$IMPACT_TMP/pending-note"
     if ((compare == 1)); then
         if ! impact__ssh_record "$before" "$client_address" "${accounts[@]}"; then
             impact_die "$IMPACT_EXIT_FAILED" "sshd could not report the effective settings: $IMPACT_SSH_OUTPUT" \
@@ -593,21 +860,29 @@ impact__ssh_rules_procedure() {
         cp -p -- "$IMPACT_SSH_RULES_FILE" "$IMPACT__SSH_BACKUP" ||
             impact_die "$IMPACT_EXIT_FAILED" "The current rules file could not be copied aside. Nothing was changed." ""
     fi
+    # After an interrupted run the running server may have read either file,
+    # so the restore handler always reloads it.
+    IMPACT__SSH_RELOADED="$reload_needed"
+    # The note is written before the file changes: an end of the command
+    # that no handler can catch leaves it behind for the next run.
+    impact__ssh_pending_write "$mode" ||
+        impact_die "$IMPACT_EXIT_FAILED" "The note $IMPACT_SSH_PENDING_FILE could not be written, so the change is not started. Nothing was changed by the SSH step." \
+            "Look at the folder $IMPACT_ADMIN_DIR (it must be a folder of root, mode 700), then run the command again."
     IMPACT__SSH_CHANGES_BEFORE="${#IMPACT_CHANGES[@]}"
     IMPACT__SSH_UNDO_BEFORE="${#IMPACT_UNDO[@]}"
-    IMPACT__SSH_RELOADED=0
     IMPACT__SSH_PENDING=1
     impact_on_exit impact__ssh_rules_restore
 
     # --- 3. Write the new file (temporary name, then rename) ----------------
-    if [[ "$mode" == 'install' ]]; then
-        impact_do "$write_text" impact_write_file_atomic "$IMPACT_SSH_RULES_FILE" 644 root root <"$content_file" ||
-            impact_die "$IMPACT_EXIT_FAILED" "The rules file could not be written." ""
-        impact_undo "Remove the SSH rules: sudo impact-workstation-setup --remove-ssh-rules"
-    else
-        impact_do "$write_text" rm -f -- "$IMPACT_SSH_RULES_FILE" ||
-            impact_die "$IMPACT_EXIT_FAILED" "The rules file could not be removed." ""
-        impact_undo "Write the SSH rules again: sudo impact-workstation-setup"
+    if ((need_write == 1)); then
+        if [[ "$mode" == 'install' ]]; then
+            impact_do "$write_text" impact_write_file_atomic "$IMPACT_SSH_RULES_FILE" 644 root root <"$content_file" ||
+                impact_die "$IMPACT_EXIT_FAILED" "The rules file could not be written." ""
+        else
+            impact_do "$write_text" rm -f -- "$IMPACT_SSH_RULES_FILE" ||
+                impact_die "$IMPACT_EXIT_FAILED" "The rules file could not be removed." ""
+        fi
+        impact__ssh_add_undo "$mode" "$state_exists"
     fi
 
     # --- 4. sshd -t ---------------------------------------------------------
@@ -615,7 +890,7 @@ impact__ssh_rules_procedure() {
         impact_error "sshd -t reports an error with the changed rules:"
         printf '%s\n' "$IMPACT_SSH_OUTPUT" >&2
         impact_die "$IMPACT_EXIT_FAILED" "The SSH configuration would be invalid. The previous state is put back." \
-            "Read the message of sshd above. The SSH service was not reloaded, so nothing changed for logins."
+            "Read the message of sshd above. The SSH service was not reloaded by this run."
     fi
     impact_ok "sshd -t: the SSH configuration is free of errors."
 
@@ -668,6 +943,14 @@ impact__ssh_rules_procedure() {
     impact_do "Reload the SSH service (open sessions stay open)" impact_ssh_reload ||
         impact_die "$IMPACT_EXIT_FAILED" "The SSH service could not be reloaded: $IMPACT_SSH_RELOAD_TEXT The previous state is put back." \
             "Keep this session open and look at: sudo systemctl status ssh"
+    if [[ "$IMPACT_SSH_RELOAD_STATE" == 'none' ]] && ((was_listening == 1)); then
+        # An SSH server answers, and the command found no way to make it
+        # read the files again. It would keep its old settings while every
+        # check that asks sshd -T reports the new ones, so the change is
+        # treated as failed.
+        impact_die "$IMPACT_EXIT_FAILED" "An SSH server answers on this machine, and no way was found to make it read the changed rules (no SSH service of systemd is active, and the PidFile of sshd names no running sshd). The previous state is put back." \
+            "Find out how the SSH server is started here (sudo systemctl status ssh; ps -ef | grep sshd). Start it as the service ssh (sudo systemctl enable --now ssh), then run the command again."
+    fi
     if [[ "$IMPACT_SSH_RELOAD_STATE" == 'reloaded' ]]; then
         impact_ok "$IMPACT_SSH_RELOAD_TEXT"
     else
@@ -690,9 +973,11 @@ impact__ssh_rules_procedure() {
         impact_ok "The SSH server answers new connections."
     fi
 
-    # The change is confirmed: the restore handler has nothing to do any more.
+    # The change is confirmed: the restore handler has nothing to do any
+    # more, and the note of the unconfirmed change goes.
     IMPACT__SSH_PENDING=0
-    IMPACT_SSH_RULES_CHANGED=1
+    impact__ssh_pending_clear
+    IMPACT_SSH_RULES_CHANGED="$need_write"
 
     # --- 8. What the administrator does next --------------------------------
     impact_say ''
@@ -702,10 +987,30 @@ impact__ssh_rules_procedure() {
     impact_say '    login worked. If it fails, undo the change from this session:'
     if [[ "$mode" == 'install' ]]; then
         impact_say '        sudo impact-workstation-setup --remove-ssh-rules'
+        impact_say '    (Members then have the normal SSH settings until the rules are written'
+        impact_say '    again with sudo impact-workstation-setup.)'
     else
         impact_say '        sudo impact-workstation-setup'
     fi
     return 0
+}
+
+# impact__ssh_add_undo MODE PREVIOUS_EXISTED
+#   Internal: adds the "How to undo" line of the SSH step.
+#   install, no rules file before: remove the rules again.
+#   install, a rules file before: no line here. The file follows from the
+#     settings; impact-workstation-setup prints the one command that puts
+#     the previous settings back, and that command writes the rules again.
+#     Removing the rules would leave the members without any restriction.
+#   remove: write the rules again.
+impact__ssh_add_undo() {
+    if [[ "$1" == 'install' ]]; then
+        if [[ "$2" != '1' ]]; then
+            impact_undo "Remove the SSH rules: sudo impact-workstation-setup --remove-ssh-rules"
+        fi
+    else
+        impact_undo "Write the SSH rules again: sudo impact-workstation-setup"
+    fi
 }
 
 # impact_ssh_rules_install CONTENT_FILE GROUP PORT_MIN PORT_MAX

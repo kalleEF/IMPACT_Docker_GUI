@@ -68,6 +68,29 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   mapfile -t LIST <FILE     read the lines of FILE into the list LIST, one
+#                        entry per line (-t drops the line ends)
+#   < <(command)  <(command)   hand the output of a command to a loop, to
+#                        mapfile or to another program as if it were a file
+#                        ("process substitution")
+#   <<<"$text"           hand a text to a command as its input ("here-string")
+#   declare -A NAME  local -A NAME   a list whose entries are found by a name
+#                        (an "associative array"): NAME[key]=value, "${NAME[key]}"
+#   IFS=: read -r A B    split one line at the character after "IFS=" (here
+#                        ":") into the variables A and B; with -a LIST into a list
+#   while IFS= read -r line   read input line by line, exactly as written:
+#                        "IFS=" keeps blanks at both ends, -r keeps backslashes
+#   $'\t'  $'\r'  $'\n'   a text with a special character: tab, carriage return,
+#                        new line (\xNN is the byte NN)
+#   command || true      accept a failure of this command ("set -e" would
+#                        otherwise stop the script there)
+#   2>&1                 send the error channel to the same place as the output
+#   "${NAME:+text}"      "text" when NAME has content, otherwise nothing
+#   "${!LIST[@]}"        the positions (or the names) of the entries of a list
+#   "${NAME:0:10}"       a part of the text: from position 0, 10 characters
+#   "${NAME,,}"          the text in lower case
+#   shopt -s nullglob    a file pattern (*.conf) without a match gives an empty
+#                        list; "shopt -u" switches this off again
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -1523,8 +1546,15 @@ impact_check_block_ssh() {
     if impact_ssh_listening; then
         impact_check_ok "An SSH server answers on this machine."
     else
-        impact_check_warn "No SSH server answers on this machine (127.0.0.1 and ::1 were tried)." \
+        impact_check_warn "No SSH server answers on this machine (the ports of sshd -T were tried on 127.0.0.1 and ::1)." \
             "Look at the SSH service: sudo systemctl status ssh"
+    fi
+    # A change of the rules file that an interrupted run left unconfirmed:
+    # the running SSH server may still use the old rules, while sshd -T
+    # (and so every check below) already reads the new file.
+    if [[ -e "$IMPACT_SSH_PENDING_FILE" || -L "$IMPACT_SSH_PENDING_FILE" ]]; then
+        impact_check_warn "A change of the SSH rules was interrupted before the SSH service had read it (note $IMPACT_SSH_PENDING_FILE). The running SSH server may still use the rules from before; the checks below read the files." \
+            "Run the interrupted command again; it puts the previous file back and repeats the change with all checks: sudo impact-workstation-setup (or sudo impact-workstation-setup --remove-ssh-rules when the rules were being removed)"
     fi
     if impact_ssh_include_ok; then
         impact_check_ok "$IMPACT_SSHD_CONFIG reads the files in $IMPACT_SSH_RULES_DIR before any Match line."
@@ -1780,9 +1810,40 @@ impact_check_block_accounts() {
         fi
         impact_check__account "$name"
     done
+    impact_check__shared_keys "${accounts[@]}"
     if ((${#service[@]} > 0)); then
         impact_check_info "Further accounts in that range without a login shell (service accounts, not looked at further): ${#service[@]}: ${service[*]:0:12}${service[12]:+ ...}."
     fi
+}
+
+# impact_check__shared_keys ACCOUNT...
+#   Internal: one key pair belongs to one person. Warns for every login key
+#   (by its fingerprint) that more than one of the accounts has: whoever
+#   holds the private key can log in to each of them. The keys are read
+#   with the rights of each person.
+impact_check__shared_keys() {
+    local account home text print
+    local -A owners=()
+    for account in "$@"; do
+        home="$(impact_account_home "$account" 2>/dev/null)" || continue
+        impact_valid_abs_path "$home" || continue
+        text="$(impact_user_read_file "$account" "$home/.ssh/authorized_keys" 2>/dev/null)" || continue
+        [[ -n "$text" ]] || continue
+        # ssh-keygen -l lists the fingerprint of every key line of the text
+        # (the second word of each line).
+        while IFS= read -r print; do
+            [[ "$print" == SHA256:* ]] || continue
+            if [[ " ${owners[$print]:-} " != *" $account "* ]]; then
+                owners[$print]="${owners[$print]:+${owners[$print]} }$account"
+            fi
+        done < <(ssh-keygen -l -E sha256 -f /dev/stdin <<<"$text" 2>/dev/null | awk '{ print $2 }')
+    done
+    for print in "${!owners[@]}"; do
+        if [[ "${owners[$print]}" == *' '* ]]; then
+            impact_check_warn "The login key $print belongs to more than one account: ${owners[$print]}. One key pair belongs to one person; whoever holds this key can log in to each of these accounts." \
+                "Ask whose key it is, and remove it from the other accounts: sudo impact-key remove <account> --fingerprint $print"
+        fi
+    done
 }
 
 # impact_check__is_service_account ACCOUNT

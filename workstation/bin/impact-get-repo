@@ -79,7 +79,11 @@
 #   started as root, several key copies); 3 the workstation is not prepared;
 #   4 the copy exists already, or another command works in the folder;
 #   5 no access (no key copy, the key or the repository refused by GitHub,
-#   or your account is no member of the shared group); 6 network problem.
+#   or your account is no member of the shared group); 6 network problem;
+#   129, 130, 143 stopped by a signal (a closed session, Ctrl+C, a request
+#   to end; 128 plus the number of the signal).
+#   Besides the reasons listed above, the result line can name "ok" (done,
+#   where no other reason applies) and "failed" (any other failure).
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -107,6 +111,16 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   mapfile -t LIST <FILE     read the lines of FILE into the list LIST, one
+#                        entry per line (-t drops the line ends)
+#   < <(command)  <(command)   hand the output of a command to a loop, to
+#                        mapfile or to another program as if it were a file
+#                        ("process substitution")
+#   <<<"$text"           hand a text to a command as its input ("here-string")
+#   IFS=: read -r A B    split one line at the character after "IFS=" (here
+#                        ":") into the variables A and B; with -a LIST into a list
+#   "${NAME:+text}"      "text" when NAME has content, otherwise nothing
+#   "${!LIST[@]}"        the positions (or the names) of the entries of a list
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -389,6 +403,12 @@ fi
 clone_status=0
 impact_do "$clone_text" run_clone || clone_status=$?
 if ((clone_status != 0)); then
+    # 128 + the number of a signal: git was ended by Ctrl+C (130), a closed
+    # session (129) or a request to end (143).
+    if ((clone_status == 129 || clone_status == 130 || clone_status == 143)); then
+        impact_die_reason "$clone_status" interrupted "git was stopped by a signal (exit code $clone_status). The copy was not made." \
+            "Run the command again when you want the copy; the unfinished copy is removed first."
+    fi
     impact_git_classify_error "$(cat -- "$ERROR_FILE")"
     next="Try again later. If it stays like this, contact $(impact_contact_text)."
     case "$IMPACT_GIT_ERROR_REASON" in
@@ -398,6 +418,12 @@ if ((clone_status != 0)); then
         network) next="Check the workstation's connection to github.com and try again later." ;;
         *) ;;
     esac
+    if [[ -z "$KEY" && "$IMPACT_GIT_ERROR_REASON" == 'no_access' ]]; then
+        # The anonymous way is the one impact-give-repo takes for a person
+        # without a key copy; the administrator reads this message.
+        IMPACT_GIT_ERROR_CAUSE="GitHub refused the copy over anonymous HTTPS. Over anonymous HTTPS only public repositories can be copied, so the repository is private, or the address in model.conf is wrong."
+        next="If the repository is private: let the person start the GUI once (it places the key copy for git), then run this again. If it should be public, check REPO_URL in $(impact_model_dir "$MODEL" 2>/dev/null || printf 'the model folder')/model.conf."
+    fi
     impact_die_reason "$IMPACT_GIT_ERROR_CODE" "$IMPACT_GIT_ERROR_REASON" "$IMPACT_GIT_ERROR_CAUSE The copy was not made." "$next"
 fi
 if [[ -z "$KEY" ]]; then

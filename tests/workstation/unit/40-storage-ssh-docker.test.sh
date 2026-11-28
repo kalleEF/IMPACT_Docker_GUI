@@ -320,6 +320,92 @@ test_effective_settings_refuse_unusable_names() {
 # Docker
 # ----------------------------------------------------------------------------
 
+
+# fake_sshd_T [PORT...]
+#   Replaces the library function impact__sshd_T by a stand-in that behaves
+#   like sshd 8.9 of Ubuntu 22.04: it prints the "port" lines and the
+#   "pidfile" line first, then about 100 KB of further settings, one write
+#   per line. A reader that closes the pipe early makes it end with the
+#   signal SIGPIPE (exit status 141), as the real sshd 8.9 does.
+#   The pid file named is $TEST_TMP/sshd.pid.
+fake_sshd_T() {
+    local port
+    {
+        printf '#!/bin/bash\n'
+        for port in "$@"; do
+            printf 'printf "port %s\\n"\n' "$port"
+        done
+        printf 'printf "listenaddress 0.0.0.0:%s\\n"\n' "${1:-22}"
+        printf 'printf "pidfile %s\\n"\n' "$TEST_TMP/sshd.pid"
+        printf 'for ((i = 0; i < 2000; i++)); do printf "setting%%05d %%s\\n" "$i" "................................................"; done\n'
+    } >"$TEST_TMP/fake-sshd-T"
+    chmod 755 "$TEST_TMP/fake-sshd-T"
+    # A function of the same name, defined after the library was loaded,
+    # replaces the library's own function for this test process.
+    # shellcheck disable=SC2317
+    # Reason for SC2317 (command appears unreachable): the library calls it.
+    impact__sshd_T() {
+        "$TEST_TMP/fake-sshd-T"
+    }
+}
+
+# The values of sshd -T are found although sshd prints much more after
+# them, also with "set -o pipefail" (each test runs with it): a reader that
+# stopped early would lose the whole answer on Ubuntu 22.04.
+test_sshd_values_are_read_from_the_whole_output() {
+    fake_sshd_T 2222 2200
+    # The stand-in really dies of SIGPIPE when its reader stops early.
+    local status=0
+    "$TEST_TMP/fake-sshd-T" | head -n 1 >/dev/null || status=$?
+    assert_eq 141 "$status" "exit status of the stand-in when the reader stops early"
+    # The question succeeds (status 0) and gives the value.
+    assert_success impact__sshd_config_values pidfile
+    assert_eq "$TEST_TMP/sshd.pid" "$(impact__sshd_config_values pidfile)" "pidfile"
+    assert_eq $'2222\n2200' "$(impact__sshd_config_values port)" "both port lines"
+    assert_eq '' "$(impact__sshd_config_values nosuchsetting)" "a setting sshd does not print"
+}
+
+# impact_ssh_listening tries the ports that sshd -T names (here 2222 and
+# 2200), not only port 22, on the loopback addresses.
+test_probe_targets_follow_the_ports_of_sshd() {
+    fake_sshd_T 2222 2200
+    local targets
+    targets="$(impact__ssh_probe_targets)"
+    assert_contains "$targets" '127.0.0.1 2222'
+    assert_contains "$targets" '127.0.0.1 2200'
+    assert_contains "$targets" '::1 2222'
+    # Port 22 stays the last fallback, and no pair appears twice.
+    assert_eq '127.0.0.1 2222' "$(printf '%s\n' "$targets" | head -n 1)" "first target (from listenaddress 0.0.0.0:2222)"
+    assert_eq "$(printf '%s\n' "$targets" | sort -u | wc -l)" "$(printf '%s\n' "$targets" | wc -l)" "each pair once"
+}
+
+# Without systemd, impact_ssh_reload sends the signal HUP to the process
+# named in sshd's PidFile, when its program name is sshd. The stand-in
+# server here is a copy of "sleep" named sshd; HUP ends it.
+test_reload_without_systemd_finds_the_server_through_the_pid_file() {
+    if [[ -d /run/systemd/system ]]; then
+        skip "systemd runs on this machine; the branch without systemd is tested where it does not run"
+    fi
+    fake_sshd_T 22
+    cp "$(command -v sleep)" "$TEST_TMP/sshd"
+    "$TEST_TMP/sshd" 300 &
+    local pid=$!
+    printf '%s\n' "$pid" >"$TEST_TMP/sshd.pid"
+    assert_success impact_ssh_reload
+    assert_eq 'reloaded' "$IMPACT_SSH_RELOAD_STATE" "reload state"
+    # The signal ended the stand-in: wait returns 128 + 1 (HUP).
+    local status=0
+    wait "$pid" || status=$?
+    assert_eq 129 "$status" "exit status of the stand-in after HUP"
+    # A pid file that names another program is never signalled.
+    sleep 300 &
+    pid=$!
+    printf '%s\n' "$pid" >"$TEST_TMP/sshd.pid"
+    assert_success impact_ssh_reload
+    assert_eq 'none' "$IMPACT_SSH_RELOAD_STATE" "reload state for a process that is no sshd"
+    kill "$pid"
+}
+
 # fake_tools
 #   Puts stand-ins for "docker" and "dockerd" in front of the PATH of this
 #   test. The stand-ins print fixed answers and write their arguments to a

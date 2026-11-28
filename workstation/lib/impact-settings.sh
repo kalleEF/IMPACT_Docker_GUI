@@ -53,6 +53,13 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   declare -A NAME  local -A NAME   a list whose entries are found by a name
+#                        (an "associative array"): NAME[key]=value, "${NAME[key]}"
+#   while IFS= read -r line   read input line by line, exactly as written:
+#                        "IFS=" keeps blanks at both ends, -r keeps backslashes
+#   $'\t'  $'\r'  $'\n'   a text with a special character: tab, carriage return,
+#                        new line (\xNN is the byte NN)
+#   2>&1                 send the error channel to the same place as the output
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -993,10 +1000,22 @@ impact_model_load() {
 #   "not_member" for a person outside the shared group.
 #   Example: impact_require_model "${IMPACT_ARGS[0]}"
 impact_require_model() {
-    local status=0 text
+    local status=0 text cause
     impact_model_load "$1" || status=$?
     if ((status == 0)); then
         return 0
+    fi
+    if ((status == 1)); then
+        # One clear message: the first problem found is the cause.
+        IMPACT_RESULT_REASON='unknown_model'
+        cause="${IMPACT_MODEL_ERRORS[0]:-The model '$(impact_display "$1")' is not available on this workstation.}"
+        if ((EUID == 0)); then
+            # The administrator reads this (impact-give-repo, impact-check-model).
+            impact_die "$IMPACT_EXIT_FAILED" "$cause" \
+                "Check the spelling; the models are the folders in ${IMPACT_CONF[MODEL_DIR]:-the model folder}. To add a model: sudo impact-add-model --help"
+        fi
+        impact_die "$IMPACT_EXIT_FAILED" "$cause" \
+            "Check the spelling. To add a model, the administrator runs impact-add-model. Contact: $(impact_contact_text)."
     fi
     for text in "${IMPACT_MODEL_ERRORS[@]}"; do
         impact_error "$text"
@@ -1006,12 +1025,11 @@ impact_require_model() {
         impact_die "$IMPACT_EXIT_NO_ACCESS" "Your account has no access to the models of this workstation: it is no member of the group '${IMPACT_CONF[SHARED_GROUP]}' in this login." \
             "If you were enrolled just now, log out and log in again. Otherwise ask $(impact_contact_text) to enrol you (impact-add-user)."
     fi
-    if ((status == 1)); then
-        IMPACT_RESULT_REASON='unknown_model'
-        impact_die "$IMPACT_EXIT_FAILED" "The model '$(impact_display "$1")' is not available on this workstation." \
-            "Check the spelling. To add a model, the administrator runs impact-add-model. Contact: $(impact_contact_text)."
-    fi
     IMPACT_RESULT_REASON='model_invalid'
+    if ((EUID == 0)); then
+        impact_die "$IMPACT_EXIT_FAILED" "The model file of '$(impact_display "$1")' is invalid (the lines above name the problems)." \
+            "Correct it with: sudo impact-add-model (see its --help), or with an editor: sudoedit ${IMPACT_CONF[MODEL_DIR]:-<model folder>}/$(impact_display "$1")/model.conf"
+    fi
     impact_die "$IMPACT_EXIT_FAILED" "The model file of '$(impact_display "$1")' is invalid." \
         "The administrator corrects it with impact-add-model. Contact: $(impact_contact_text)."
 }

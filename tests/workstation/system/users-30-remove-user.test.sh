@@ -74,10 +74,10 @@ suite_setup() {
     sys_sshd_start
     sys_setup
     local name
-    for name in m1 m2 o1 ned; do
+    for name in m1 m2 o1 ned p1 p2; do
         sys_keypair "$name"
     done
-    for name in "$ACC" "$OTHER" ned newcomer; do
+    for name in "$ACC" "$OTHER" ned newcomer paula-example; do
         sys_register_account "$name"
     done
     enrol "$GH" m1
@@ -92,6 +92,8 @@ suite_setup() {
 suite_teardown() {
     pkill -f 'http.server 8787' 2>/dev/null || true
     remove_fake_docker
+    remove_fake_jobs
+    rm -f /var/lib/systemd/linger/paula-example
     sys_clean_slate
 }
 
@@ -288,7 +290,84 @@ test_wrong_and_hostile_input_is_refused_before_any_change() {
     refused_without_change 4 sys_as_admin "$REMOVE" ned --yes
     refused_without_change 4 sys_as_admin "$REMOVE" "$SYS_ADMIN" --yes
     refused_without_change 4 sys_as_admin "$REMOVE" root --yes
+    # root and administration accounts are never changed: the message says
+    # so and does not suggest adopting them (impact-add-user refuses that).
+    assert_output_contains 'never changed'
+    assert_output_not_contains 'adopt it first'
     assert_missing /tmp/impact-test-hostile
+}
+
+# install_fake_jobs ACCOUNT
+#   Puts stand-ins for crontab, atq, at and atrm first in the commands'
+#   PATH (/usr/local/sbin), with one cron table and one "at" job of ACCOUNT
+#   and one "at" job of root. They keep their state in /run/impact-test-jobs.
+#   They prove how impact-remove-user treats scheduled jobs; the real cron
+#   and at are not installed on every test machine.
+install_fake_jobs() {
+    mkdir -p /run/impact-test-jobs
+    printf '0 3 * * * /home/%s/bin/nightly-tunnel\n' "$1" >"/run/impact-test-jobs/cron-$1"
+    printf '41\tWed Nov 25 03:00:00 2026 a %s\n42\tWed Nov 25 04:00:00 2026 a root\n' "$1" >/run/impact-test-jobs/atq
+    cat >/usr/local/sbin/crontab <<'END'
+#!/bin/bash
+# impact-test stand-in for crontab: crontab -u ACCOUNT -l | -r
+account="$2"
+case "$3" in
+    -l) cat "/run/impact-test-jobs/cron-$account" 2>/dev/null || { echo "no crontab for $account" >&2; exit 1; } ;;
+    -r) rm "/run/impact-test-jobs/cron-$account" ;;
+esac
+END
+    printf '#!/bin/bash\n# impact-test stand-in for atq\ncat /run/impact-test-jobs/atq\n' >/usr/local/sbin/atq
+    printf '#!/bin/bash\n# impact-test stand-in for at -c NUMBER\necho "job $2: /home/someone/bin/once"\n' >/usr/local/sbin/at
+    printf '#!/bin/bash\n# impact-test stand-in for atrm NUMBER\nsed -i -e "/^$1\\t/d" /run/impact-test-jobs/atq\n' >/usr/local/sbin/atrm
+    chmod 755 /usr/local/sbin/crontab /usr/local/sbin/atq /usr/local/sbin/at /usr/local/sbin/atrm
+}
+
+# remove_fake_jobs
+#   Removes the stand-ins of install_fake_jobs.
+remove_fake_jobs() {
+    rm -f /usr/local/sbin/crontab /usr/local/sbin/atq /usr/local/sbin/at /usr/local/sbin/atrm
+    rm -rf /run/impact-test-jobs
+}
+
+# Programs of a person can start again without a login: through lingering
+# (systemd starts the person's own services at boot), a cron table, an "at"
+# job, and through login keys in ~/.ssh/authorized_keys2, which sshd on
+# Ubuntu reads as well. The removal switches all of them off and keeps
+# copies of the jobs and keys in the archive; other people's jobs stay.
+test_removal_switches_off_work_without_login_and_further_key_files() {
+    run_cmd sys_as_admin "$ADD" paula-example --key-file "$(pub p1)" --fingerprint "$(print_of p1)"
+    assert_status 0
+    # Lingering, as "loginctl enable-linger" marks it (no systemd runs here).
+    mkdir -p /var/lib/systemd/linger
+    : >/var/lib/systemd/linger/paula-example
+    # A further key in authorized_keys2, written by the person.
+    install -m 600 -o paula-example -g paula-example -- "$(pub p2)" /home/paula-example/.ssh/authorized_keys2
+    install_fake_jobs paula-example
+    run_cmd sys_as_admin "$REMOVE" paula-example --dry-run
+    assert_status 0
+    assert_output_contains "[dry run] Switch off lingering for 'paula-example'"
+    assert_output_contains "[dry run] Save the scheduled jobs of 'paula-example' (cron table: yes; at jobs: 1)"
+    assert_output_contains '[dry run] Move the login keys of /home/paula-example/.ssh/authorized_keys2'
+    assert_exists /var/lib/systemd/linger/paula-example
+    run_cmd sys_as_admin "$REMOVE" paula-example --yes
+    local jobs_folder keys2_folder removal_output="$RUN_OUTPUT"
+    jobs_folder="$(find /opt/impact/admin/keys/paula-example -maxdepth 1 -name 'jobs-removed-*' | head -n 1)"
+    keys2_folder="$(find /opt/impact/admin/keys/paula-example -maxdepth 1 -name 'authorized_keys2-removed-*' | head -n 1)"
+    remove_fake_jobs
+    assert_status 0
+    assert_missing /var/lib/systemd/linger/paula-example
+    assert_missing /home/paula-example/.ssh/authorized_keys2
+    assert_file_facts "$jobs_folder/crontab" 600 root root
+    assert_file_contains "$jobs_folder/crontab" 'nightly-tunnel'
+    assert_file_facts "$jobs_folder/at-41.job" 600 root root
+    assert_missing "$jobs_folder/at-42.job"
+    assert_file_contains "$keys2_folder/key-1.pub" "$(blob_of p2)"
+    # The key of authorized_keys2 no longer opens a session.
+    run_cmd sys_ssh_key paula-example p2 id -un
+    assert_status 255
+    # The bring-back of the keys still uses the archive of authorized_keys.
+    assert_contains "$removal_output" 'Scheduled jobs (cron, at) and lingering stay off.'
+    assert_contains "$removal_output" 'account-removed-'
 }
 
 test_dry_run_changes_nothing_and_ends_no_session() {
@@ -403,7 +482,8 @@ test_list_users_shows_the_removed_person() {
     run_cmd sys_as_admin /usr/local/bin/impact-list-users
     assert_status 0
     assert_output_contains 'removed (account closed, user number kept)'
-    assert_output_contains 'Summary: 1 enrolled, 1 removed, 0 deleted'
+    # Removed: alice-example and paula-example (an earlier test).
+    assert_output_contains 'Summary: 1 enrolled, 2 removed, 0 deleted'
 }
 
 test_a_removed_account_needs_the_way_back() {
@@ -459,8 +539,11 @@ test_delete_lists_the_files_first_and_asks_twice() {
     printf 'result\n' >"$SYS_ROOT_A/Example-Model/outputs/analysis_1/table.csv"
     printf 'note\n' >"$SYS_ROOT_A/Example-Model/outputs/notes with blank.txt"
     chown -R "$ACC" "$SYS_ROOT_A/Example-Model/outputs/analysis_1" "$SYS_ROOT_A/Example-Model/outputs/notes with blank.txt"
-    # Without a terminal: --yes does not answer the two questions.
+    # Without a terminal: --yes does not answer the two questions, and the
+    # message does not tell the administrator to add --yes.
     refused_without_change 1 sys_as_admin "$REMOVE" "$ACC" --delete --yes
+    assert_output_contains 'A deletion is confirmed on a terminal only'
+    assert_output_not_contains 'add the option --yes after checking'
     assert_output_contains "owns 3 files and folders on the shared storage"
     assert_output_contains "$SYS_ROOT_A/Example-Model/outputs/analysis_1/table.csv"
     assert_output_contains 'notes with blank.txt'

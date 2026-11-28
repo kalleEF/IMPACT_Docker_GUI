@@ -12,6 +12,12 @@
 #     5. stops its containers (the label impact.account=<account>);
 #     6. deletes its private key copies (~/.ssh/id_ed25519_<name>);
 #     7. notes the state "removed" in the account record.
+#   Before step 4 it also switches off the ways in which programs of the
+#   person start without a login: lingering (systemd would start the
+#   person's own services at boot), the person's own service manager, the
+#   cron table and waiting "at" jobs (saved to the archive first). Login
+#   keys in further files that sshd reads (~/.ssh/authorized_keys2) are
+#   moved to the archive as well.
 #   The account, its home folder and its files stay. So the user number is
 #   never given to a new account, and files on the shared storage keep their
 #   owner. At the end the command prints the commands that bring the person
@@ -45,7 +51,10 @@
 #   the expiry date of the account; ~/.ssh/authorized_keys (moved to
 #   /opt/impact/admin/keys/<account>/account-removed-<time>/); membership
 #   in the shared group and in docker; processes and containers of the
-#   person; ~/.ssh/id_ed25519_* of the person; the account record in
+#   person; ~/.ssh/id_ed25519_* of the person; the lingering mark
+#   /var/lib/systemd/linger/<account>, the cron table and the "at" jobs of
+#   the person (saved to /opt/impact/admin/keys/<account>/jobs-removed-<time>/);
+#   ~/.ssh/authorized_keys2 (saved first); the account record in
 #   /opt/impact/admin/accounts; one block in the log
 #   /opt/impact/admin/log/impact-admin.log. With --delete: the account, its
 #   home folder and its personal group are deleted.
@@ -86,6 +95,16 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   mapfile -t LIST <FILE     read the lines of FILE into the list LIST, one
+#                        entry per line (-t drops the line ends)
+#   < <(command)  <(command)   hand the output of a command to a loop, to
+#                        mapfile or to another program as if it were a file
+#                        ("process substitution")
+#   <<<"$text"           hand a text to a command as its input ("here-string")
+#   while IFS= read -r line   read input line by line, exactly as written:
+#                        "IFS=" keeps blanks at both ends, -r keeps backslashes
+#   2>&1                 send the error channel to the same place as the output
+#   "${NAME:0:10}"       a part of the text: from position 0, 10 characters
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -138,6 +157,12 @@ CONTAINERS=''        # the containers of the person, one per line
 CONTAINER_STATUS=0   # 0 list complete, 1 Docker does not answer, 2 no Docker
 COPIES=()            # names of the key copies in ~/.ssh
 INCOMPLETE=0         # 1 when a step could not be done
+LINGERING=0          # 1 when lingering is on (systemd starts the person's services at boot)
+USER_MANAGER=0       # 1 when the person's own service manager runs
+HAS_CRONTAB=0        # 1 when the person has a cron table
+AT_JOBS=()           # numbers of the person's waiting "at" jobs
+INNER_KEY_FILES=()   # further login key files inside the home folder (authorized_keys2)
+OUTER_KEY_FILES=()   # further login key files outside the home folder
 
 # -----------------------------------------------------------------------------
 # Functions
@@ -153,6 +178,7 @@ print_bring_back() {
     folder="$(impact_users_latest_account_archive "$ACCOUNT")" || folder=''
     impact_users_bring_back_text "$ACCOUNT" "$GITHUB" "$USER_NUMBER" "$1" "$folder"
     impact_say "  The GUI places the key copy for git again at the next start; containers are started again from the GUI."
+    impact_say "  Scheduled jobs (cron, at) and lingering stay off. Saved jobs are in the folders jobs-removed-<time> of $(impact_users_keys_dir "$ACCOUNT"); put them back by hand only if they are still wanted."
     if (($1 == 1)); then
         impact_say "  The home folder was deleted; the person fetches the repositories again (\"Add repository\" in the GUI)."
     fi
@@ -194,6 +220,12 @@ check_account() {
         impact_die "$IMPACT_EXIT_FAILED" "The account '$ACCOUNT' does not exist." "Check the name: sudo impact-list-users"
     fi
     if ((status == 1)); then
+        # root, system accounts and administration accounts are never
+        # changed; adopting them is refused by impact-add-user as well.
+        if ! impact_users_check_changeable "$ACCOUNT"; then
+            impact_die "$IMPACT_EXIT_CONFLICT" "$IMPACT_USERS_REASON" \
+                "The IMPACT commands never change this account. Choose the account of a colleague (sudo impact-list-users)."
+        fi
         impact_die "$IMPACT_EXIT_CONFLICT" "The account '$ACCOUNT' was not enrolled with impact-add-user, so this command does not touch it." \
             "If it is the account of a colleague, adopt it first (sudo impact-add-user <GitHub name> --account $ACCOUNT --existing ...), or close it by hand."
     fi
@@ -237,6 +269,72 @@ check_account() {
 
     mapfile -t COPIES < <(impact_users_key_copies "$ACCOUNT")
     impact_ok "Key copies in $HOME_DIR/.ssh: ${#COPIES[@]}."
+
+    check_work_without_login
+    check_further_key_files
+}
+
+# check_work_without_login
+#   Finds the ways in which programs of the person can start without a
+#   login: lingering with the person's own service manager, a cron table,
+#   waiting "at" jobs. Read-only.
+check_work_without_login() {
+    local text=''
+    if impact_users_is_lingering "$ACCOUNT"; then
+        LINGERING=1
+        text+=" lingering is on (systemd starts the person's own services at boot);"
+    fi
+    if impact_users_user_manager_active "$USER_NUMBER"; then
+        USER_MANAGER=1
+        text+=" the person's own service manager user@$USER_NUMBER.service runs;"
+    fi
+    if impact_users_crontab "$ACCOUNT" >/dev/null; then
+        HAS_CRONTAB=1
+        text+=" a cron table exists;"
+    fi
+    mapfile -t AT_JOBS < <(impact_users_at_jobs "$ACCOUNT")
+    if ((${#AT_JOBS[@]} > 0)); then
+        text+=" waiting at jobs: ${AT_JOBS[*]};"
+    fi
+    if [[ -n "$text" ]]; then
+        impact_info "Work that can start without a login:${text%;}."
+    else
+        impact_ok "No lingering, no cron table and no at jobs of '$ACCOUNT'."
+    fi
+}
+
+# check_further_key_files
+#   Finds login key files other than ~/.ssh/authorized_keys that sshd reads
+#   for the account (for example ~/.ssh/authorized_keys2). Read-only.
+check_further_key_files() {
+    local path status
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        if impact_path_is_below "$path" "$HOME_DIR"; then
+            status=0
+            impact_user_file_exists "$ACCOUNT" "$path" 2>/dev/null || status=$?
+            if ((status != 4)); then
+                INNER_KEY_FILES+=("$path")
+            fi
+        elif [[ -e "$path" || -L "$path" ]]; then
+            OUTER_KEY_FILES+=("$path")
+        fi
+    done < <(impact_users_further_key_files "$ACCOUNT" "$HOME_DIR")
+    if ((${#INNER_KEY_FILES[@]} + ${#OUTER_KEY_FILES[@]} > 0)); then
+        impact_info "Further files with login keys that sshd reads for '$ACCOUNT': ${INNER_KEY_FILES[*]} ${OUTER_KEY_FILES[*]}"
+    fi
+}
+
+# move_further_key_file PATH FOLDER
+#   Saves the lines of a further login key file inside the home folder in
+#   the archive FOLDER and removes the file, with the rights of the person.
+move_further_key_file() {
+    local text status=0
+    text="$(impact_user_read_file "$ACCOUNT" "$1")" || status=$?
+    if ((status == 0)); then
+        impact_users_save_key_lines "$2" "$text" || return 1
+    fi
+    impact_user_remove_file "$ACCOUNT" "$1"
 }
 
 # count_lines TEXT
@@ -258,6 +356,8 @@ something_to_do() {
     impact_account_in_group "$ACCOUNT" docker && return 0
     [[ -n "$PROCESSES" || -n "$CONTAINERS" ]] && return 0
     ((${#COPIES[@]} > 0)) && return 0
+    ((LINGERING == 1 || USER_MANAGER == 1 || HAS_CRONTAB == 1 || ${#AT_JOBS[@]} > 0)) && return 0
+    ((${#INNER_KEY_FILES[@]} > 0)) && return 0
     [[ "$RECORD_STATE" != 'removed' ]]
 }
 
@@ -308,11 +408,12 @@ confirm_removal() {
     # "local" gives this function its own IMPACT_ASSUME_YES with the value 0,
     # so --yes cannot answer the two questions of a deletion.
     local IMPACT_ASSUME_YES=0
-    if ! impact_confirm "DELETE the account '$ACCOUNT', its home folder $HOME_DIR with everything in it, and its personal group? This cannot be undone. (Question 1 of 2)"; then
+    local terminal_only='A deletion is confirmed on a terminal only (the option --yes does not answer it): run the command in an SSH session or at the local terminal of the workstation.'
+    if ! impact_confirm "DELETE the account '$ACCOUNT', its home folder $HOME_DIR with everything in it, and its personal group? This cannot be undone. (Question 1 of 2)" yes "$terminal_only"; then
         impact_die "$IMPACT_EXIT_FAILED" "Stopped: the deletion was not confirmed. Nothing was changed." \
             "To close the account and keep its files, run the command without --delete."
     fi
-    if ! impact_confirm "Question 2 of 2: type the account name to delete it." "$ACCOUNT"; then
+    if ! impact_confirm "Question 2 of 2: type the account name to delete it." "$ACCOUNT" "$terminal_only"; then
         impact_die "$IMPACT_EXIT_FAILED" "Stopped: the account name was not typed. Nothing was changed." \
             "To close the account and keep its files, run the command without --delete."
     fi
@@ -392,6 +493,17 @@ elif ((AK_PRESENT == 1)); then
 else
     impact_ok "'$ACCOUNT' has no login keys."
 fi
+# sshd may read further files with login keys (Ubuntu: ~/.ssh/authorized_keys2).
+for key_file in "${INNER_KEY_FILES[@]}"; do
+    KEY_FILE_ARCHIVE="$(impact_users_new_archive_name "$ACCOUNT" "$(basename -- "$key_file")")"
+    impact_do "Move the login keys of $key_file to $KEY_FILE_ARCHIVE (root only) and remove the file" \
+        move_further_key_file "$key_file" "$KEY_FILE_ARCHIVE" || step_failed "$key_file could not be moved. Look at it by hand."
+done
+for key_file in "${OUTER_KEY_FILES[@]}"; do
+    # A file outside the home folder belongs to the administrator's own
+    # arrangement of the SSH server; the command names it and leaves it.
+    impact_warn "sshd also reads login keys of '$ACCOUNT' from $key_file. The expiry date blocks the login; remove the person's lines there by hand: sudoedit $key_file"
+done
 
 impact_step "Groups"
 for group_name in "$GROUP" docker; do
@@ -408,6 +520,28 @@ if ! impact_is_dry_run; then
             step_failed "'$ACCOUNT' is still a member of '$group_name', probably as its primary group. Change it with: sudo usermod --gid $ACCOUNT $ACCOUNT"
         fi
     done
+fi
+
+impact_step "Work that starts without a login"
+# These come before the processes are ended: a service manager that systemd
+# keeps alive for a lingering account would start the person's services
+# again right after they were ended.
+if ((LINGERING == 1)); then
+    impact_do "Switch off lingering for '$ACCOUNT' (systemd would start the person's own services at boot)" \
+        impact_users_disable_linger "$ACCOUNT" || step_failed "Lingering could not be switched off: sudo loginctl disable-linger $ACCOUNT"
+else
+    impact_ok "Lingering is off for '$ACCOUNT'."
+fi
+if ((USER_MANAGER == 1)); then
+    impact_do "Stop the person's own service manager user@$USER_NUMBER.service (it runs the person's own services)" \
+        systemctl stop -- "user@$USER_NUMBER.service" || step_failed "user@$USER_NUMBER.service could not be stopped: sudo systemctl stop user@$USER_NUMBER.service"
+fi
+if ((HAS_CRONTAB == 1 || ${#AT_JOBS[@]} > 0)); then
+    JOBS_ARCHIVE="$(impact_users_new_archive_name "$ACCOUNT" jobs)"
+    impact_do "Save the scheduled jobs of '$ACCOUNT' (cron table: $( ((HAS_CRONTAB == 1)) && printf yes || printf no); at jobs: ${#AT_JOBS[@]}) to $JOBS_ARCHIVE (root only) and remove them" \
+        impact_users_save_and_remove_jobs "$JOBS_ARCHIVE" "$ACCOUNT" || step_failed "The scheduled jobs could not be removed. Look at them: sudo crontab -u $ACCOUNT -l; sudo atq"
+else
+    impact_ok "'$ACCOUNT' has no cron table and no waiting at jobs."
 fi
 
 impact_step "Sessions, tunnels and processes"

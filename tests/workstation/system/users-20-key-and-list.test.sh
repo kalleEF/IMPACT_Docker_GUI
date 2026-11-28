@@ -56,11 +56,11 @@ suite_setup() {
     sys_sshd_start
     sys_setup
     local name
-    for name in k1 k2 k3 k4 ned; do
+    for name in k1 k2 k3 k4 ned z1; do
         sys_keypair "$name"
     done
     ssh-keygen -q -t rsa -b 2048 -N '' -C 'rsa@example-pc' -f "$TEST_SUITE_TMP/keys/rsa"
-    for name in "$ACC" ned zed; do
+    for name in "$ACC" ned zed yara-example; do
         sys_register_account "$name"
     done
     run_cmd sys_as_admin /usr/local/bin/impact-add-user "$GH" --key-file "$(pub k1)" --fingerprint "$(print_of k1)"
@@ -288,6 +288,23 @@ test_replace_second_run_changes_nothing() {
     assert_exists "$COPY"
 }
 
+# A replacement that was interrupted after the login key was replaced and
+# before the key copy of the old key was deleted: the same command again
+# finds the replacement done, deletes the copy of the old key and prints
+# the reminder about GitHub, which the interrupted run never printed.
+test_replace_rerun_finishes_an_interrupted_replacement() {
+    place_key_copy k1
+    run_cmd sys_as_admin "$KEY" replace "$ACC" --old-fingerprint "$(print_of k1)" --key-file "$(pub k3)" --fingerprint "$(print_of k3)"
+    assert_status 0
+    assert_output_contains 'the replacement was done earlier'
+    assert_output_contains 'Delete the key copy for git'
+    assert_output_contains "Ask $GH to delete it on GitHub"
+    assert_output_contains "$(print_of k1)"
+    assert_missing "$COPY"
+    assert_missing "$COPY.pub"
+    login_works k3
+}
+
 test_the_printed_undo_line_of_replace_works() {
     # The undo line of the replacement, typed as printed: k1 comes back in
     # the place of k3. The key copy of k3 goes with its key.
@@ -401,4 +418,15 @@ test_list_users_shows_the_people_and_changes_nothing() {
     assert_output_contains 'from 127.0.0.1 (terminal login)'
     assert_output_contains "zed: member of 'docker', not enrolled with impact-add-user"
     assert_output_contains 'Summary: 1 enrolled, 0 removed, 0 deleted'
+}
+
+# One key pair belongs to one person: impact-key refuses a key that is a
+# login key of another enrolled account (exit code 4), before any change.
+test_the_key_of_another_account_is_refused() {
+    run_cmd sys_as_admin /usr/local/bin/impact-add-user yara-example --key-file "$(pub z1)" --fingerprint "$(print_of z1)"
+    assert_status 0
+    refused_without_change 4 sys_as_admin "$KEY" add "$ACC" --key-file "$(pub z1)" --fingerprint "$(print_of z1)"
+    assert_output_contains 'is a login key of the account yara-example already'
+    refused_without_change 4 sys_as_admin "$KEY" replace "$ACC" --key-file "$(pub z1)" --fingerprint "$(print_of z1)"
+    assert_output_contains 'is a login key of the account yara-example already'
 }

@@ -51,6 +51,8 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   command || true      accept a failure of this command ("set -e" would
+#                        otherwise stop the script there)
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 

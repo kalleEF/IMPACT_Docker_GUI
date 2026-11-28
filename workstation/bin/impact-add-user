@@ -79,7 +79,8 @@
 #   0 done, or nothing to do; 1 a check or a step failed, or the fingerprint
 #   was not confirmed; 2 wrong usage, or a key line that is not accepted;
 #   3 the workstation is not prepared (run impact-workstation-setup);
-#   4 the account or the name conflicts with the current state;
+#   4 the account, the name or the key conflicts with the current state
+#   (for example: the key is a login key of another account already);
 #   5 GitHub has no account of that name; 6 GitHub could not be reached.
 # =============================================================================
 
@@ -108,6 +109,14 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   < <(command)  <(command)   hand the output of a command to a loop, to
+#                        mapfile or to another program as if it were a file
+#                        ("process substitution")
+#   <<<"$text"           hand a text to a command as its input ("here-string")
+#   IFS=: read -r A B    split one line at the character after "IFS=" (here
+#                        ":") into the variables A and B; with -a LIST into a list
+#   while IFS= read -r line   read input line by line, exactly as written:
+#                        "IFS=" keeps blanks at both ends, -r keeps backslashes
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -136,6 +145,24 @@ impact_require_root
 impact_require_conf
 impact_log_enable "$@"
 
+# suggest_account_name GITHUB_NAME
+#   Prints ", for example --account <name>" with an account name made from
+#   the GitHub name that follows the rules of Linux account names and is
+#   free on this machine, or nothing when no such name comes out. The name
+#   keeps the allowed characters, gets the letter "u" in front when it does
+#   not start with a letter, and is cut to 32 characters.
+suggest_account_name() {
+    local name="${1//[^a-z0-9_-]/}"
+    if [[ "$name" != [a-z]* ]]; then
+        name="u$name"
+    fi
+    # "${name:0:32}" is the first 32 characters of the name.
+    name="${name:0:32}"
+    if impact_valid_account_name "$name" && impact_name_is_free "$name"; then
+        printf ', for example --account %s' "$name"
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # Validate every name from input before any use
 # -----------------------------------------------------------------------------
@@ -153,7 +180,7 @@ if impact_opt_given account; then
 else
     ACCOUNT="$GITHUB"
     if ! impact_valid_account_name "$ACCOUNT"; then
-        impact_die_usage "The GitHub name '$GITHUB' cannot be a Linux account name (a lower-case letter first, then lower-case letters, digits, - or _; at most 32 characters). Choose an account name with --account, for example --account ${GITHUB//[^a-z0-9_-]/}x"
+        impact_die_usage "The GitHub name '$GITHUB' cannot be a Linux account name (a lower-case letter first, then lower-case letters, digits, - or _; at most 32 characters). Choose an account name with --account$(suggest_account_name "$GITHUB")."
     fi
 fi
 
@@ -220,6 +247,14 @@ check_tools_and_preparation() {
             "Run sudo impact-workstation-setup first; it writes the rules."
     fi
     impact_ok "The SSH rules file $IMPACT_SSH_RULES_FILE exists."
+    # sshd -T reads the files; the running SSH server knows only what it
+    # read at its last reload. While a change of the rules is unconfirmed,
+    # the check of step "SSH rules" below could report values that the
+    # running server does not use yet.
+    if [[ -e "$IMPACT_SSH_PENDING_FILE" || -L "$IMPACT_SSH_PENDING_FILE" ]]; then
+        impact_die "$IMPACT_EXIT_NOT_PREPARED" "A change of the SSH rules was interrupted before the SSH service had read it (note $IMPACT_SSH_PENDING_FILE), so the running SSH server may use other rules than the file." \
+            "Run sudo impact-workstation-setup again first (it repeats the change with all checks), then this command."
+    fi
 }
 
 # check_github_name_is_not_enrolled_elsewhere
@@ -231,7 +266,7 @@ check_github_name_is_not_enrolled_elsewhere() {
         [[ -n "$other" && "$other" != "$ACCOUNT" ]] || continue
         if impact_account_record_load "$other" && [[ "${IMPACT_ACCOUNT_RECORD[GITHUB_NAME]}" == "$GITHUB" ]] &&
             impact_account_exists "$other"; then
-            if [[ "${IMPACT_ACCOUNT_RECORD[STATE]}" == 'enrolled' ]]; then
+            if [[ "${IMPACT_ACCOUNT_RECORD[STATE]}" == 'enrolled' || "${IMPACT_ACCOUNT_RECORD[STATE]}" == 'enrolling' ]]; then
                 impact_die "$IMPACT_EXIT_CONFLICT" "The GitHub name '$GITHUB' is enrolled already, for the account '$other'." \
                     "Add a further key to that account with: sudo impact-key add $other --key-file <file>"
             fi
@@ -295,6 +330,10 @@ check_existing_account() {
     case "$RECORD_STATE" in
         enrolled)
             impact_ok "The account '$ACCOUNT' is enrolled already with the GitHub name '$GITHUB': every part is checked again."
+            ;;
+        enrolling)
+            # An earlier run created the account and stopped before its end.
+            impact_ok "An earlier run created the account '$ACCOUNT' for the GitHub name '$GITHUB' and stopped before it had finished: this run continues the enrolment."
             ;;
         removed)
             if ! impact_opt_given existing; then
@@ -382,12 +421,17 @@ check_repository_folder() {
 #   Creates the account: home folder with the files of /etc/skel, a personal
 #   group of the same name, bash as login shell. useradd leaves the password
 #   locked ("!" in /etc/shadow).
+#   In the same step the account record is written with the state
+#   "enrolling". A run that stops after this step (an error, Ctrl+C, a
+#   closed window) leaves an account that a second run of the same command
+#   continues, and that impact-remove-user can close.
 create_account() {
     local -a options=(--create-home --shell /bin/bash --user-group)
     if [[ -n "$UID_WANTED" ]]; then
         options+=(--uid "$UID_WANTED")
     fi
-    useradd "${options[@]}" -- "$ACCOUNT"
+    useradd "${options[@]}" -- "$ACCOUNT" &&
+        impact_account_record_write "$ACCOUNT" "$GITHUB" enrolling
 }
 
 # write_new_authorized_keys CONTENT_FILE
@@ -409,9 +453,31 @@ record_needs_write() {
         "${IMPACT_ACCOUNT_RECORD[USER_NUMBER]}" != "$uid" ]]
 }
 
+# rules_files_read_first
+#   Prints the files in /etc/ssh/sshd_config.d whose names sort before
+#   60-impact.conf, separated by blanks. sshd reads them first, and for most
+#   settings the first value it reads applies, so a line there can override
+#   the IMPACT rules.
+rules_files_read_first() {
+    local file
+    local -a found=()
+    shopt -s nullglob
+    for file in "$IMPACT_SSH_RULES_DIR"/*.conf; do
+        # "<" compares two texts in the sort order of the C locale.
+        if [[ "$file" < "$IMPACT_SSH_RULES_FILE" ]]; then
+            found+=("$file")
+        fi
+    done
+    shopt -u nullglob
+    printf '%s' "${found[*]}"
+}
+
 # show_ssh_check
 #   Asks sshd which settings apply to a login of the account and compares
-#   them with the restricted values of the shared group.
+#   them with the restricted values of the shared group. It runs after the
+#   groups and before the login key is installed: when the values deviate,
+#   the command stops while the account has no new key, so the account
+#   cannot log in with the normal SSH settings.
 show_ssh_check() {
     local deviations status=0 port_min="${IMPACT_CONF[PORT_MIN]}" port_max="${IMPACT_CONF[PORT_MAX]}"
     if impact_is_dry_run && { [[ "$MODE" == 'new' ]] || ! impact_account_in_group "$ACCOUNT" "$GROUP"; }; then
@@ -432,8 +498,20 @@ show_ssh_check() {
             ;;
         1)
             printf '%s\n' "$deviations"
-            impact_die "$IMPACT_EXIT_FAILED" "The SSH rules do not apply to '$ACCOUNT' as expected (the lines above show the differences). The account exists; until this is fixed it has the normal SSH settings." \
-                "Write the rules again with sudo impact-workstation-setup, then run this command again. To close the account meanwhile: sudo impact-remove-user $ACCOUNT"
+            local first_files cause state_text
+            first_files="$(rules_files_read_first)"
+            if [[ -n "$first_files" ]]; then
+                cause="Likely cause: a line in a file that sshd reads before $IMPACT_SSH_RULES_FILE: $first_files. Also look at $IMPACT_SSHD_CONFIG for a Match block or a line before the Include line."
+            else
+                cause="Likely cause: a line in $IMPACT_SSHD_CONFIG (a Match block, or a line before the Include line), or a changed $IMPACT_SSH_RULES_FILE (sudo impact-check shows it)."
+            fi
+            if [[ "$MODE" == 'adopt' ]] && (($(impact_users_count_keys "$IMPACT_USERS_AK_TEXT") > 0)); then
+                state_text="The account has login keys already and can log in with the normal SSH settings; close it meanwhile with: sudo impact-remove-user $ACCOUNT"
+            else
+                state_text="No login key was installed, so the account cannot log in yet."
+            fi
+            impact_die "$IMPACT_EXIT_FAILED" "The SSH rules do not apply to '$ACCOUNT' as expected (the lines above show the differences). $state_text" \
+                "$cause Correct it, check it with: sudo sshd -T -C user=$ACCOUNT,host=127.0.0.1,addr=127.0.0.1 | grep -i -e permitopen -e authenticationmethods -e usepam   Then run this command again; it continues where it stopped."
             ;;
         *)
             impact_die "$IMPACT_EXIT_FAILED" "sshd could not be asked for the settings of '$ACCOUNT': ${IMPACT_SSH_OUTPUT:-no answer}" \
@@ -486,6 +564,14 @@ impact_users_collect_keys "$GITHUB"
 impact_users_choose_key "$GITHUB"
 KEY_LINE="$IMPACT_KEY_LINE ${IMPACT_KEY_COMMENT:-$GITHUB}"
 KEY_PRINT="$IMPACT_KEY_FINGERPRINT"
+# One key pair belongs to one person. A key that is a login key of another
+# account already usually means that the .pub file of another colleague was
+# taken; installing it would let that colleague log in to this account.
+KEY_OWNERS="$(impact_users_fingerprint_owners "$KEY_PRINT" "$ACCOUNT" | tr '\n' ' ')"
+if [[ -n "${KEY_OWNERS// /}" ]]; then
+    impact_die "$IMPACT_EXIT_CONFLICT" "The key $KEY_PRINT is a login key of the account ${KEY_OWNERS% } already. One key pair belongs to one person, so the same key is never installed for two accounts." \
+        "Check that you took the public key of $GITHUB (compare the fingerprint with the one the person sent). If the person really uses this key on the other account, remove it there first: sudo impact-key remove <account> --fingerprint $KEY_PRINT"
+fi
 if [[ "$MODE" == 'adopt' ]] && impact_users_text_has_blob "$IMPACT_USERS_AK_TEXT" "$IMPACT_KEY_BLOB"; then
     KEY_NEW=0
 fi
@@ -505,23 +591,35 @@ if ((LOCK_PASSWORD == 1)); then
 fi
 
 impact_step "Account '$ACCOUNT'"
+# UNDO_BY_REMOVE: 1 when one line "sudo impact-remove-user" undoes the run:
+# for a new account, and for a removed person who is brought back. That
+# command takes the account out of both groups and moves its login keys
+# away, so separate lines for these steps would fail after it.
+UNDO_BY_REMOVE=0
 if [[ "$MODE" == 'new' ]]; then
     text="Create the account '$ACCOUNT' (home folder $HOME_DIR, login shell /bin/bash, password locked: no password login and no sudo"
     if [[ -n "$UID_WANTED" ]]; then
-        text+=", user number $UID_WANTED)"
+        text+=", user number $UID_WANTED"
     else
-        text+=", the system chooses the user number)"
+        text+=", the system chooses the user number"
     fi
-    impact_do "$text" create_account || impact_die "$IMPACT_EXIT_FAILED" "useradd could not create the account '$ACCOUNT'." "Read the message of useradd above."
-    impact_undo "Close the account again and keep its number: sudo impact-remove-user $ACCOUNT  (or delete it: sudo impact-remove-user $ACCOUNT --delete)"
+    text+="), and note it as 'enrolment not finished' in $(impact_account_record_file "$ACCOUNT")"
+    impact_do "$text" create_account || impact_die "$IMPACT_EXIT_FAILED" "The account '$ACCOUNT' could not be created and noted." "Read the message of useradd above."
+    UNDO_BY_REMOVE=1
+    impact_undo "Close the account again and keep its number (add --delete to delete it with its home folder): sudo impact-remove-user $ACCOUNT"
     if ! impact_is_dry_run; then
         if [[ "$(impact_account_password_state "$ACCOUNT")" != 'L' ]]; then
             do_step "Lock the password of '$ACCOUNT' (useradd left it usable)" usermod --lock -- "$ACCOUNT"
         fi
-        impact_info "The account '$ACCOUNT' has the user number $(impact_account_uid "$ACCOUNT"). Note it in the site record; a rebuilt workstation needs it (--uid)."
+        impact_info "The account '$ACCOUNT' has the user number $(impact_account_uid "$ACCOUNT"). Write this number down with your notes about this workstation; a rebuilt workstation needs it (--uid)."
         impact_log_note "user number: $(impact_account_uid "$ACCOUNT")"
     fi
 else
+    if [[ "$RECORD_STATE" == 'enrolling' ]]; then
+        # An account that an earlier run of this command created.
+        UNDO_BY_REMOVE=1
+        impact_undo "Close the account again and keep its number (add --delete to delete it with its home folder): sudo impact-remove-user $ACCOUNT"
+    fi
     SHELL_NOW="$(impact_account_shell "$ACCOUNT")" || SHELL_NOW=''
     if [[ "$SHELL_NOW" != '/bin/bash' ]]; then
         do_step "Set the login shell of '$ACCOUNT' to /bin/bash (it was ${SHELL_NOW:-empty})" usermod --shell /bin/bash -- "$ACCOUNT"
@@ -531,7 +629,10 @@ else
     fi
     if impact_account_is_expired "$ACCOUNT"; then
         do_step "Clear the expiry date of '$ACCOUNT', so the account can log in again" usermod --expiredate '' -- "$ACCOUNT"
-        impact_undo "Close the account again: sudo impact-remove-user $ACCOUNT"
+        if ((UNDO_BY_REMOVE == 0)); then
+            impact_undo "Close the account again (this also takes it out of the groups and moves its login keys away): sudo impact-remove-user $ACCOUNT"
+        fi
+        UNDO_BY_REMOVE=1
     else
         impact_ok "The account has not expired."
     fi
@@ -550,10 +651,17 @@ for group_name in "$GROUP" docker; do
         impact_ok "'$ACCOUNT' is a member of the group '$group_name'."
     else
         do_step "Add '$ACCOUNT' to the group '$group_name'" usermod --append --groups "$group_name" -- "$ACCOUNT"
-        impact_undo "Take '$ACCOUNT' out of the group again: sudo gpasswd --delete $ACCOUNT $group_name"
+        if ((UNDO_BY_REMOVE == 0)); then
+            impact_undo "Take '$ACCOUNT' out of the group again: sudo gpasswd --delete $ACCOUNT $group_name"
+        fi
     fi
 done
 impact_info "$(impact_users_docker_statement)"
+
+# The SSH check comes before the login key: as long as the account has no
+# key, it cannot log in, whatever the SSH settings are.
+impact_step "SSH rules for '$ACCOUNT'"
+show_ssh_check
 
 impact_step "Login key"
 if ((KEY_NEW == 1)); then
@@ -564,7 +672,9 @@ if ((KEY_NEW == 1)); then
         write_new_authorized_keys "$NEW_KEYS_FILE" ||
         impact_die "$IMPACT_EXIT_FAILED" "The key could not be installed safely (see the line above)." \
             "Look at $HOME_DIR/.ssh (sudo ls -la $HOME_DIR/.ssh); it must be a real folder of '$ACCOUNT'. Then run the command again."
-    impact_undo "Remove this login key again: sudo impact-key remove $ACCOUNT --fingerprint $KEY_PRINT"
+    if ((UNDO_BY_REMOVE == 0)); then
+        impact_undo "Remove this login key again: sudo impact-key remove $ACCOUNT --fingerprint $KEY_PRINT"
+    fi
 else
     impact_ok "The key $KEY_PRINT is a login key of '$ACCOUNT'."
 fi
@@ -576,25 +686,26 @@ else
 fi
 
 impact_step "Repository folder"
-if [[ "$MODE" == 'adopt' ]] && impact_repo_base_is_ready "$ACCOUNT"; then
+if [[ "$MODE" == 'adopt' || "$RECORD_STATE" == 'enrolling' ]] && impact_repo_base_is_ready "$ACCOUNT"; then
     impact_ok "$REPO_DIR exists and belongs to '$ACCOUNT'."
 else
     impact_do "Create the repository folder $REPO_DIR (owner $ACCOUNT, mode 750)" impact_repo_base_create "$ACCOUNT" ||
         impact_die "$IMPACT_EXIT_FAILED" "The repository folder could not be created safely (see the line above)." \
             "Look at the folders on the way to $REPO_DIR, then run the command again."
-    impact_undo "Remove the repository folder while it is empty: sudo rmdir $REPO_DIR"
+    # A folder inside the home folder stays with the home folder (and goes
+    # with --delete); one outside it is removed by hand.
+    if ((UNDO_BY_REMOVE == 0)) || ! impact_path_is_below "$REPO_DIR" "$HOME_DIR"; then
+        impact_undo "Remove the repository folder while it is empty: sudo rmdir $REPO_DIR"
+    fi
 fi
 
 impact_step "Account record"
 if [[ "$MODE" == 'adopt' ]] && ! record_needs_write; then
     impact_ok "$(impact_account_record_file "$ACCOUNT") notes the GitHub name '$GITHUB' (enrolled)."
 else
-    do_step "Note the GitHub name '$GITHUB' of '$ACCOUNT' in $(impact_account_record_file "$ACCOUNT")" \
+    do_step "Note the GitHub name '$GITHUB' of '$ACCOUNT' in $(impact_account_record_file "$ACCOUNT") (enrolled)" \
         impact_account_record_write "$ACCOUNT" "$GITHUB" enrolled
 fi
-
-impact_step "SSH rules for '$ACCOUNT'"
-show_ssh_check
 
 impact_summary
 impact_say ''

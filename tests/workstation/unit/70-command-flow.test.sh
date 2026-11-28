@@ -527,6 +527,52 @@ END
     assert_output_contains 'not confirmed'
 }
 
+# A signal that arrives while an impact_do step runs: bash handles it when
+# the step's program has ended, so the change may be made. The report at
+# the end names that step as "may have finished", next to the steps that
+# had run before.
+test_a_step_that_was_running_at_a_signal_is_reported() {
+    make_command interrupted <<'END'
+impact_parse_args 'dry-run' '' '' "$@"
+impact_do "Make the first change" true
+# The step's program sends TERM to the command itself ($PPID of the inner
+# bash) and finishes its work.
+impact_do "Make the second change" bash -c 'kill -TERM "$PPID"; sleep 0.2; echo done-inside'
+impact_do "Make the third change" true
+impact_summary
+END
+    run_cmd "$TEST_TMP/interrupted"
+    assert_status 143
+    assert_output_contains 'was interrupted (signal TERM)'
+    assert_output_contains 'These steps had already run:'
+    assert_output_contains '  + Make the first change'
+    assert_output_contains 'This step was running when the command stopped and may have finished:'
+    assert_output_contains '  ? Make the second change'
+    assert_output_not_contains 'Make the third change'
+}
+
+# A question that --yes does not answer (the command sets IMPACT_ASSUME_YES
+# to 0 for it) names its own way out when no terminal is available, and
+# never tells the reader to add --yes, which was perhaps given already.
+test_confirm_without_terminal_names_the_given_way_out() {
+    make_command asks-hard <<'END'
+impact_parse_args 'dry-run yes' '' '' "$@"
+IMPACT_ASSUME_YES=0
+if impact_confirm "Delete everything?" yes "This question is answered on a terminal only."; then
+    echo "confirmed"
+else
+    echo "not confirmed"
+    exit 1
+fi
+END
+    run_cmd timeout 20 setsid --wait "$TEST_TMP/asks-hard" --yes
+    assert_status 1
+    assert_output_contains 'no terminal is available'
+    assert_output_contains 'This question is answered on a terminal only.'
+    assert_output_not_contains 'add the option --yes'
+    assert_output_contains 'not confirmed'
+}
+
 test_confirm_reads_the_answer_from_the_terminal() {
     if ! command -v script >/dev/null 2>&1; then
         skip "the tool script (package bsdutils) is not installed"

@@ -62,7 +62,10 @@
 #   own in docker_setup, or the copy belongs to another repository, or
 #   another command works in the folder); 5 no access (the key or the
 #   repository refused by GitHub, or your account is no member of the shared
-#   group); 6 network problem.
+#   group); 6 network problem; 129, 130, 143 stopped by a signal (a closed
+#   session, Ctrl+C, a request to end; 128 plus the number of the signal).
+#   Besides the reasons listed above, the result line can name "ok" (done,
+#   where no other reason applies) and "failed" (any other failure).
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -90,6 +93,15 @@
 #   return N / exit N    end the function / the script with status N; 0 means
 #                        success
 #   list=(a b)  "${list[@]}"  "${#list[@]}"   a list, all its entries, their number
+#   mapfile -t LIST <FILE     read the lines of FILE into the list LIST, one
+#                        entry per line (-t drops the line ends)
+#   < <(command)  <(command)   hand the output of a command to a loop, to
+#                        mapfile or to another program as if it were a file
+#                        ("process substitution")
+#   command || true      accept a failure of this command ("set -e" would
+#                        otherwise stop the script there)
+#   "${NAME:+text}"      "text" when NAME has content, otherwise nothing
+#   "${NAME:0:10}"       a part of the text: from position 0, 10 characters
 # Constructs beyond these are explained where they are first used.
 # -----------------------------------------------------------------------------
 
@@ -258,6 +270,12 @@ branch_text="${branch_text:-the default branch}"
 fetch_status=0
 impact_do --transient "Fetch the current state of $branch_text from $REPO_URL with the key copy $KEY" fetch_state || fetch_status=$?
 if ((fetch_status != 0)); then
+    # 128 + the number of a signal: git was ended by Ctrl+C (130), a closed
+    # session (129) or a request to end (143).
+    if ((fetch_status == 129 || fetch_status == 130 || fetch_status == 143)); then
+        impact_die_reason "$fetch_status" interrupted "git was stopped by a signal (exit code $fetch_status). Nothing was changed." \
+            "Run the command again when you want the update."
+    fi
     impact_git_classify_error "$(cat -- "$ERROR_FILE")"
     impact_die_reason "$IMPACT_GIT_ERROR_CODE" "$IMPACT_GIT_ERROR_REASON" "$IMPACT_GIT_ERROR_CAUSE Nothing was changed." \
         "Try again later. If it stays like this, contact $(impact_contact_text)."
